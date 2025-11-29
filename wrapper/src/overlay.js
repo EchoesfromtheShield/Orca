@@ -1,4 +1,4 @@
-// Orca Stealth Wrapper - overlay 1:1 Orca grid (WASD)
+// Orca Stealth Wrapper - overlay 1:1 + collision debug (WASD)
 
 (function () {
   'use strict';
@@ -19,6 +19,10 @@
   let playerCol = 0;
   let playerRow = 0;
 
+  // --------------------------------------------------
+  // Helpers base
+  // --------------------------------------------------
+
   function getOrcaCanvas() {
     return document.querySelector('canvas');
   }
@@ -32,8 +36,8 @@
       return;
     }
 
-    const ow = typeof client.orca.w === 'number' ? client.orca.w : 80;
-    const oh = typeof client.orca.h === 'number' ? client.orca.h : 40;
+    const ow = (typeof client.orca.w === 'number') ? client.orca.w : 80;
+    const oh = (typeof client.orca.h === 'number') ? client.orca.h : 40;
 
     gridCols = ow;
     gridRows = oh;
@@ -49,7 +53,7 @@
     overlayDiv.style.position = 'absolute';
     overlayDiv.style.pointerEvents = 'none';
     overlayDiv.style.zIndex = '9999';
-    // DEBUG: velo verde, poi lo metteremo a 'transparent'
+    // DEBUG: velo verde
     overlayDiv.style.background = 'rgba(0, 255, 0, 0.12)';
 
     playerDiv = document.createElement('div');
@@ -65,38 +69,76 @@
     log('Overlay DOM created.');
   }
 
+  // --------------------------------------------------
+  // Lettura dei glyph da Orca
+  // --------------------------------------------------
+
+  function getOrcaGlyph(col, row) {
+    const client = window.orcaClient;
+    if (!client || !client.orca) {
+      log('getOrcaGlyph: no client.orca, returning "."');
+      return '.';
+    }
+    const orca = client.orca;
+    if (typeof orca.glyphAt !== 'function') {
+      log('getOrcaGlyph: orca.glyphAt is not a function, orca =', orca);
+      return '.';
+    }
+
+    if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) {
+      return '.';
+    }
+
+    const g = orca.glyphAt(col, row);
+    return g;
+  }
+
+  function isWalkable(col, row) {
+    const g = getOrcaGlyph(col, row);
+    // Logghiamo sempre per capire cosa sta succedendo
+    log('isWalkable? col=', col, 'row=', row, 'glyph=', JSON.stringify(g));
+    // Per v0: solo '.' = vuoto
+    return g === '.';
+  }
+
+  // --------------------------------------------------
+  // Geometria 1:1 (come nella versione che matcha perfettamente)
+  // --------------------------------------------------
+
   function syncGeometry() {
     const canvas = getOrcaCanvas();
-    if (!canvas || !overlayDiv || !playerDiv) {
-      log('syncGeometry: missing canvas/overlay/player.');
+    if (!canvas) {
+      log('syncGeometry: no canvas');
+      return;
+    }
+    if (!overlayDiv || !playerDiv) {
+      log('syncGeometry: missing overlayDiv/playerDiv');
       return;
     }
 
     const rect = canvas.getBoundingClientRect();
 
-    // 1. Aggancia l’overlay esattamente sopra il canvas di Orca (CSS space)
+    // Aggancia l’overlay sopra il canvas
     overlayDiv.style.left   = (rect.left + window.scrollX) + 'px';
     overlayDiv.style.top    = (rect.top  + window.scrollY) + 'px';
     overlayDiv.style.width  = rect.width  + 'px';
     overlayDiv.style.height = rect.height + 'px';
 
-    // 2. Legge la griglia reale da orcaClient.orca (program width/height)
+    // Dimensioni logiche della griglia
     readGridSizeFromOrca();
 
     const cssW = rect.width;
     const cssH = rect.height;
 
-    // 3. Lato X: Orca usa tutta la larghezza → 1 col = width / gridCols
+    // X: tutta la larghezza
     cellW = cssW / gridCols;
 
-    // 4. Lato Y: Orca usa SOLO 5/6 dell’altezza per il codice
-    // perché in resize: style.height = (tile.h + tile.h/5)*orca.h
-    // mentre i glyph vengono disegnati a step di tile.h.
-    // Quindi rowHeightGlyph = totalHeight/rows * (5/6).
-    const rowFull = cssH / gridRows; // include quello spazio extra
+    // Y: Orca gonfia ogni riga di 1/5 (tile.h + tile.h/5)
+    // -> glyph-step = tile.h = rowFull * (5/6)
+    const rowFull = cssH / gridRows;
     cellH = rowFull * (5 / 6);
 
-    // Non ricentriamo il player ogni volta, ma lo clampiamo
+    // Clamp player in-bounds
     if (playerCol >= gridCols) playerCol = gridCols - 1;
     if (playerRow >= gridRows) playerRow = gridRows - 1;
     if (playerCol < 0) playerCol = 0;
@@ -105,8 +147,6 @@
     updatePlayerPosition();
 
     log('Geometry synced:', {
-      rectLeft: rect.left,
-      rectTop: rect.top,
       cssW,
       cssH,
       gridCols,
@@ -134,25 +174,53 @@
     if (playerRow > gridRows - 1) playerRow = gridRows - 1;
   }
 
+  // --------------------------------------------------
+  // Input
+  // --------------------------------------------------
+
   function onKeyDown(ev) {
     const key = ev.key.toLowerCase();
     if (key !== 'w' && key !== 'a' && key !== 's' && key !== 'd') return;
 
-    // WASD solo per il fantasmino
+    // WASD solo per fantasmino
     ev.preventDefault();
 
-    if (key === 'w') playerRow -= 1;
-    if (key === 's') playerRow += 1;
-    if (key === 'a') playerCol -= 1;
-    if (key === 'd') playerCol += 1;
+    let targetCol = playerCol;
+    let targetRow = playerRow;
 
+    if (key === 'w') targetRow -= 1;
+    if (key === 's') targetRow += 1;
+    if (key === 'a') targetCol -= 1;
+    if (key === 'd') targetCol += 1;
+
+    // Clamp target
+    if (targetCol < 0) targetCol = 0;
+    if (targetRow < 0) targetRow = 0;
+    if (targetCol > gridCols - 1) targetCol = gridCols - 1;
+    if (targetRow > gridRows - 1) targetRow = gridRows - 1;
+
+    const walkable = isWalkable(targetCol, targetRow);
+
+    if (!walkable) {
+      log('MOVE BLOCKED at', targetCol, targetRow, 'glyph=', JSON.stringify(getOrcaGlyph(targetCol, targetRow)));
+      return;
+    }
+
+    playerCol = targetCol;
+    playerRow = targetRow;
     clampPlayer();
     updatePlayerPosition();
+
     log('player moved to', playerCol, playerRow);
   }
 
+  // --------------------------------------------------
+  // Init
+  // --------------------------------------------------
+
   function initOverlay() {
     log('initOverlay start');
+
     ensureOverlayElements();
     syncGeometry();
 
@@ -162,9 +230,8 @@
     log('overlay initialized.');
   }
 
-  // Aspettiamo che Orca abbia fatto il suo client
   window.addEventListener('load', () => {
-    // piccolo delay per dare tempo a orcaClient di apparire
+    // piccolo delay per dare tempo a orcaClient di popolarsi
     setTimeout(initOverlay, 300);
   });
 })();
