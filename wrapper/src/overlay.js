@@ -1,11 +1,18 @@
-// Orca Stealth Wrapper - overlay 1:1 + collision debug (WASD)
+// Orca Stealth Wrapper - overlay 1:1 Orca grid
+// Modes: EDIT (Orca controlla i tasti), GAME (overlay controlla WASD, Orca read-only tranne Space)
 
 (function () {
   'use strict';
 
+  const DEBUG = false; // true per log verbosi
+
   function log() {
+    if (!DEBUG) return;
     console.log('[overlay]', ...arguments);
   }
+
+  // 'edit' | 'game'
+  let mode = 'edit';
 
   let overlayDiv = null;
   let playerDiv = null;
@@ -53,8 +60,7 @@
     overlayDiv.style.position = 'absolute';
     overlayDiv.style.pointerEvents = 'none';
     overlayDiv.style.zIndex = '9999';
-    // DEBUG: velo verde
-    overlayDiv.style.background = 'rgba(0, 255, 0, 0.12)';
+    overlayDiv.style.background = 'rgba(0, 255, 0, 0.10)';
 
     playerDiv = document.createElement('div');
     playerDiv.id = 'orca-stealth-player';
@@ -64,24 +70,59 @@
     playerDiv.style.border = '1px solid white';
 
     overlayDiv.appendChild(playerDiv);
+
+    // Piccolo HUD di stato in basso a destra
+    const hud = document.createElement('div');
+    hud.id = 'orca-stealth-hud';
+    hud.style.position = 'absolute';
+    hud.style.right = '4px';
+    hud.style.bottom = '4px';
+    hud.style.padding = '2px 4px';
+    hud.style.fontFamily = 'monospace';
+    hud.style.fontSize = '10px';
+    hud.style.background = 'rgba(0, 0, 0, 0.6)';
+    hud.style.color = '#fff';
+    hud.style.pointerEvents = 'none';
+    hud.style.opacity = '0.8';
+    overlayDiv.appendChild(hud);
+
     document.body.appendChild(overlayDiv);
+
+    updateModeVisual();
 
     log('Overlay DOM created.');
   }
 
+  function updateModeVisual() {
+    if (!overlayDiv) return;
+    const hud = document.getElementById('orca-stealth-hud');
+
+    if (mode === 'edit') {
+      overlayDiv.style.background = 'rgba(0, 255, 0, 0.05)'; // velo quasi invisibile
+      if (hud) {
+        hud.textContent = '[MODE: EDIT] (Orca controls keyboard)';
+      }
+    } else {
+      overlayDiv.style.background = 'rgba(0, 255, 0, 0.18)'; // piu\' visibile
+      if (hud) {
+        hud.textContent = '[MODE: GAME] (WASD = player, Space = Orca clock)';
+      }
+    }
+  }
+
+  function toggleMode() {
+    mode = (mode === 'edit') ? 'game' : 'edit';
+    updateModeVisual();
+    console.log('[overlay] Mode changed to', mode.toUpperCase());
+  }
+
   // --------------------------------------------------
-  // Lettura dei glyph da Orca
+  // Lettura glyph da Orca
   // --------------------------------------------------
 
   function getOrcaGlyph(col, row) {
     const client = window.orcaClient;
-    if (!client || !client.orca) {
-      log('getOrcaGlyph: no client.orca, returning "."');
-      return '.';
-    }
-    const orca = client.orca;
-    if (typeof orca.glyphAt !== 'function') {
-      log('getOrcaGlyph: orca.glyphAt is not a function, orca =', orca);
+    if (!client || !client.orca || typeof client.orca.glyphAt !== 'function') {
       return '.';
     }
 
@@ -89,56 +130,46 @@
       return '.';
     }
 
-    const g = orca.glyphAt(col, row);
-    return g;
+    return client.orca.glyphAt(col, row);
   }
 
   function isWalkable(col, row) {
     const g = getOrcaGlyph(col, row);
-    // Logghiamo sempre per capire cosa sta succedendo
-    log('isWalkable? col=', col, 'row=', row, 'glyph=', JSON.stringify(g));
-    // Per v0: solo '.' = vuoto
-    return g === '.';
+    const walkable = (g === '.');
+    if (DEBUG) {
+      console.log('[overlay] isWalkable?', 'col=', col, 'row=', row, 'glyph=', JSON.stringify(g), '->', walkable);
+    }
+    return walkable;
   }
 
   // --------------------------------------------------
-  // Geometria 1:1 (come nella versione che matcha perfettamente)
+  // Geometria 1:1 con Orca
   // --------------------------------------------------
 
   function syncGeometry() {
     const canvas = getOrcaCanvas();
-    if (!canvas) {
-      log('syncGeometry: no canvas');
-      return;
-    }
-    if (!overlayDiv || !playerDiv) {
-      log('syncGeometry: missing overlayDiv/playerDiv');
+    if (!canvas || !overlayDiv || !playerDiv) {
+      log('syncGeometry: missing canvas/overlay/player.');
       return;
     }
 
     const rect = canvas.getBoundingClientRect();
 
-    // Aggancia l’overlay sopra il canvas
     overlayDiv.style.left   = (rect.left + window.scrollX) + 'px';
     overlayDiv.style.top    = (rect.top  + window.scrollY) + 'px';
     overlayDiv.style.width  = rect.width  + 'px';
     overlayDiv.style.height = rect.height + 'px';
 
-    // Dimensioni logiche della griglia
     readGridSizeFromOrca();
 
     const cssW = rect.width;
     const cssH = rect.height;
 
-    // X: tutta la larghezza
     cellW = cssW / gridCols;
 
-    // Y: Orca gonfia ogni riga di 1/5 (tile.h + tile.h/5)
-    // -> glyph-step = tile.h = rowFull * (5/6)
     const rowFull = cssH / gridRows;
-    cellH = rowFull * (5 / 6);
+    cellH = rowFull * (5 / 6); // copiato dalla matematica Orca
 
-    // Clamp player in-bounds
     if (playerCol >= gridCols) playerCol = gridCols - 1;
     if (playerRow >= gridRows) playerRow = gridRows - 1;
     if (playerCol < 0) playerCol = 0;
@@ -179,30 +210,64 @@
   // --------------------------------------------------
 
   function onKeyDown(ev) {
-    const key = ev.key.toLowerCase();
-    if (key !== 'w' && key !== 'a' && key !== 's' && key !== 'd') return;
+    const key = ev.key;
 
-    // WASD solo per fantasmino
+    // 1) Toggle mode (F1) - sempre catturato
+    if (key === 'F1') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleMode();
+      return;
+    }
+
+    // 2) EDIT mode: non tocchiamo nulla
+    if (mode === 'edit') {
+      return;
+    }
+
+    // Da qui in avanti: mode === 'game'
+
+    // 3) Space: lasciamo passare la barra spaziatrice a Orca (clock start/stop)
+    if (key === ' ') {
+      // niente preventDefault, niente stopPropagation
+      if (DEBUG) {
+        console.log('[overlay] Space in GAME mode: letting it pass to Orca.');
+      }
+      return;
+    }
+
+    // 4) Tutti gli altri tasti in GAME mode NON devono arrivare a Orca
     ev.preventDefault();
+    ev.stopPropagation();
 
+    const lower = key.toLowerCase();
+
+    // Se non e' WASD, non facciamo nulla a livello di gioco (ma lo abbiamo bloccato per Orca)
+    if (lower !== 'w' && lower !== 'a' && lower !== 's' && lower !== 'd') {
+      if (DEBUG) {
+        console.log('[overlay] Key blocked in GAME mode (not WASD, not Space):', key);
+      }
+      return;
+    }
+
+    // WASD = movimento del player
     let targetCol = playerCol;
     let targetRow = playerRow;
 
-    if (key === 'w') targetRow -= 1;
-    if (key === 's') targetRow += 1;
-    if (key === 'a') targetCol -= 1;
-    if (key === 'd') targetCol += 1;
+    if (lower === 'w') targetRow -= 1;
+    if (lower === 's') targetRow += 1;
+    if (lower === 'a') targetCol -= 1;
+    if (lower === 'd') targetCol += 1;
 
-    // Clamp target
     if (targetCol < 0) targetCol = 0;
     if (targetRow < 0) targetRow = 0;
     if (targetCol > gridCols - 1) targetCol = gridCols - 1;
     if (targetRow > gridRows - 1) targetRow = gridRows - 1;
 
-    const walkable = isWalkable(targetCol, targetRow);
-
-    if (!walkable) {
-      log('MOVE BLOCKED at', targetCol, targetRow, 'glyph=', JSON.stringify(getOrcaGlyph(targetCol, targetRow)));
+    if (!isWalkable(targetCol, targetRow)) {
+      if (DEBUG) {
+        console.log('[overlay] MOVE BLOCKED at', targetCol, targetRow, 'glyph=', JSON.stringify(getOrcaGlyph(targetCol, targetRow)));
+      }
       return;
     }
 
@@ -225,13 +290,15 @@
     syncGeometry();
 
     window.addEventListener('resize', syncGeometry);
-    window.addEventListener('keydown', onKeyDown);
+
+    // Importante: capture = true, cosi' intercettiamo PRIMA di Orca
+    window.addEventListener('keydown', onKeyDown, true);
 
     log('overlay initialized.');
+    console.log('[overlay] Start in EDIT mode. Press F1 to switch to GAME mode.');
   }
 
   window.addEventListener('load', () => {
-    // piccolo delay per dare tempo a orcaClient di popolarsi
     setTimeout(initOverlay, 300);
   });
 })();
