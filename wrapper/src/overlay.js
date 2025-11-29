@@ -1,33 +1,173 @@
-// Orca Stealth Wrapper - overlay 1:1 Orca grid
-// Modes: EDIT (Orca controlla i tasti), GAME (overlay controlla WASD, Orca read-only tranne Space)
+// Orca Stealth Wrapper - overlay 1:1 with Orca grid
+// Modes:
+//   EDIT -> Orca receives keyboard normally
+//   GAME -> WASD control the player, Orca only receives Space for the clock
+//
+// Player: yellow triangle oriented in the direction of the last movement.
+// Guards: array of guards, rectangular patrol, cone-shaped FOV (9 cells).
+//
+// Guard states:
+//   state: "patrol" | "alert_chaser" | "stunned"
+//   behavior: "chaser"
+//
+// Sector alert logic:
+//   - sectors: NW / NE / SW / SE (based on static split grid center).
+//   - each sector has: state: "idle" | "tracking"
+//     * "tracking": at least one guard saw the player recently, or is seeing him now.
+//     * while any guard in the sector sees the player, the sector target == player's current position.
+//     * when all guards in the sector lose sight, they still know the absolute player position
+//       for ALERT_MEMORY_TICKS, chasing him even out of FOV.
+//     * when the timer expires, sector goes back to "idle" and guards return to PATROL.
+//
+// ALERT behavior for guards:
+//   - if sector is "tracking":
+//       * guards in that sector go into "alert_chaser".
+//       * if a guard currently has the player in FOV:
+//           - it stops rushing closer,
+//           - orients towards the player,
+//           - if possible, does very small local moves to gain line-of-shot,
+//           - and shoots when line-of-shot is clear.
+//       * if a guard does NOT see the player but sector is tracking:
+//           - it chases towards a "preferred shooting slot" around the player
+//             (N/E/S/W ring) using BFS pathfinding,
+//             trying to avoid overlapping with other guards.
+//   - when sector leaves "tracking" (timer expired), guards revert to PATROL.
+//
+// Collisions player <-> guard on the same cell:
+//   - if the player steps into the guard from directly behind -> stealth takedown (guard stunned)
+//   - in all other cases -> the player takes damage
+//
+// In ALERT, guards try to keep shooting distance and do not intentionally step onto the player cell.
 
 (function () {
   'use strict';
 
-  const DEBUG = false; // true per log verbosi
+  const DEBUG = false;
+
+  // --------------------------------------------------
+  // Tuning handles
+  // --------------------------------------------------
+
+  const WORLD_TICK_MS = 250;          // global tick speed
+
+  // Guard movement speed (cells per tick)
+  const PATROL_STEPS_PER_TICK = 1;    // patrol speed
+  const ALERT_STEPS_PER_TICK  = 2;    // alert / chasing speed
+
+  // Bullets
+  const BULLET_STEPS_PER_TICK       = 1;  // cells per tick
+  const GUARD_FIRE_COOLDOWN_TICKS   = 4;  // ticks between shots (~1s at 250ms)
+
+  // Alert / memory (how long sectors remember player absolute position after losing sight)
+  const ALERT_MEMORY_TICKS          = 12; // ~3s at 250ms
 
   function log() {
     if (!DEBUG) return;
     console.log('[overlay]', ...arguments);
   }
 
+  // --------------------------------------------------
+  // Level config (minimal sandbox for guards)
+  // --------------------------------------------------
+
+  const levelConfig = {
+    guards: [
+      {
+        id: 'g1',
+        patrolType: 'rect',
+        startCol: 10,
+        startRow: 10,
+        rect: { minCol: 8, maxCol: 20, minRow: 8, maxRow: 14 },
+        fovProfile: 'A',
+        behavior: 'chaser'
+      },
+      {
+        id: 'g2',
+        patrolType: 'rect',
+        startCol: 40,
+        startRow: 12,
+        rect: { minCol: 36, maxCol: 50, minRow: 10, maxRow: 18 },
+        fovProfile: 'A',
+        behavior: 'chaser'
+      },
+      {
+        id: 'g3',
+        patrolType: 'rect',
+        startCol: 25,
+        startRow: 20,
+        rect: { minCol: 22, maxCol: 32, minRow: 18, maxRow: 24 },
+        fovProfile: 'A',
+        behavior: 'chaser'
+      }
+    ],
+    fovProfiles: {
+      // Profile A: depth 9, widths 1,1,3,3,3,5,5,5,7
+      A: {
+        depth: 9,
+        widths: [1, 1, 3, 3, 3, 5, 5, 5, 7]
+      }
+    }
+  };
+
+  // --------------------------------------------------
+  // Overlay state
+  // --------------------------------------------------
+
   // 'edit' | 'game'
   let mode = 'edit';
 
   let overlayDiv = null;
-  let playerDiv = null;
+  let guardsContainer = null;
+  let fovContainer = null;
+  let bulletsContainer = null;
 
+  // Player
+  let playerDiv = null;
+  let playerInner = null;
+  let playerCol = 0;
+  let playerRow = 0;
+  let prevPlayerCol = 0;
+  let prevPlayerRow = 0;
+  // 'up' | 'down' | 'left' | 'right'
+  let playerDir = 'up';
+
+  // Player HP
+  let playerHPMax = 3;
+  let playerHP = playerHPMax;
+  let playerHitCooldown = 0; // invulnerability ticks after being hit
+
+  // Guards
+  let guards = [];
+  let guardTimer = null;
+  let globalAlertLevel = 0; // 0 = no guard sees the player, 1 = at least one guard sees him
+
+  // Bullets
+  let bullets = [];
+
+  // Grid / geometry
   let gridCols = 80;
   let gridRows = 40;
 
   let cellW = 0;
   let cellH = 0;
 
-  let playerCol = 0;
-  let playerRow = 0;
+  // Sectors (quadrants, static map split)
+  let midCol = 0;
+  let midRow = 0;
+
+  // Sector alert states:
+  //   state: "idle" | "tracking"
+  //   targetCol/Row: last known player position (for debug / possible future use)
+  //   timer: memory countdown
+  const sectorAlerts = {
+    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
+    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
+    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
+    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0 }
+  };
 
   // --------------------------------------------------
-  // Helpers base
+  // Basic helpers
   // --------------------------------------------------
 
   function getOrcaCanvas() {
@@ -52,6 +192,18 @@
     log('Grid size from orcaClient.orca:', gridCols + 'x' + gridRows);
   }
 
+  function getSector(col, row) {
+    if (row < midRow) {
+      return col < midCol ? 'NW' : 'NE';
+    } else {
+      return col < midCol ? 'SW' : 'SE';
+    }
+  }
+
+  // --------------------------------------------------
+  // Overlay DOM creation
+  // --------------------------------------------------
+
   function ensureOverlayElements() {
     if (overlayDiv) return;
 
@@ -60,18 +212,64 @@
     overlayDiv.style.position = 'absolute';
     overlayDiv.style.pointerEvents = 'none';
     overlayDiv.style.zIndex = '9999';
-    overlayDiv.style.background = 'rgba(0, 255, 0, 0.10)';
+    overlayDiv.style.background = 'rgba(0, 128, 128, 0.06)';
 
+    // FOV container (under guards and player)
+    fovContainer = document.createElement('div');
+    fovContainer.id = 'orca-stealth-fov';
+    fovContainer.style.position = 'absolute';
+    fovContainer.style.left = '0';
+    fovContainer.style.top = '0';
+    fovContainer.style.width = '100%';
+    fovContainer.style.height = '100%';
+    fovContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(fovContainer);
+
+    // Guards container
+    guardsContainer = document.createElement('div');
+    guardsContainer.id = 'orca-stealth-guards';
+    guardsContainer.style.position = 'absolute';
+    guardsContainer.style.left = '0';
+    guardsContainer.style.top = '0';
+    guardsContainer.style.width = '100%';
+    guardsContainer.style.height = '100%';
+    guardsContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(guardsContainer);
+
+    // Bullets container (above guards, below player)
+    bulletsContainer = document.createElement('div');
+    bulletsContainer.id = 'orca-stealth-bullets';
+    bulletsContainer.style.position = 'absolute';
+    bulletsContainer.style.left = '0';
+    bulletsContainer.style.top = '0';
+    bulletsContainer.style.width = '100%';
+    bulletsContainer.style.height = '100%';
+    bulletsContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(bulletsContainer);
+
+    // PLAYER ------------------------------------------------------
     playerDiv = document.createElement('div');
     playerDiv.id = 'orca-stealth-player';
     playerDiv.style.position = 'absolute';
     playerDiv.style.boxSizing = 'border-box';
-    playerDiv.style.background = 'red';
-    playerDiv.style.border = '1px solid white';
+    playerDiv.style.background = 'transparent';
+    playerDiv.style.border = 'none';
 
+    playerInner = document.createElement('div');
+    playerInner.id = 'orca-stealth-player-inner';
+    playerInner.style.position = 'absolute';
+    playerInner.style.left = '0';
+    playerInner.style.top = '0';
+    playerInner.style.width = '100%';
+    playerInner.style.height = '100%';
+    playerInner.style.background = 'yellow';
+    playerInner.style.clipPath = 'polygon(50% 12%, 14% 88%, 86% 88%)';
+    playerInner.style.transformOrigin = '50% 50%';
+
+    playerDiv.appendChild(playerInner);
     overlayDiv.appendChild(playerDiv);
 
-    // Piccolo HUD di stato in basso a destra
+    // HUD (bottom-right)
     const hud = document.createElement('div');
     hud.id = 'orca-stealth-hud';
     hud.style.position = 'absolute';
@@ -89,23 +287,49 @@
     document.body.appendChild(overlayDiv);
 
     updateModeVisual();
+    updatePlayerDirectionVisual();
 
     log('Overlay DOM created.');
+  }
+
+  function anySectorTracking() {
+    return (
+      sectorAlerts.NW.state === 'tracking' ||
+      sectorAlerts.NE.state === 'tracking' ||
+      sectorAlerts.SW.state === 'tracking' ||
+      sectorAlerts.SE.state === 'tracking'
+    );
   }
 
   function updateModeVisual() {
     if (!overlayDiv) return;
     const hud = document.getElementById('orca-stealth-hud');
 
+    const inAlert = (globalAlertLevel > 0) || anySectorTracking();
+
     if (mode === 'edit') {
-      overlayDiv.style.background = 'rgba(0, 255, 0, 0.05)'; // velo quasi invisibile
+      overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
       if (hud) {
-        hud.textContent = '[MODE: EDIT] (Orca controls keyboard)';
+        hud.textContent = '[MODE: EDIT] HP ' + playerHP + '/' + playerHPMax;
+        hud.style.color = '#ffffff';
       }
     } else {
-      overlayDiv.style.background = 'rgba(0, 255, 0, 0.18)'; // piu\' visibile
+      const alertText = inAlert ? 'ALERT' : 'STEALTH';
+      if (inAlert) {
+        overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
+      } else {
+        overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
+      }
       if (hud) {
-        hud.textContent = '[MODE: GAME] (WASD = player, Space = Orca clock)';
+        hud.textContent =
+          '[MODE: GAME] HP ' +
+          playerHP +
+          '/' +
+          playerHPMax +
+          '  [' +
+          alertText +
+          ']  (F1: toggle, WASD: move, Space: Orca clock)';
+        hud.style.color = '#ffffff';
       }
     }
   }
@@ -113,11 +337,83 @@
   function toggleMode() {
     mode = (mode === 'edit') ? 'game' : 'edit';
     updateModeVisual();
+    renderGuardFov();
     console.log('[overlay] Mode changed to', mode.toUpperCase());
   }
 
   // --------------------------------------------------
-  // Lettura glyph da Orca
+  // Guards initialization from levelConfig
+  // --------------------------------------------------
+
+  function initGuardsFromConfig() {
+    guards = [];
+    if (!guardsContainer) return;
+
+    const defs = levelConfig.guards || [];
+
+    defs.forEach((cfg, index) => {
+      const gEl = document.createElement('div');
+      gEl.className = 'orca-stealth-guard';
+      gEl.style.position = 'absolute';
+      gEl.style.boxSizing = 'border-box';
+      gEl.style.background = 'transparent';
+      gEl.style.border = 'none';
+
+      const inner = document.createElement('div');
+      inner.className = 'orca-stealth-guard-inner';
+      inner.style.position = 'absolute';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.left = '15%';
+      inner.style.top = '15%';
+      inner.style.background = '#ff4444';
+      inner.style.borderRadius = '3px';
+
+      gEl.appendChild(inner);
+      guardsContainer.appendChild(gEl);
+
+      const rect = cfg.rect || {};
+
+      const guard = {
+        id: cfg.id || ('guard_' + index),
+        patrolType: cfg.patrolType || 'rect',
+        behavior: cfg.behavior || 'chaser',
+        col: cfg.startCol || 0,
+        row: cfg.startRow || 0,
+        dirX: 1,
+        dirY: 0,
+        minCol: rect.minCol != null ? rect.minCol : 0,
+        maxCol: rect.maxCol != null ? rect.maxCol : Math.max(0, gridCols - 1),
+        minRow: rect.minRow != null ? rect.minRow : 0,
+        maxRow: rect.maxRow != null ? rect.maxRow : Math.max(0, gridRows - 1),
+        fovProfileId: cfg.fovProfile || 'A',
+        el: gEl,
+        inner,
+        lookPhase: 0,
+        lookTick: 0,
+        fovCells: [],
+        seenPlayer: false,
+        wasSeeingPlayer: false,
+        state: 'patrol',
+        lastSeenPlayerCol: null,
+        lastSeenPlayerRow: null,
+        alertTimer: 0,
+        path: null,
+        pathTargetCol: null,
+        pathTargetRow: null,
+        neutralized: false,
+        stunTicks: 0,
+        shootCooldown: 0
+      };
+
+      guards.push(guard);
+    });
+
+    log('Guards initialized from config:', guards.length);
+  }
+
+  // --------------------------------------------------
+  // Reading glyphs from Orca
   // --------------------------------------------------
 
   function getOrcaGlyph(col, row) {
@@ -137,13 +433,23 @@
     const g = getOrcaGlyph(col, row);
     const walkable = (g === '.');
     if (DEBUG) {
-      console.log('[overlay] isWalkable?', 'col=', col, 'row=', row, 'glyph=', JSON.stringify(g), '->', walkable);
+      console.log(
+        '[overlay] isWalkable?',
+        'col=',
+        col,
+        'row=',
+        row,
+        'glyph=',
+        JSON.stringify(g),
+        '->',
+        walkable
+      );
     }
     return walkable;
   }
 
   // --------------------------------------------------
-  // Geometria 1:1 con Orca
+  // Geometry 1:1 with Orca
   // --------------------------------------------------
 
   function syncGeometry() {
@@ -155,9 +461,9 @@
 
     const rect = canvas.getBoundingClientRect();
 
-    overlayDiv.style.left   = (rect.left + window.scrollX) + 'px';
-    overlayDiv.style.top    = (rect.top  + window.scrollY) + 'px';
-    overlayDiv.style.width  = rect.width  + 'px';
+    overlayDiv.style.left = (rect.left + window.scrollX) + 'px';
+    overlayDiv.style.top = (rect.top + window.scrollY) + 'px';
+    overlayDiv.style.width = rect.width + 'px';
     overlayDiv.style.height = rect.height + 'px';
 
     readGridSizeFromOrca();
@@ -167,15 +473,28 @@
 
     cellW = cssW / gridCols;
 
+    // Same vertical proportion Orca uses: tile height plus extra line for UI
     const rowFull = cssH / gridRows;
-    cellH = rowFull * (5 / 6); // copiato dalla matematica Orca
+    cellH = rowFull * (5 / 6);
+
+    midCol = Math.floor(gridCols / 2);
+    midRow = Math.floor(gridRows / 2);
 
     if (playerCol >= gridCols) playerCol = gridCols - 1;
     if (playerRow >= gridRows) playerRow = gridRows - 1;
     if (playerCol < 0) playerCol = 0;
     if (playerRow < 0) playerRow = 0;
 
-    updatePlayerPosition();
+    clampGuards();
+
+        updatePlayerPosition();
+    updatePlayerDirectionVisual();
+    guards.forEach(updateGuardPosition);
+    updateAllBulletsPosition();
+
+    // only FOV, no alert memory
+    updateAllFovAndAlert(false);
+
 
     log('Geometry synced:', {
       cssW,
@@ -193,9 +512,21 @@
     const x = playerCol * cellW;
     const y = playerRow * cellH;
 
-    playerDiv.style.transform = `translate(${x}px, ${y}px)`;
-    playerDiv.style.width  = cellW + 'px';
+    playerDiv.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+    playerDiv.style.width = cellW + 'px';
     playerDiv.style.height = cellH + 'px';
+  }
+
+  function updatePlayerDirectionVisual() {
+    if (!playerInner) return;
+
+    let angle = 0;
+    if (playerDir === 'up') angle = 0;
+    else if (playerDir === 'right') angle = 90;
+    else if (playerDir === 'down') angle = 180;
+    else if (playerDir === 'left') angle = 270;
+
+    playerInner.style.transform = 'rotate(' + angle + 'deg)';
   }
 
   function clampPlayer() {
@@ -205,59 +536,1159 @@
     if (playerRow > gridRows - 1) playerRow = gridRows - 1;
   }
 
+  function clampGuard(guard) {
+    if (guard.col < 0) guard.col = 0;
+    if (guard.row < 0) guard.row = 0;
+    if (guard.col > gridCols - 1) guard.col = gridCols - 1;
+    if (guard.row > gridRows - 1) guard.row = 0 + (gridRows - 1);
+  }
+
+  function clampGuards() {
+    guards.forEach(clampGuard);
+  }
+
   // --------------------------------------------------
-  // Input
+  // Guard occupancy helper (no overlapping)
   // --------------------------------------------------
 
-  function onKeyDown(ev) {
-    const key = ev.key;
+  function isCellOccupiedByOtherGuard(col, row, selfGuard) {
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (g === selfGuard) continue;
+      if (g.state === 'stunned') continue;
+      if (g.col === col && g.row === row) {
+        return true;
+      }
+    }
+    return false;
+  }
 
-    // 1) Toggle mode (F1) - sempre catturato
-    if (key === 'F1') {
-      ev.preventDefault();
-      ev.stopPropagation();
-      toggleMode();
+  // --------------------------------------------------
+  // Pathfinding (BFS) for chasers
+  // --------------------------------------------------
+
+  function computeBFSPath(fromCol, fromRow, toCol, toRow) {
+    const width = gridCols;
+    const height = gridRows;
+
+    if (fromCol === toCol && fromRow === toRow) {
+      return [{ col: fromCol, row: fromRow }];
+    }
+
+    const idx = (c, r) => r * width + c;
+    const startIndex = idx(fromCol, fromRow);
+    const targetIndex = idx(toCol, toRow);
+
+    const visited = new Array(width * height).fill(false);
+    const prev = new Array(width * height).fill(-1);
+
+    const queue = [];
+    queue.push(startIndex);
+    visited[startIndex] = true;
+
+    const dirs = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1]
+    ];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (current === targetIndex) break;
+
+      const cx = current % width;
+      const cy = (current - cx) / width;
+
+      for (let i = 0; i < dirs.length; i++) {
+        const nx = cx + dirs[i][0];
+        const ny = cy + dirs[i][1];
+
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+
+        const ni = idx(nx, ny);
+        if (visited[ni]) continue;
+
+        // Can walk only on '.' or on the exact target cell
+        if (!isWalkable(nx, ny) && !(nx === toCol && ny === toRow)) continue;
+
+        visited[ni] = true;
+        prev[ni] = current;
+        queue.push(ni);
+      }
+    }
+
+    if (!visited[targetIndex]) {
+      return null;
+    }
+
+    const path = [];
+    let cur = targetIndex;
+    while (cur !== -1) {
+      const cx = cur % width;
+      const cy = (cur - cx) / width;
+      path.push({ col: cx, row: cy });
+      cur = prev[cur];
+    }
+
+    path.reverse();
+    return path;
+  }
+
+  function ensureGuardPath(guard, targetCol, targetRow) {
+    if (
+      guard.path &&
+      guard.pathTargetCol === targetCol &&
+      guard.pathTargetRow === targetRow &&
+      guard.path.length > 1
+    ) {
       return;
     }
 
-    // 2) EDIT mode: non tocchiamo nulla
-    if (mode === 'edit') {
+    const path = computeBFSPath(guard.col, guard.row, targetCol, targetRow);
+    if (!path || path.length <= 1) {
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
       return;
     }
 
-    // Da qui in avanti: mode === 'game'
+    guard.path = path;
+    guard.pathTargetCol = targetCol;
+    guard.pathTargetRow = targetRow;
+  }
 
-    // 3) Space: lasciamo passare la barra spaziatrice a Orca (clock start/stop)
-    if (key === ' ') {
-      // niente preventDefault, niente stopPropagation
-      if (DEBUG) {
-        console.log('[overlay] Space in GAME mode: letting it pass to Orca.');
+  function stepGuardAlongPath(guard) {
+    if (!guard.path || guard.path.length <= 1) {
+      return false;
+    }
+
+    let idxCurrent = guard.path.findIndex(
+      (p) => p.col === guard.col && p.row === guard.row
+    );
+
+    if (idxCurrent === -1) {
+      idxCurrent = 0;
+    }
+
+    const nextIndex = idxCurrent + 1;
+    if (nextIndex >= guard.path.length) {
+      return false;
+    }
+
+    const next = guard.path[nextIndex];
+
+    // Do not step onto player cell in alert
+    if (next.col === playerCol && next.row === playerRow) {
+      return false;
+    }
+
+    // No overlapping with other guards
+    if (isCellOccupiedByOtherGuard(next.col, next.row, guard)) {
+      return false;
+    }
+
+    const oldCol = guard.col;
+    const oldRow = guard.row;
+
+    guard.col = next.col;
+    guard.row = next.row;
+
+    guard.dirX = guard.col - oldCol;
+    guard.dirY = guard.row - oldRow;
+
+    if (nextIndex === guard.path.length - 1) {
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
+    }
+
+    clampGuard(guard);
+    updateGuardPosition(guard);
+    return true;
+  }
+
+  // --------------------------------------------------
+  // Guard positioning
+  // --------------------------------------------------
+
+  function updateGuardPosition(guard) {
+    if (!guard.el) return;
+
+    const gx = guard.col * cellW;
+    const gy = guard.row * cellH;
+
+    guard.el.style.transform = 'translate(' + gx + 'px, ' + gy + 'px)';
+    guard.el.style.width = cellW + 'px';
+    guard.el.style.height = cellH + 'px';
+    guard.el.style.opacity = guard.state === 'stunned' ? '0.25' : '1.0';
+  }
+
+  // --------------------------------------------------
+  // Bullet logic (ranged attacks from guards)
+  // --------------------------------------------------
+
+  function updateBulletPosition(bullet) {
+    if (!bullet.el) return;
+    const bw = cellW * 0.3;
+    const bh = cellH * 0.3;
+    const x = bullet.col * cellW + (cellW - bw) / 2;
+    const y = bullet.row * cellH + (cellH - bh) / 2;
+
+    bullet.el.style.width = bw + 'px';
+    bullet.el.style.height = bh + 'px';
+    bullet.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
+
+  function updateAllBulletsPosition() {
+    bullets.forEach(updateBulletPosition);
+  }
+
+  function hasLineOfShot(guard, targetCol, targetRow) {
+    const dx = targetCol - guard.col;
+    const dy = targetRow - guard.row;
+
+    // Must be aligned on row or column
+    if ((dx === 0 && dy === 0) || (dx !== 0 && dy !== 0)) {
+      return false;
+    }
+
+    const stepX = dx === 0 ? 0 : (dx > 0 ? 1 : -1);
+    const stepY = dy === 0 ? 0 : (dy > 0 ? 1 : -1);
+
+    let c = guard.col + stepX;
+    let r = guard.row + stepY;
+
+    while (c !== targetCol || r !== targetRow) {
+      if (!isWalkable(c, r)) {
+        return false;
+      }
+      c += stepX;
+      r += stepY;
+    }
+
+    return true;
+  }
+
+  function spawnBulletFromGuard(guard, targetCol, targetRow) {
+    if (!bulletsContainer) return;
+    if (guard.state === 'stunned') return;
+
+    const dx = targetCol - guard.col;
+    const dy = targetRow - guard.row;
+
+    if ((dx === 0 && dy === 0) || (dx !== 0 && dy !== 0)) {
+      return;
+    }
+
+    const stepX = dx === 0 ? 0 : (dx > 0 ? 1 : -1);
+    const stepY = dy === 0 ? 0 : (dy > 0 ? 1 : -1);
+
+    const startCol = guard.col + stepX;
+    const startRow = guard.row + stepY;
+
+    if (
+      startCol < 0 ||
+      startRow < 0 ||
+      startCol >= gridCols ||
+      startRow >= gridRows
+    ) {
+      return;
+    }
+
+    if (!isWalkable(startCol, startRow)) {
+      return;
+    }
+
+    const bulletEl = document.createElement('div');
+    bulletEl.className = 'orca-stealth-bullet';
+    bulletEl.style.position = 'absolute';
+    bulletEl.style.background = '#ffcc00';
+    bulletEl.style.borderRadius = '50%';
+    bulletEl.style.pointerEvents = 'none';
+
+    bulletsContainer.appendChild(bulletEl);
+
+    const bullet = {
+      col: startCol,
+      row: startRow,
+      dx: stepX,
+      dy: stepY,
+      el: bulletEl,
+      alive: true,
+      fromGuardId: guard.id || 'guard'
+    };
+
+    bullets.push(bullet);
+    updateBulletPosition(bullet);
+
+    guard.shootCooldown = GUARD_FIRE_COOLDOWN_TICKS;
+
+    console.log('[overlay] GUARD', guard.id, 'shoots.');
+  }
+
+  function stepBullets() {
+    if (!bulletsContainer || bullets.length === 0) return;
+
+    const survivors = [];
+
+    for (let i = 0; i < bullets.length; i++) {
+      const b = bullets[i];
+      if (!b.alive || !b.el) {
+        if (b.el && b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        continue;
+      }
+
+      let alive = true;
+
+      for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
+        const nextCol = b.col + b.dx;
+        const nextRow = b.row + b.dy;
+
+        // Out of bounds
+        if (
+          nextCol < 0 ||
+          nextRow < 0 ||
+          nextCol >= gridCols ||
+          nextRow >= gridRows
+        ) {
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
+
+        // Player hit
+        if (nextCol === playerCol && nextRow === playerRow) {
+          applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
+
+        // Wall / Orca code hit
+        if (!isWalkable(nextCol, nextRow)) {
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
+
+        // Move bullet forward
+        b.col = nextCol;
+        b.row = nextRow;
+      }
+
+      if (alive) {
+        updateBulletPosition(b);
+        survivors.push(b);
+      }
+    }
+
+    bullets = survivors;
+  }
+
+  function shootingTickForGuard(guard) {
+    if (mode !== 'game') return;
+    if (guard.state !== 'alert_chaser') return;
+    if (guard.state === 'stunned') return;
+
+    if (guard.shootCooldown > 0) {
+      guard.shootCooldown--;
+      return;
+    }
+
+    // Only shoot if currently seeing the player
+    if (!guard.seenPlayer) {
+      return;
+    }
+
+    const realTargetCol = playerCol;
+    const realTargetRow = playerRow;
+
+    if (!hasLineOfShot(guard, realTargetCol, realTargetRow)) {
+      return;
+    }
+
+    spawnBulletFromGuard(guard, realTargetCol, realTargetRow);
+  }
+
+  // --------------------------------------------------
+  // FOV for guards
+  // --------------------------------------------------
+
+  function getFovProfile(guard) {
+    const profiles = levelConfig.fovProfiles || {};
+    const id = guard.fovProfileId || 'A';
+    return profiles[id] || profiles['A'];
+  }
+
+  function getLookMode(guard) {
+    const phase = guard.lookPhase || 0;
+    if (phase === 1) return 'positive';
+    if (phase === 3) return 'negative';
+    return 'center';
+  }
+
+  function computeGuardFovCellsForGuard(guard) {
+    const cells = [];
+
+    if (guard.state === 'stunned') {
+      return cells;
+    }
+
+    if (guard.col < 0 || guard.col >= gridCols || guard.row < 0 || guard.row >= gridRows) {
+      return cells;
+    }
+
+    const profile = getFovProfile(guard) || {};
+    const widths = profile.widths || [1, 1, 3, 3, 3, 5, 5, 5, 7];
+    const maxDist = Math.min(profile.depth || widths.length, widths.length);
+
+    const dx = guard.dirX;
+    const dy = guard.dirY;
+    const lookMode = getLookMode(guard);
+
+    for (let d = 1; d <= maxDist; d++) {
+      const w = widths[d - 1];
+      const half = (w - 1) / 2;
+
+      if (dx !== 0 && dy === 0) {
+        // Horizontal guard (right/left)
+        const forwardCol = guard.col + dx * d;
+        if (forwardCol < 0 || forwardCol >= gridCols) break;
+
+        const baseRow = guard.row;
+        let startRow, endRow;
+
+        if (lookMode === 'center') {
+          startRow = baseRow - half;
+          endRow = baseRow + half;
+        } else if (lookMode === 'positive') {
+          // Looking "down" (south): flat on the north side
+          startRow = baseRow;
+          endRow = baseRow + (w - 1);
+        } else {
+          // Looking "up" (north): flat on the south side
+          startRow = baseRow - (w - 1);
+          endRow = baseRow;
+        }
+
+        if (startRow > endRow) {
+          const tmp = startRow;
+          startRow = endRow;
+          endRow = tmp;
+        }
+
+        if (endRow < 0 || startRow > gridRows - 1) continue;
+        if (startRow < 0) startRow = 0;
+        if (endRow > gridRows - 1) endRow = gridRows - 1;
+
+        for (let ry = startRow; ry <= endRow; ry++) {
+          cells.push({ col: forwardCol, row: ry });
+        }
+
+      } else if (dy !== 0 && dx === 0) {
+        // Vertical guard (up/down)
+        const forwardRow = guard.row + dy * d;
+        if (forwardRow < 0 || forwardRow >= gridRows) break;
+
+        const baseCol = guard.col;
+        let startCol, endCol;
+
+        if (lookMode === 'center') {
+          startCol = baseCol - half;
+          endCol = baseCol + half;
+        } else if (lookMode === 'positive') {
+          // Looking "right" (east): flat on the west side
+          startCol = baseCol;
+          endCol = baseCol + (w - 1);
+        } else {
+          // Looking "left" (west): flat on the east side
+          startCol = baseCol - (w - 1);
+          endCol = baseCol;
+        }
+
+        if (startCol > endCol) {
+          const tmp = startCol;
+          startCol = endCol;
+          endCol = tmp;
+        }
+
+        if (endCol < 0 || startCol > gridCols - 1) continue;
+        if (startCol < 0) startCol = 0;
+        if (endCol > gridCols - 1) endCol = gridCols - 1;
+
+        for (let cx = startCol; cx <= endCol; cx++) {
+          cells.push({ col: cx, row: forwardRow });
+        }
+      }
+    }
+
+    return cells;
+  }
+
+  function renderGuardFov() {
+    if (!fovContainer) return;
+
+    while (fovContainer.firstChild) {
+      fovContainer.removeChild(fovContainer.firstChild);
+    }
+
+    if (mode !== 'game') return;
+
+    const baseAlpha = (globalAlertLevel > 0 || anySectorTracking()) ? 0.35 : 0.20;
+
+    guards.forEach((guard) => {
+      if (guard.state === 'stunned') return;
+      const color = guard.seenPlayer
+        ? 'rgba(255, 64, 64, ' + baseAlpha + ')'
+        : 'rgba(255, 0, 0, ' + baseAlpha + ')';
+
+      guard.fovCells.forEach((cell) => {
+        const cellDiv = document.createElement('div');
+        cellDiv.style.position = 'absolute';
+        cellDiv.style.left = (cell.col * cellW) + 'px';
+        cellDiv.style.top = (cell.row * cellH) + 'px';
+        cellDiv.style.width = cellW + 'px';
+        cellDiv.style.height = cellH + 'px';
+        cellDiv.style.background = color;
+        fovContainer.appendChild(cellDiv);
+      });
+    });
+  }
+
+  function handleGuardSpotsPlayer(guard) {
+    console.log(
+      '[overlay] GUARD',
+      guard.id,
+      'spots player at',
+      playerCol,
+      playerRow
+    );
+  }
+
+    function updateAllFovAndAlert(manageMemory) {
+    manageMemory = !!manageMemory;
+
+    let anySeen = false;
+    const sectorSaw = { NW: false, NE: false, SW: false, SE: false };
+
+    guards.forEach((guard) => {
+      if (guard.state === 'stunned') {
+        guard.fovCells = [];
+        guard.wasSeeingPlayer = guard.seenPlayer;
+        guard.seenPlayer = false;
+        return;
+      }
+
+      guard.fovCells = computeGuardFovCellsForGuard(guard);
+      const prevSeen = guard.seenPlayer;
+      const nextSeen = guard.fovCells.some(
+        (c) => c.col === playerCol && c.row === playerRow
+      );
+
+      guard.wasSeeingPlayer = prevSeen;
+      guard.seenPlayer = nextSeen;
+
+      if (nextSeen) {
+        anySeen = true;
+        guard.lastSeenPlayerCol = playerCol;
+        guard.lastSeenPlayerRow = playerRow;
+        const s = getSector(guard.col, guard.row);
+        sectorSaw[s] = true;
+      }
+
+      if (!prevSeen && nextSeen) {
+        handleGuardSpotsPlayer(guard);
+      }
+    });
+
+    if (manageMemory) {
+      // Aggiorna gli stati di settore con memoria a 3s
+      ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+        const sa = sectorAlerts[name];
+
+        if (sectorSaw[name]) {
+          // Qualcuna vede il player ORA in questo settore
+          sa.state = 'tracking';
+          sa.targetCol = playerCol;
+          sa.targetRow = playerRow;
+          sa.timer = ALERT_MEMORY_TICKS;
+        } else if (sa.state === 'tracking') {
+          // Nessuno lo vede adesso, ma il settore era in tracking
+          if (sa.timer > 0) {
+            sa.timer--;
+            if (sa.timer > 0) {
+              // Memoria: per tutta la durata, conosciamo ancora la posizione assoluta
+              sa.targetCol = playerCol;
+              sa.targetRow = playerRow;
+            } else {
+              sa.state = 'idle';
+              sa.targetCol = null;
+              sa.targetRow = null;
+            }
+          } else {
+            sa.state = 'idle';
+            sa.targetCol = null;
+            sa.targetRow = null;
+          }
+        }
+      });
+
+      // Alert globale: attivo se qualcuno vede OR se almeno un settore è in tracking (memoria)
+      const trackingNow =
+        sectorAlerts.NW.state === 'tracking' ||
+        sectorAlerts.NE.state === 'tracking' ||
+        sectorAlerts.SW.state === 'tracking' ||
+        sectorAlerts.SE.state === 'tracking';
+
+      globalAlertLevel = (anySeen || trackingNow) ? 1 : 0;
+
+      // Allinea stati delle guardie al loro settore
+      guards.forEach((g) => {
+        if (g.state === 'stunned') return;
+        const s = getSector(g.col, g.row);
+        const sa = sectorAlerts[s];
+
+        if (sa.state === 'tracking') {
+          g.state = 'alert_chaser';
+        } else {
+          // Settore tornato idle: la guardia torna a PATROL quando non ha più target diretto
+          if (g.state === 'alert_chaser' && !g.seenPlayer) {
+            g.state = 'patrol';
+            g.path = null;
+            g.pathTargetCol = null;
+            g.pathTargetRow = null;
+          }
+        }
+      });
+
+      updateModeVisual();
+    }
+
+    // FOV sempre ridisegnati (forme e colori)
+    renderGuardFov();
+  }
+
+
+  // --------------------------------------------------
+  // Guard look direction oscillation & aiming
+  // --------------------------------------------------
+
+  function updateGuardLookDirection(guard) {
+    guard.lookTick = (guard.lookTick || 0) + 1;
+
+    // Change every 4 steps for smoother wobble
+    if (guard.lookTick % 4 !== 0) {
+      return;
+    }
+
+    // 0 -> center
+    // 1 -> positive
+    // 2 -> center
+    // 3 -> negative
+    guard.lookPhase = ((guard.lookPhase || 0) + 1) % 4;
+  }
+
+  function aimGuardAtTarget(guard, targetCol, targetRow) {
+    const dx = targetCol - guard.col;
+    const dy = targetRow - guard.row;
+
+    if (dx === 0 && dy === 0) {
+      return;
+    }
+
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      guard.dirX = dx > 0 ? 1 : -1;
+      guard.dirY = 0;
+    } else {
+      guard.dirX = 0;
+      guard.dirY = dy > 0 ? 1 : -1;
+    }
+  }
+
+  // --------------------------------------------------
+  // Rectangular patrol
+  // --------------------------------------------------
+
+  function withinGuardRect(guard, col, row) {
+    return (
+      col >= guard.minCol &&
+      col <= guard.maxCol &&
+      row >= guard.minRow &&
+      row <= guard.maxRow
+    );
+  }
+
+  function rotateGuardDirClockwise(guard) {
+    const dx = guard.dirX;
+    const dy = guard.dirY;
+    // (1,0) -> (0,1) -> (-1,0) -> (0,-1) -> ...
+    if (dx === 1 && dy === 0) {
+      guard.dirX = 0; guard.dirY = 1;
+    } else if (dx === 0 && dy === 1) {
+      guard.dirX = -1; guard.dirY = 0;
+    } else if (dx === -1 && dy === 0) {
+      guard.dirX = 0; guard.dirY = -1;
+    } else if (dx === 0 && dy === -1) {
+      guard.dirX = 1; guard.dirY = 0;
+    } else {
+      guard.dirX = 1;
+      guard.dirY = 0;
+    }
+  }
+
+  function stepGuardPatrol(guard) {
+    // If guard is outside its patrol rect, move back towards it
+    if (!withinGuardRect(guard, guard.col, guard.row)) {
+      let targetCol = guard.col;
+      let targetRow = guard.row;
+
+      if (guard.col < guard.minCol) targetCol = guard.col + 1;
+      else if (guard.col > guard.maxCol) targetCol = guard.col - 1;
+
+      if (guard.row < guard.minRow) targetRow = guard.row + 1;
+      else if (guard.row > guard.maxRow) targetRow = guard.row - 1;
+
+      const stepX = targetCol - guard.col;
+      const stepY = targetRow - guard.row;
+
+      let nextCol = guard.col;
+      let nextRow = guard.row;
+
+      if (stepX !== 0 && isWalkable(guard.col + Math.sign(stepX), guard.row) &&
+          !isCellOccupiedByOtherGuard(guard.col + Math.sign(stepX), guard.row, guard)) {
+        nextCol = guard.col + Math.sign(stepX);
+        nextRow = guard.row;
+      } else if (stepY !== 0 && isWalkable(guard.col, guard.row + Math.sign(stepY)) &&
+                 !isCellOccupiedByOtherGuard(guard.col, guard.row + Math.sign(stepY), guard)) {
+        nextCol = guard.col;
+        nextRow = guard.row + Math.sign(stepY);
+      }
+
+      guard.col = nextCol;
+      guard.row = nextRow;
+      clampGuard(guard);
+      updateGuardPosition(guard);
+      updateGuardLookDirection(guard);
+      return;
+    }
+
+    // Normal rectangular patrol inside rect
+    let nextCol = guard.col + guard.dirX;
+    let nextRow = guard.row + guard.dirY;
+
+    // If it leaves its rectangle, rotate and retry
+    if (!withinGuardRect(guard, nextCol, nextRow)) {
+      rotateGuardDirClockwise(guard);
+      nextCol = guard.col + guard.dirX;
+      nextRow = guard.row + guard.dirY;
+
+      if (!withinGuardRect(guard, nextCol, nextRow)) {
+        updateGuardLookDirection(guard);
+        updateGuardPosition(guard);
+        return;
+      }
+    }
+
+    // If it hits Orca code or another guard, try to rotate to go around it
+    if (!isWalkable(nextCol, nextRow) ||
+        isCellOccupiedByOtherGuard(nextCol, nextRow, guard)) {
+      rotateGuardDirClockwise(guard);
+      nextCol = guard.col + guard.dirX;
+      nextRow = guard.row + guard.dirY;
+
+      if (!withinGuardRect(guard, nextCol, nextRow) ||
+          !isWalkable(nextCol, nextRow) ||
+          isCellOccupiedByOtherGuard(nextCol, nextRow, guard)) {
+        updateGuardLookDirection(guard);
+        updateGuardPosition(guard);
+        return;
+      }
+    }
+
+    guard.col = nextCol;
+    guard.row = nextRow;
+    clampGuard(guard);
+
+    updateGuardLookDirection(guard);
+    updateGuardPosition(guard);
+  }
+
+  // --------------------------------------------------
+  // Preferred alert targets (cardinal "slots" around player)
+  // --------------------------------------------------
+
+  function getSectorGuards(sectorName) {
+    return guards.filter((g) => {
+      if (g.state === 'stunned') return false;
+      const s = getSector(g.col, g.row);
+      return s === sectorName;
+    });
+  }
+  
+    // --------------------------------------------------
+  // Assegnazione slot cardinali per l'accerchiamento
+  // --------------------------------------------------
+  function assignSectorCardinals() {
+    const sectors = { NW: [], NE: [], SW: [], SE: [] };
+
+    guards.forEach((g) => {
+      if (g.state === 'stunned') {
+        g.preferredCardinal = null;
+        return;
+      }
+      const s = getSector(g.col, g.row);
+      if (!sectors[s]) sectors[s] = [];
+      sectors[s].push(g);
+    });
+
+    const dirs = ['N', 'E', 'S', 'W'];
+
+    ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+      const list = sectors[name] || [];
+      for (let i = 0; i < list.length; i++) {
+        const g = list[i];
+        g.preferredCardinal = dirs[i % dirs.length];
+      }
+    });
+  }
+
+    function computePreferredAlertTarget(guard) {
+    const sectorName = getSector(guard.col, guard.row);
+    const sa = sectorAlerts[sectorName];
+    if (!sa || sa.state !== 'tracking') {
+      // Nessun alert attivo per il settore: resta dove sei
+      return { col: guard.col, row: guard.row };
+    }
+
+    // Posizione assoluta del player mentre il settore è in tracking
+    const px = playerCol;
+    const py = playerRow;
+
+    // Slot cardinale assegnato in assignSectorCardinals()
+    const slotDir = guard.preferredCardinal || 'N';
+
+    const maxR = 6;
+    for (let r = 2; r <= maxR; r++) {
+      let cx = px;
+      let cy = py;
+
+      if (slotDir === 'N') {
+        cy = py - r;
+      } else if (slotDir === 'S') {
+        cy = py + r;
+      } else if (slotDir === 'W') {
+        cx = px - r;
+      } else {
+        // 'E' o fallback
+        cx = px + r;
+      }
+
+      if (cx < 0 || cy < 0 || cx >= gridCols || cy >= gridRows) continue;
+      if (!isWalkable(cx, cy)) continue;
+      if (cx === px && cy === py) continue; // non puntare la cella del player
+
+      return { col: cx, row: cy };
+    }
+
+    // Fallback: piccolo anello attorno al player
+    for (let r = 1; r <= maxR; r++) {
+      const candidates = [
+        { col: px + r, row: py },
+        { col: px - r, row: py },
+        { col: px, row: py + r },
+        { col: px, row: py - r }
+      ];
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        if (c.col < 0 || c.row < 0 || c.col >= gridCols || c.row >= gridRows) continue;
+        if (!isWalkable(c.col, c.row)) continue;
+        if (c.col === px && c.row === py) continue;
+        return c;
+      }
+    }
+
+    // Ultima risorsa: vai proprio verso il player
+    return { col: px, row: py };
+  }
+
+
+  // --------------------------------------------------
+  // Alert / chasing behavior (uses BFS towards preferred target)
+  // --------------------------------------------------
+
+  function stepGuardAlert(guard) {
+    if (guard.state === 'stunned') return;
+
+    const sectorName = getSector(guard.col, guard.row);
+    const sa = sectorAlerts[sectorName];
+
+    if (!sa || sa.state !== 'tracking') {
+      // Sector not in alert: back to patrol
+      guard.state = 'patrol';
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
+      updateGuardPosition(guard);
+      return;
+    }
+
+    // If this guard currently sees the real player, stop rushing closer:
+    // just orient, and if needed, try a very small local reposition
+    // to get line-of-shot.
+    if (guard.seenPlayer) {
+      const tx = playerCol;
+      const ty = playerRow;
+
+      aimGuardAtTarget(guard, tx, ty);
+
+      // Already have line-of-shot -> stand and shoot from here
+      if (hasLineOfShot(guard, tx, ty)) {
+        updateGuardLookDirection(guard);
+        updateGuardPosition(guard);
+        return;
+      }
+
+      // Try tiny local moves (4-neighborhood) to gain line-of-shot
+      const localDirs = [
+        { dx: 1, dy: 0 },
+        { dx: -1, dy: 0 },
+        { dx: 0, dy: 1 },
+        { dx: 0, dy: -1 }
+      ];
+
+      for (let i = 0; i < localDirs.length; i++) {
+        const d = localDirs[i];
+        const nc = guard.col + d.dx;
+        const nr = guard.row + d.dy;
+
+        if (nc < 0 || nr < 0 || nc >= gridCols || nr >= gridRows) continue;
+        if (nc === playerCol && nr === playerRow) continue;
+        if (!isWalkable(nc, nr)) continue;
+        if (isCellOccupiedByOtherGuard(nc, nr, guard)) continue;
+
+        const tmp = { col: nc, row: nr };
+        if (!hasLineOfShot(tmp, tx, ty)) continue;
+
+        guard.col = nc;
+        guard.row = nr;
+        aimGuardAtTarget(guard, tx, ty);
+        clampGuard(guard);
+        updateGuardPosition(guard);
+        updateGuardLookDirection(guard);
+        return;
+      }
+
+      // Cannot improve, stay still and keep looking
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      return;
+    }
+
+    // Guard does NOT currently see the player but sector is tracking:
+    // chase towards a preferred cardinal shooting slot around the player.
+    const preferred = computePreferredAlertTarget(guard);
+    const targetCol = preferred.col;
+    const targetRow = preferred.row;
+
+    aimGuardAtTarget(guard, playerCol, playerRow);
+
+    ensureGuardPath(guard, targetCol, targetRow);
+
+    if (!guard.path) {
+      // Cannot find path: just look around in place
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      return;
+    }
+
+    const moved = stepGuardAlongPath(guard);
+    if (!moved) {
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      return;
+    }
+
+    updateGuardLookDirection(guard);
+  }
+
+  function stepGuard(guard) {
+    // STUNNED state
+    if (guard.state === 'stunned') {
+      if (guard.stunTicks > 0) {
+        guard.stunTicks--;
+        return;
+      } else {
+        // Wake up and go back to PATROL
+        guard.state = 'patrol';
+        guard.neutralized = false;
+        guard.stunTicks = 0;
+        if (guard.el) guard.el.style.opacity = '1.0';
+        return;
+      }
+    }
+
+    // ALERT_CHASER state: faster movement (multiple steps per tick)
+    if (guard.state === 'alert_chaser') {
+      for (let i = 0; i < ALERT_STEPS_PER_TICK; i++) {
+        stepGuardAlert(guard);
+        if (guard.state !== 'alert_chaser') {
+          break;
+        }
       }
       return;
     }
 
-    // 4) Tutti gli altri tasti in GAME mode NON devono arrivare a Orca
-    ev.preventDefault();
-    ev.stopPropagation();
+    // Default: PATROL
+    for (let i = 0; i < PATROL_STEPS_PER_TICK; i++) {
+      stepGuardPatrol(guard);
+    }
+  }
 
-    const lower = key.toLowerCase();
+  // --------------------------------------------------
+  // Collisions & damage
+  // --------------------------------------------------
 
-    // Se non e' WASD, non facciamo nulla a livello di gioco (ma lo abbiamo bloccato per Orca)
-    if (lower !== 'w' && lower !== 'a' && lower !== 's' && lower !== 'd') {
-      if (DEBUG) {
-        console.log('[overlay] Key blocked in GAME mode (not WASD, not Space):', key);
-      }
+  function neutralizeGuard(guard) {
+    if (guard.state === 'stunned') return;
+    guard.state = 'stunned';
+    guard.neutralized = true;
+    guard.stunTicks = 12; // 12 ticks * 250ms ≈ 3s
+    guard.path = null;
+    guard.pathTargetCol = null;
+    guard.pathTargetRow = null;
+    guard.seenPlayer = false;
+    guard.wasSeeingPlayer = false;
+    guard.fovCells = [];
+    if (guard.el) {
+      guard.el.style.opacity = '0.25';
+    }
+    console.log('[overlay] GUARD STUNNED by player (3s):', guard.id);
+  }
+
+  function applyPlayerHit(source) {
+    if (playerHitCooldown > 0) {
       return;
     }
 
-    // WASD = movimento del player
-    let targetCol = playerCol;
-    let targetRow = playerRow;
+    playerHP--;
+    if (playerHP < 0) playerHP = 0;
+    const srcId = source && source.id ? source.id : 'unknown';
+    console.log(
+      '[overlay] PLAYER HIT by',
+      srcId,
+      'HP:',
+      playerHP,
+      '/',
+      playerHPMax
+    );
 
-    if (lower === 'w') targetRow -= 1;
-    if (lower === 's') targetRow += 1;
-    if (lower === 'a') targetCol -= 1;
-    if (lower === 'd') targetCol += 1;
+    // Small cooldown to avoid taking damage every single tick
+    playerHitCooldown = 4; // ~1s of invulnerability at 250ms per tick
+
+    // Update HUD
+    updateModeVisual();
+
+    // Flash red
+    if (overlayDiv) {
+      overlayDiv.style.background = 'rgba(255, 0, 0, 0.35)';
+      setTimeout(() => {
+        updateModeVisual();
+      }, 150);
+    }
+
+    if (playerHP <= 0) {
+      console.log('[overlay] PLAYER DEAD (restart logic not implemented yet)');
+      // TODO: reset level / respawn
+    }
+  }
+
+  function isPlayerBehindGuard(guard) {
+    const dx = guard.dirX;
+    const dy = guard.dirY;
+
+    if (dx === 0 && dy === 0) return false;
+
+    const backCol = guard.col - dx;
+    const backRow = guard.row - dy;
+
+    return (
+      playerCol === guard.col &&
+      playerRow === guard.row &&
+      prevPlayerCol === backCol &&
+      prevPlayerRow === backRow
+    );
+  }
+
+  function checkGuardPlayerCollisions() {
+    guards.forEach((guard) => {
+      if (guard.state === 'stunned') return;
+      if (guard.col === playerCol && guard.row === playerRow) {
+        if (isPlayerBehindGuard(guard)) {
+          // Stealth takedown from behind
+          neutralizeGuard(guard);
+          updateAllFovAndAlert();
+        } else {
+          // All other collisions: player takes damage
+          applyPlayerHit(guard);
+        }
+      }
+    });
+  }
+
+  // --------------------------------------------------
+  // Guards tick
+  // --------------------------------------------------
+
+    function stepAllGuards() {
+    if (mode !== 'game') return;
+
+    // Cooldown danno al player
+    if (playerHitCooldown > 0) {
+      playerHitCooldown--;
+    }
+
+    // Assegna slot cardinali per settore (N/E/S/W) una volta per tick
+    assignSectorCardinals();
+
+    // 1) Tick di "percezione": aggiorna FOV + stati di alert + memoria 3s
+    updateAllFovAndAlert(true);
+
+    // 2) Movimento guardie (patrol / alert / stunned)
+    guards.forEach(stepGuard);
+
+    // 3) Ricalcola solo le forme dei FOV dopo il movimento (senza toccare timer)
+    updateAllFovAndAlert(false);
+
+    // 4) Attacchi a distanza
+    guards.forEach(shootingTickForGuard);
+
+    // 5) Movimento proiettili
+    stepBullets();
+
+    // 6) Collisioni corpo a corpo (stealth / danno)
+    checkGuardPlayerCollisions();
+  }
+
+
+  // --------------------------------------------------
+  // Player movement
+  // --------------------------------------------------
+
+  function tryMovePlayer(dCol, dRow, newDir) {
+    prevPlayerCol = playerCol;
+    prevPlayerRow = playerRow;
+
+    let targetCol = playerCol + dCol;
+    let targetRow = playerRow + dRow;
 
     if (targetCol < 0) targetCol = 0;
     if (targetRow < 0) targetRow = 0;
@@ -266,17 +1697,83 @@
 
     if (!isWalkable(targetCol, targetRow)) {
       if (DEBUG) {
-        console.log('[overlay] MOVE BLOCKED at', targetCol, targetRow, 'glyph=', JSON.stringify(getOrcaGlyph(targetCol, targetRow)));
+        console.log(
+          '[overlay] MOVE BLOCKED at',
+          targetCol,
+          targetRow,
+          'glyph=',
+          JSON.stringify(getOrcaGlyph(targetCol, targetRow))
+        );
       }
       return;
     }
 
     playerCol = targetCol;
     playerRow = targetRow;
-    clampPlayer();
-    updatePlayerPosition();
+    playerDir = newDir;
 
-    log('player moved to', playerCol, playerRow);
+        clampPlayer();
+    updatePlayerPosition();
+    updatePlayerDirectionVisual();
+    // update only FOV, alert and guard reactions will be done in the main tick
+    updateAllFovAndAlert(false);
+    checkGuardPlayerCollisions();
+
+
+    log('player moved to', playerCol, playerRow, 'dir=', playerDir);
+  }
+
+  // --------------------------------------------------
+  // Keyboard input
+  // --------------------------------------------------
+
+  function onKeyDown(ev) {
+    const key = ev.key;
+
+    // Toggle mode (F1)
+    if (key === 'F1') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleMode();
+      return;
+    }
+
+    // EDIT mode: let Orca handle everything
+    if (mode === 'edit') {
+      return;
+    }
+
+    // GAME mode
+    if (key === ' ') {
+      // Space goes to Orca (clock)
+      if (DEBUG) {
+        console.log('[overlay] Space in GAME mode: letting it pass to Orca.');
+      }
+      return;
+    }
+
+    // Block everything else, except WASD
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const lower = key.toLowerCase();
+
+    if (lower !== 'w' && lower !== 'a' && lower !== 's' && lower !== 'd') {
+      if (DEBUG) {
+        console.log('[overlay] Key blocked in GAME mode (not WASD, not Space):', key);
+      }
+      return;
+    }
+
+    if (lower === 'w') {
+      tryMovePlayer(0, -1, 'up');
+    } else if (lower === 's') {
+      tryMovePlayer(0, 1, 'down');
+    } else if (lower === 'a') {
+      tryMovePlayer(-1, 0, 'left');
+    } else if (lower === 'd') {
+      tryMovePlayer(1, 0, 'right');
+    }
   }
 
   // --------------------------------------------------
@@ -287,12 +1784,13 @@
     log('initOverlay start');
 
     ensureOverlayElements();
+    initGuardsFromConfig();
     syncGeometry();
 
     window.addEventListener('resize', syncGeometry);
-
-    // Importante: capture = true, cosi' intercettiamo PRIMA di Orca
     window.addEventListener('keydown', onKeyDown, true);
+
+    guardTimer = window.setInterval(stepAllGuards, WORLD_TICK_MS);
 
     log('overlay initialized.');
     console.log('[overlay] Start in EDIT mode. Press F1 to switch to GAME mode.');
@@ -302,3 +1800,4 @@
     setTimeout(initOverlay, 300);
   });
 })();
+
