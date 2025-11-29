@@ -167,6 +167,42 @@
   };
 
   // --------------------------------------------------
+  // Patch liberation test (4 corner markers + ORCA write)
+  // --------------------------------------------------
+
+  const PATCH_RECT = {
+    x: 16,
+    y: 24,
+    w: 23, // 38 - 16 + 1
+    h: 12  // 35 - 24 + 1
+  };
+
+  const PATCH_MARKERS_DEFS = [
+    { id: 'tl', col: 16, row: 24 },
+    { id: 'tr', col: 38, row: 24 },
+    { id: 'bl', col: 16, row: 35 },
+    { id: 'br', col: 38, row: 35 }
+  ];
+
+  // Patch content that will be injected when all markers are activated
+  const PATCH_UNLOCK_BLOCK =
+    '.......................\n' +
+    '..D4...................\n' +
+    '..*......aC2..H........\n' +
+    '..:71Czz..111GS........\n' +
+    '.......................\n' +
+    '..............S2I3.....\n' +
+    '................13TFbC.\n' +
+    '................2Xb....\n' +
+    '.................b.....\n' +
+    '.......................\n' +
+    '..............:61bzz...\n' +
+    '.......................';
+
+  let patchMarkersContainer = null;
+  let patchMarkers = [];
+  let patchLiberated = false;
+  // --------------------------------------------------
   // Basic helpers
   // --------------------------------------------------
 
@@ -247,6 +283,17 @@
     bulletsContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(bulletsContainer);
 
+    // Patch liberation markers (above bullets, below player)
+    patchMarkersContainer = document.createElement('div');
+    patchMarkersContainer.id = 'orca-stealth-patch-markers';
+    patchMarkersContainer.style.position = 'absolute';
+    patchMarkersContainer.style.left = '0';
+    patchMarkersContainer.style.top = '0';
+    patchMarkersContainer.style.width = '100%';
+    patchMarkersContainer.style.height = '100%';
+    patchMarkersContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(patchMarkersContainer);
+
     // PLAYER ------------------------------------------------------
     playerDiv = document.createElement('div');
     playerDiv.id = 'orca-stealth-player';
@@ -288,8 +335,10 @@
 
     updateModeVisual();
     updatePlayerDirectionVisual();
+    initPatchMarkersDom();
 
     log('Overlay DOM created.');
+
   }
 
   function anySectorTracking() {
@@ -302,37 +351,62 @@
   }
 
   function updateModeVisual() {
-    if (!overlayDiv) return;
-    const hud = document.getElementById('orca-stealth-hud');
+  if (!overlayDiv) return;
+  const hud = document.getElementById('orca-stealth-hud');
 
-    const inAlert = (globalAlertLevel > 0) || anySectorTracking();
+  const inAlert = (globalAlertLevel > 0) || anySectorTracking();
 
-    if (mode === 'edit') {
-      overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
-      if (hud) {
-        hud.textContent = '[MODE: EDIT] HP ' + playerHP + '/' + playerHPMax;
-        hud.style.color = '#ffffff';
-      }
+  if (mode === 'edit') {
+    overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
+    if (hud) {
+      hud.textContent = '[MODE: EDIT] HP ' + playerHP + '/' + playerHPMax;
+      hud.style.color = '#ffffff';
+    }
+  } else {
+    const alertText = inAlert ? 'ALERT' : 'STEALTH';
+    if (inAlert) {
+      overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
     } else {
-      const alertText = inAlert ? 'ALERT' : 'STEALTH';
-      if (inAlert) {
-        overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
-      } else {
-        overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
-      }
-      if (hud) {
-        hud.textContent =
-          '[MODE: GAME] HP ' +
-          playerHP +
-          '/' +
-          playerHPMax +
-          '  [' +
-          alertText +
-          ']  (F1: toggle, WASD: move, Space: Orca clock)';
-        hud.style.color = '#ffffff';
-      }
+      overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
+    }
+    if (hud) {
+      hud.textContent =
+        '[MODE: GAME] HP ' +
+        playerHP +
+        '/' +
+        playerHPMax +
+        '  [' +
+        alertText +
+        ']  (F1: toggle, Arrows: move, Space: Orca clock)';
+      hud.style.color = '#ffffff';
     }
   }
+
+  // Re-position HUD after any change
+  updateHudLayout();
+}
+
+// Position HUD in the bottom band of Orca, slightly to the right
+// of the built-in Orca status text.
+function updateHudLayout() {
+  const hud = document.getElementById('orca-stealth-hud');
+  if (!hud || !overlayDiv) return;
+  if (cellW <= 0 || cellH <= 0) return;
+
+  // Choose an anchor column to the right of Orca's own HUD text.
+  // 0.5 ~ middle of the grid; 0.6 pushes it a bit further right.
+  const anchorCol = Math.floor(gridCols * 0.55);
+  const anchorRow = gridRows - 1; // bottom row
+
+  const x = anchorCol * cellW;
+  const y = anchorRow * cellH;
+
+  hud.style.left = x + 'px';
+  hud.style.top = (y + cellH * 0.15) + 'px'; // small offset inside the band
+  hud.style.right = 'auto';
+  hud.style.bottom = 'auto';
+}
+
 
   function toggleMode() {
     mode = (mode === 'edit') ? 'game' : 'edit';
@@ -485,18 +559,23 @@
     if (playerCol < 0) playerCol = 0;
     if (playerRow < 0) playerRow = 0;
 
-    clampGuards();
+     clampGuards();
 
-        updatePlayerPosition();
+    updatePlayerPosition();
     updatePlayerDirectionVisual();
     guards.forEach(updateGuardPosition);
     updateAllBulletsPosition();
+    updatePatchMarkersPosition();
 
     // only FOV, no alert memory
     updateAllFovAndAlert(false);
 
 
+    // Re-position HUD according to new canvas size / grid
+    updateHudLayout();
+
     log('Geometry synced:', {
+
       cssW,
       cssH,
       gridCols,
@@ -893,6 +972,126 @@
 
     bullets = survivors;
   }
+
+  // --------------------------------------------------
+  // Patch liberation markers + ORCA injection
+  // --------------------------------------------------
+
+  function initPatchMarkersDom() {
+    if (!patchMarkersContainer) return;
+
+    // Clear previous markers if any
+    patchMarkersContainer.innerHTML = '';
+    patchMarkers = [];
+
+    PATCH_MARKERS_DEFS.forEach((def) => {
+      const el = document.createElement('div');
+      el.className = 'orca-stealth-patch-marker';
+      el.style.position = 'absolute';
+      el.style.boxSizing = 'border-box';
+      el.style.display = 'flex';
+      el.style.alignItems = 'center';
+      el.style.justifyContent = 'center';
+      el.style.fontFamily = 'monospace';
+      el.style.fontSize = '12px';
+      el.style.fontWeight = 'bold';
+      el.style.color = '#ff5555'; // red
+      el.textContent = 'X';
+
+      patchMarkersContainer.appendChild(el);
+
+      patchMarkers.push({
+        id: def.id,
+        col: def.col,
+        row: def.row,
+        active: false,
+        el
+      });
+    });
+
+    updatePatchMarkersPosition();
+  }
+
+  function updatePatchMarkersPosition() {
+    if (!patchMarkers || patchMarkers.length === 0) return;
+    if (!patchMarkersContainer) return;
+
+    patchMarkers.forEach((m) => {
+      if (!m.el) return;
+      const x = m.col * cellW;
+      const y = m.row * cellH;
+      m.el.style.width = cellW + 'px';
+      m.el.style.height = cellH + 'px';
+      m.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+    });
+  }
+
+  function isAdjacentToMarker(marker) {
+    const dx = Math.abs(playerCol - marker.col);
+    const dy = Math.abs(playerRow - marker.row);
+    // Cardinal adjacency or same cell
+    return (dx + dy === 1) || (dx === 0 && dy === 0);
+  }
+
+  function tryActivateNearbyMarker() {
+    if (patchLiberated) return;
+    if (!patchMarkers || patchMarkers.length === 0) return;
+
+    // Activate one marker per key press
+    for (let i = 0; i < patchMarkers.length; i++) {
+      const m = patchMarkers[i];
+      if (m.active) continue;
+      if (!isAdjacentToMarker(m)) continue;
+
+      m.active = true;
+      if (m.el) {
+        m.el.textContent = 'O';
+        m.el.style.color = '#55ff55'; // green
+      }
+
+      console.log('[overlay] Patch marker', m.id, 'activated.');
+      break;
+    }
+
+    const allActive = patchMarkers.length > 0 && patchMarkers.every((m) => m.active);
+    if (allActive && !patchLiberated) {
+      liberatePatchInOrca();
+    }
+  }
+
+  function liberatePatchInOrca() {
+    const client = window.orcaClient;
+    if (!client || !client.orca) {
+      console.warn('[overlay] Cannot liberate patch: orcaClient.orca not available');
+      return;
+    }
+
+    const orca = client.orca;
+
+    // Inject the patch block at the given rectangle
+    orca.writeBlock(
+      PATCH_RECT.x,
+      PATCH_RECT.y,
+      PATCH_UNLOCK_BLOCK
+    );
+
+    patchLiberated = true;
+
+    console.log(
+      '[overlay] Patch liberated at',
+      PATCH_RECT.x,
+      PATCH_RECT.y,
+      'size',
+      PATCH_RECT.w,
+      'x',
+      PATCH_RECT.h
+    );
+
+    if (typeof client.update === 'function') {
+      client.update();
+    }
+  }
+
 
   function shootingTickForGuard(guard) {
     if (mode !== 'game') return;
@@ -1727,7 +1926,7 @@
   // Keyboard input
   // --------------------------------------------------
 
-  function onKeyDown(ev) {
+    function onKeyDown(ev) {
     const key = ev.key;
 
     // Toggle mode (F1)
@@ -1752,29 +1951,33 @@
       return;
     }
 
-    // Block everything else, except WASD
+    // Block everything else, except arrows and A
     ev.preventDefault();
     ev.stopPropagation();
 
-    const lower = key.toLowerCase();
-
-    if (lower !== 'w' && lower !== 'a' && lower !== 's' && lower !== 'd') {
+    if (key === 'ArrowUp') {
+      tryMovePlayer(0, -1, 'up');
+    } else if (key === 'ArrowDown') {
+      tryMovePlayer(0, 1, 'down');
+    } else if (key === 'ArrowLeft') {
+      tryMovePlayer(-1, 0, 'left');
+    } else if (key === 'ArrowRight') {
+      tryMovePlayer(1, 0, 'right');
+    } else if (key === 'a' || key === 'A') {
+      // Interaction key: try to activate a nearby marker
+      tryActivateNearbyMarker();
+    } else {
       if (DEBUG) {
-        console.log('[overlay] Key blocked in GAME mode (not WASD, not Space):', key);
+        console.log(
+          '[overlay] Key blocked in GAME mode (not arrows, not Space/A):',
+          key
+        );
       }
       return;
     }
-
-    if (lower === 'w') {
-      tryMovePlayer(0, -1, 'up');
-    } else if (lower === 's') {
-      tryMovePlayer(0, 1, 'down');
-    } else if (lower === 'a') {
-      tryMovePlayer(-1, 0, 'left');
-    } else if (lower === 'd') {
-      tryMovePlayer(1, 0, 'right');
-    }
   }
+
+
 
   // --------------------------------------------------
   // Init
