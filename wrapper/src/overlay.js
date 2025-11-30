@@ -67,17 +67,17 @@
   }
 
   // --------------------------------------------------
-  // Level config (minimal sandbox for guards)
+  // Level config (minimal sandbox for guards) + hook for external generator
   // --------------------------------------------------
 
-  const levelConfig = {
+  const defaultLevelConfig = {
     guards: [
       {
         id: 'g1',
         patrolType: 'rect',
-        startCol: 10,
-        startRow: 10,
-        rect: { minCol: 8, maxCol: 20, minRow: 8, maxRow: 14 },
+        startCol: 12,
+        startRow: 8,
+        rect: { minCol: 8, maxCol: 20, minRow: 6, maxRow: 12 },
         fovProfile: 'A',
         behavior: 'chaser'
       },
@@ -106,8 +106,118 @@
         depth: 9,
         widths: [1, 1, 3, 3, 3, 5, 5, 5, 7]
       }
-    }
+    },
+    // First liberation trigger: same four-corners test we already use
+    liberationTriggers: [
+      {
+        id: 'main_patch',
+        type: 'fourCorners',
+        corners: [
+          { col: 16, row: 24 },
+          { col: 38, row: 24 },
+          { col: 16, row: 35 },
+          { col: 38, row: 35 }
+        ],
+        targetBlock: {
+          x: 16,
+          y: 24,
+          w: 23,
+          h: 12
+        }
+      }
+    ]
   };
+
+  // Shallow merge of defaults with an optional external config.
+  // Intended shape of external config (window.orcaStealthLevelConfig or JSON):
+  // {
+  //   guards: [...],
+  //   fovProfiles: { ... },
+  //   liberationTriggers: [...]
+  // }
+  function mergeLevelConfig(baseCfg, externalCfg) {
+    if (!externalCfg || typeof externalCfg !== 'object') {
+      return baseCfg;
+    }
+
+    return {
+      guards: Array.isArray(externalCfg.guards)
+        ? externalCfg.guards
+        : baseCfg.guards,
+
+      fovProfiles: Object.assign(
+        {},
+        baseCfg.fovProfiles || {},
+        externalCfg.fovProfiles || {}
+      ),
+
+      liberationTriggers: Array.isArray(externalCfg.liberationTriggers)
+        ? externalCfg.liberationTriggers
+        : (baseCfg.liberationTriggers || [])
+    };
+  }
+
+  // Mutable current level config (starts from defaults, can be updated later).
+  let levelConfig = mergeLevelConfig(
+    defaultLevelConfig,
+    window.orcaStealthLevelConfig || null
+  );
+
+  // Mutable liberation triggers derived from current config.
+  let liberationTriggers = Array.isArray(levelConfig.liberationTriggers)
+    ? levelConfig.liberationTriggers
+    : [];
+
+  // Optional URL for auto-loading an external JSON level description.
+  // Put generated-level.json next to index.html / overlay.js, or change the path.
+  const LEVEL_JSON_URL = 'generated-level.json';
+
+  function applyExternalLevelConfig(externalCfg) {
+    const merged = mergeLevelConfig(defaultLevelConfig, externalCfg);
+    levelConfig = merged;
+    liberationTriggers = Array.isArray(merged.liberationTriggers)
+      ? merged.liberationTriggers
+      : [];
+
+    console.log('[overlay] Level config updated from external config:', merged);
+
+    // Rebuild guards and patch markers according to the new config.
+    initGuardsFromConfig();
+    initPatchMarkersDom();
+    syncGeometry();
+  }
+
+  function loadExternalLevelConfig() {
+    // 1) If something already wrote window.orcaStealthLevelConfig (via <script>),
+    // use that and skip JSON fetch.
+    if (window.orcaStealthLevelConfig) {
+      console.log('[overlay] Found window.orcaStealthLevelConfig, using it.');
+      applyExternalLevelConfig(window.orcaStealthLevelConfig);
+      return;
+    }
+
+    // 2) Try to fetch JSON. This is best-effort: if it fails we just keep defaults.
+    if (!window.fetch) {
+      console.warn('[overlay] fetch() not available, using default levelConfig.');
+      return;
+    }
+
+    fetch(LEVEL_JSON_URL, { cache: 'no-store' })
+      .then((resp) => {
+        if (!resp.ok) {
+          throw new Error('HTTP ' + resp.status);
+        }
+        return resp.json();
+      })
+      .then((json) => {
+        console.log('[overlay] Loaded external level config from JSON:', json);
+        applyExternalLevelConfig(json);
+      })
+      .catch((err) => {
+        console.warn('[overlay] Could not load ' + LEVEL_JSON_URL + ':', err);
+      });
+  }
+
 
   // --------------------------------------------------
   // Overlay state
@@ -167,9 +277,10 @@
   };
 
   // --------------------------------------------------
-  // Patch liberation test (4 corner markers + ORCA write)
+  // Patch zones / liberation (4-corners test, data-driven)
   // --------------------------------------------------
 
+  // Legacy rectangle kept as fallback in case a trigger has no explicit targetBlock.
   const PATCH_RECT = {
     x: 16,
     y: 24,
@@ -177,31 +288,69 @@
     h: 12  // 35 - 24 + 1
   };
 
-  const PATCH_MARKERS_DEFS = [
-    { id: 'tl', col: 16, row: 24 },
-    { id: 'tr', col: 38, row: 24 },
-    { id: 'bl', col: 16, row: 35 },
-    { id: 'br', col: 38, row: 35 }
-  ];
-
-  // Patch content that will be injected when all markers are activated
+  // Patch content that will be injected when a trigger is fully activated.
+  // For now we keep the same hardcoded demo block.
   const PATCH_UNLOCK_BLOCK =
-    '.......................\n' +
-    '..D4...................\n' +
-    '..*......aC2..H........\n' +
-    '..:71Czz..111GS........\n' +
-    '.......................\n' +
-    '..............S2I3.....\n' +
-    '................13TFbC.\n' +
-    '................2Xb....\n' +
-    '.................b.....\n' +
-    '.......................\n' +
-    '..............:61bzz...\n' +
-    '.......................';
+    '.\n' +
+    '.D4.\n' +
+    '.*.aC2.H.\n' +
+    '.:71Czz.111GS.\n' +
+    '.\n' +
+    '.S2I3.\n' +
+    '.13TFbC.\n' +
+    '.2Xb.\n' +
+    '.b.\n' +
+    '.\n' +
+    '.:61bzz.\n' +
+    '.';
+  
+  // Transform a commented block (with a rectangular '#' frame)
+  // into an uncommented one, keeping the same width/height.
+  // Assumes patch_to_level.js produced a frame like:
+  //   first/last row: "#.....#"
+  //   middle rows   : "#<code...>#"
+  function transformCommentedBlockForLiberation(blockStr) {
+    if (!blockStr || typeof blockStr !== 'string') {
+      return null;
+    }
 
+    const lines = blockStr.split(/\r?\n/);
+    if (lines.length === 0) {
+      return null;
+    }
+
+    const h = lines.length;
+    const outLines = [];
+
+    for (let y = 0; y < h; y++) {
+      const line = lines[y] || '';
+
+      // First and last row: horizontal frame only -> turn everything into dots.
+      if (y === 0 || y === h - 1) {
+        outLines.push('.'.repeat(line.length));
+        continue;
+      }
+
+      // Middle rows: remove only the vertical frame on the sides,
+      // keep the inner code exactly as it is.
+      if (line.length >= 2 && line[0] === '#' && line[line.length - 1] === '#') {
+        const middle = line.substring(1, line.length - 1);
+        outLines.push('.' + middle + '.');
+      } else {
+        // Not a framed row, keep as is.
+        outLines.push(line);
+      }
+    }
+
+    return outLines.join('\n');
+  }
+  
+
+  // Triggers loaded from levelConfig (usually provided by the generator).
   let patchMarkersContainer = null;
-  let patchMarkers = [];
+  let patchMarkers = []; // { id, corners, targetBlock, el, satisfiedCorners }
   let patchLiberated = false;
+
   // --------------------------------------------------
   // Basic helpers
   // --------------------------------------------------
@@ -415,39 +564,71 @@ function updateHudLayout() {
     console.log('[overlay] Mode changed to', mode.toUpperCase());
   }
 
-  // --------------------------------------------------
+    // --------------------------------------------------
   // Guards initialization from levelConfig
   // --------------------------------------------------
-
   function initGuardsFromConfig() {
     guards = [];
     if (!guardsContainer) return;
 
+    // Clear previous guards DOM (for when we reload a levelConfig).
+    while (guardsContainer.firstChild) {
+      guardsContainer.removeChild(guardsContainer.firstChild);
+    }
+
     const defs = levelConfig.guards || [];
 
     defs.forEach((cfg, index) => {
+      // Outer guard element, positioned by updateGuardPosition()
       const gEl = document.createElement('div');
       gEl.className = 'orca-stealth-guard';
+      gEl.dataset.guardId = cfg.id || ('guard_' + index);
       gEl.style.position = 'absolute';
-      gEl.style.boxSizing = 'border-box';
-      gEl.style.background = 'transparent';
-      gEl.style.border = 'none';
+      gEl.style.left = '0';
+      gEl.style.top = '0';
+      gEl.style.pointerEvents = 'none';
 
+      // Inner container, fills the guard cell
       const inner = document.createElement('div');
       inner.className = 'orca-stealth-guard-inner';
       inner.style.position = 'absolute';
-      inner.style.width = '70%';
-      inner.style.height = '70%';
-      inner.style.left = '15%';
-      inner.style.top = '15%';
-      inner.style.background = '#ff4444';
-      inner.style.borderRadius = '3px';
+      inner.style.left = '0';
+      inner.style.top = '0';
+      inner.style.width = '100%';
+      inner.style.height = '100%';
+      inner.style.pointerEvents = 'none';
+
+      // Red dot sprite in the center of the cell
+      const sprite = document.createElement('div');
+      sprite.className = 'orca-stealth-guard-sprite';
+      sprite.style.position = 'absolute';
+      sprite.style.left = '50%';
+      sprite.style.top = '50%';
+      sprite.style.width = '50%';
+      sprite.style.height = '50%';
+      sprite.style.transform = 'translate(-50%, -50%)';
+      sprite.style.borderRadius = '50%';
+      sprite.style.background = '#ff5555';
+      sprite.style.boxSizing = 'border-box';
+      sprite.style.border = '1px solid #ffcccc';
+      sprite.style.pointerEvents = 'none';
+      inner.appendChild(sprite);
+
+      // Optional per-guard FOV overlay (not used yet, kept for future use)
+      const fovOverlay = document.createElement('div');
+      fovOverlay.className = 'orca-stealth-guard-fov';
+      fovOverlay.style.position = 'absolute';
+      fovOverlay.style.left = '0';
+      fovOverlay.style.top = '0';
+      fovOverlay.style.width = '100%';
+      fovOverlay.style.height = '100%';
+      fovOverlay.style.pointerEvents = 'none';
+      inner.appendChild(fovOverlay);
 
       gEl.appendChild(inner);
       guardsContainer.appendChild(gEl);
 
       const rect = cfg.rect || {};
-
       const guard = {
         id: cfg.id || ('guard_' + index),
         patrolType: cfg.patrolType || 'rect',
@@ -463,6 +644,7 @@ function updateHudLayout() {
         fovProfileId: cfg.fovProfile || 'A',
         el: gEl,
         inner,
+        sprite,
         lookPhase: 0,
         lookTick: 0,
         fovCells: [],
@@ -485,6 +667,7 @@ function updateHudLayout() {
 
     log('Guards initialized from config:', guards.length);
   }
+
 
   // --------------------------------------------------
   // Reading glyphs from Orca
@@ -984,28 +1167,48 @@ function updateHudLayout() {
     patchMarkersContainer.innerHTML = '';
     patchMarkers = [];
 
-    PATCH_MARKERS_DEFS.forEach((def) => {
-      const el = document.createElement('div');
-      el.className = 'orca-stealth-patch-marker';
-      el.style.position = 'absolute';
-      el.style.boxSizing = 'border-box';
-      el.style.display = 'flex';
-      el.style.alignItems = 'center';
-      el.style.justifyContent = 'center';
-      el.style.fontFamily = 'monospace';
-      el.style.fontSize = '12px';
-      el.style.fontWeight = 'bold';
-      el.style.color = '#ff5555'; // red
-      el.textContent = 'X';
+    if (!liberationTriggers || liberationTriggers.length === 0) {
+      return;
+    }
 
-      patchMarkersContainer.appendChild(el);
+    liberationTriggers.forEach((trigger, triggerIndex) => {
+      if (!trigger || trigger.type !== 'fourCorners') {
+        return;
+      }
 
-      patchMarkers.push({
-        id: def.id,
-        col: def.col,
-        row: def.row,
-        active: false,
-        el
+      const corners = Array.isArray(trigger.corners) ? trigger.corners : [];
+      corners.forEach((corner, cornerIndex) => {
+        const col = corner.col;
+        const row = corner.row;
+
+        if (typeof col !== 'number' || typeof row !== 'number') {
+          return;
+        }
+
+        const el = document.createElement('div');
+        el.className = 'orca-stealth-patch-marker';
+        el.style.position = 'absolute';
+        el.style.boxSizing = 'border-box';
+        el.style.display = 'flex';
+        el.style.alignItems = 'center';
+        el.style.justifyContent = 'center';
+        el.style.fontFamily = 'monospace';
+        el.style.fontSize = '12px';
+        el.style.fontWeight = 'bold';
+        el.style.color = '#ff5555'; // red
+        el.textContent = 'X';
+
+        patchMarkersContainer.appendChild(el);
+
+        patchMarkers.push({
+          triggerId: trigger.id || ('trigger_' + triggerIndex),
+          triggerIndex,
+          cornerIndex,
+          col,
+          row,
+          active: false,
+          el
+        });
       });
     });
 
@@ -1037,7 +1240,9 @@ function updateHudLayout() {
     if (patchLiberated) return;
     if (!patchMarkers || patchMarkers.length === 0) return;
 
-    // Activate one marker per key press
+    let activatedMarker = null;
+
+    // Activate at most one marker per key press
     for (let i = 0; i < patchMarkers.length; i++) {
       const m = patchMarkers[i];
       if (m.active) continue;
@@ -1049,48 +1254,93 @@ function updateHudLayout() {
         m.el.style.color = '#55ff55'; // green
       }
 
-      console.log('[overlay] Patch marker', m.id, 'activated.');
+      activatedMarker = m;
+      console.log(
+        '[overlay] Patch marker',
+        m.triggerId + ':' + m.cornerIndex,
+        'activated.'
+      );
       break;
     }
 
-    const allActive = patchMarkers.length > 0 && patchMarkers.every((m) => m.active);
-    if (allActive && !patchLiberated) {
-      liberatePatchInOrca();
+    if (!activatedMarker) {
+      return;
+    }
+
+    const triggerIndex = activatedMarker.triggerIndex;
+    const trigger = liberationTriggers[triggerIndex];
+    if (!trigger) {
+      return;
+    }
+
+    // Check if all markers of this trigger are now active
+    const markersForTrigger = patchMarkers.filter(
+      (m) => m.triggerIndex === triggerIndex
+    );
+    const allActiveForTrigger =
+      markersForTrigger.length > 0 &&
+      markersForTrigger.every((m) => m.active);
+
+    if (allActiveForTrigger && !patchLiberated) {
+      liberatePatchInOrca(trigger);
     }
   }
 
-  function liberatePatchInOrca() {
+  function liberatePatchInOrca(trigger) {
     const client = window.orcaClient;
     if (!client || !client.orca) {
-      console.warn('[overlay] Cannot liberate patch: orcaClient.orca not available');
+      console.warn(
+        '[overlay] Cannot liberate patch: orcaClient.orca not available'
+      );
       return;
     }
 
     const orca = client.orca;
 
-    // Inject the patch block at the given rectangle
-    orca.writeBlock(
-      PATCH_RECT.x,
-      PATCH_RECT.y,
-      PATCH_UNLOCK_BLOCK
-    );
+    // Use trigger.targetBlock if provided, otherwise fall back to PATCH_RECT.
+    const rect = (trigger && trigger.targetBlock) ? trigger.targetBlock : PATCH_RECT;
+    const w = rect.w || PATCH_RECT.w;
+    const h = rect.h || PATCH_RECT.h;
 
+    let commentedBlock = null;
+    let unlockedBlock = null;
+
+    // Try to read the commented block currently present in Orca.
+    if (typeof orca.getBlock === 'function') {
+      try {
+        commentedBlock = orca.getBlock(rect.x, rect.y, w, h);
+      } catch (e) {
+        console.warn(
+          '[overlay] getBlock failed while liberating patch, using fallback block:',
+          e
+        );
+      }
+    }
+
+    if (commentedBlock) {
+      unlockedBlock = transformCommentedBlockForLiberation(commentedBlock);
+    }
+
+    // Fallback: if for some reason we did not obtain a block, keep
+    // using the old static demo block.
+    if (!unlockedBlock) {
+      console.warn(
+        '[overlay] No commented block found at rect, using static PATCH_UNLOCK_BLOCK.'
+      );
+      unlockedBlock = PATCH_UNLOCK_BLOCK;
+    }
+
+    orca.writeBlock(rect.x, rect.y, unlockedBlock);
     patchLiberated = true;
 
     console.log(
-      '[overlay] Patch liberated at',
-      PATCH_RECT.x,
-      PATCH_RECT.y,
-      'size',
-      PATCH_RECT.w,
-      'x',
-      PATCH_RECT.h
+      '[overlay] Patch liberated for trigger',
+      trigger && trigger.id ? trigger.id : '(no-id)',
+      'at rect',
+      rect
     );
-
-    if (typeof client.update === 'function') {
-      client.update();
-    }
   }
+
 
 
   function shootingTickForGuard(guard) {
@@ -1983,7 +2233,7 @@ function updateHudLayout() {
   // Init
   // --------------------------------------------------
 
-  function initOverlay() {
+    function initOverlay() {
     log('initOverlay start');
 
     ensureOverlayElements();
@@ -1994,6 +2244,9 @@ function updateHudLayout() {
     window.addEventListener('keydown', onKeyDown, true);
 
     guardTimer = window.setInterval(stepAllGuards, WORLD_TICK_MS);
+
+    // Try to load external level configuration (window.orcaStealthLevelConfig or JSON).
+    loadExternalLevelConfig();
 
     log('overlay initialized.');
     console.log('[overlay] Start in EDIT mode. Press F1 to switch to GAME mode.');

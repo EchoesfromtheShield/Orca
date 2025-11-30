@@ -1,0 +1,92 @@
+{
+  "guards": [
+    {
+      "id": "g1",
+      "patrolType": "rect",
+      "startCol": 12,
+      "startRow": 8,
+      "rect": {
+        "minCol": 8,
+        "maxCol": 20,
+        "minRow": 6,
+        "maxRow": 12
+      },
+      "fovProfile": "A",
+      "behavior": "chaser"
+    },
+    {
+      "id": "g2",
+      "patrolType": "rect",
+      "startCol": 40,
+      "startRow": 12,
+      "rect": {
+        "minCol": 36,
+        "maxCol": 50,
+        "minRow": 10,
+        "maxRow": 18
+      },
+      "fovProfile": "A",
+      "behavior": "chaser"
+    },
+    {
+      "id": "g3",
+      "patrolType": "rect",
+      "startCol": 25,
+      "startRow": 20,
+      "rect": {
+        "minCol": 22,
+        "maxCol": 32,
+        "minRow": 18,
+        "maxRow": 24
+      },
+      "fovProfile": "A",
+      "behavior": "chaser"
+    }
+  ],
+  "fovProfiles": {
+    "A": {
+      "depth": 9,
+      "widths": [
+        1,
+        1,
+        3,
+        3,
+        3,
+        5,
+        5,
+        5,
+        7
+      ]
+    }
+  },
+  "liberationTriggers": [
+    {
+      "id": "main_patch",
+      "type": "fourCorners",
+      "corners": [
+        {
+          "col": 16,
+          "row": 24
+        },
+        {
+          "col": 24,
+          "row": 24
+        },
+        {
+          "col": 16,
+          "row": 29
+        },
+        {
+          "col": 24,
+          "row": 29
+        }
+      ],
+      "targetBlock": {
+        "x": 16,
+        "y": 24,
+        "w": 9,
+        "h": 6
+      }
+    }
+  ]
+}
