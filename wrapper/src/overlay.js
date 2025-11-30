@@ -348,8 +348,10 @@
 
   // Triggers loaded from levelConfig (usually provided by the generator).
   let patchMarkersContainer = null;
-  let patchMarkers = []; // { id, corners, targetBlock, el, satisfiedCorners }
-  let patchLiberated = false;
+  let patchMarkers = []; // { triggerId, triggerIndex, cornerIndex, col, row, active, el }
+  // NOTE: we no longer use a global "patchLiberated" flag.
+  // Each trigger can be completed independently based on its own markers.
+
 
   // --------------------------------------------------
   // Basic helpers
@@ -1236,8 +1238,7 @@ function updateHudLayout() {
     return (dx + dy === 1) || (dx === 0 && dy === 0);
   }
 
-  function tryActivateNearbyMarker() {
-    if (patchLiberated) return;
+    function tryActivateNearbyMarker() {
     if (!patchMarkers || patchMarkers.length === 0) return;
 
     let activatedMarker = null;
@@ -1273,7 +1274,8 @@ function updateHudLayout() {
       return;
     }
 
-    // Check if all markers of this trigger are now active
+    // Check if all markers of this trigger are now active.
+    // This is per-trigger: completing one ritual does not affect the others.
     const markersForTrigger = patchMarkers.filter(
       (m) => m.triggerIndex === triggerIndex
     );
@@ -1281,10 +1283,11 @@ function updateHudLayout() {
       markersForTrigger.length > 0 &&
       markersForTrigger.every((m) => m.active);
 
-    if (allActiveForTrigger && !patchLiberated) {
+    if (allActiveForTrigger) {
       liberatePatchInOrca(trigger);
     }
   }
+
 
   function liberatePatchInOrca(trigger) {
     const client = window.orcaClient;
@@ -1330,8 +1333,7 @@ function updateHudLayout() {
       unlockedBlock = PATCH_UNLOCK_BLOCK;
     }
 
-    orca.writeBlock(rect.x, rect.y, unlockedBlock);
-    patchLiberated = true;
+        orca.writeBlock(rect.x, rect.y, unlockedBlock);
 
     console.log(
       '[overlay] Patch liberated for trigger',
@@ -1339,6 +1341,7 @@ function updateHudLayout() {
       'at rect',
       rect
     );
+
   }
 
 
