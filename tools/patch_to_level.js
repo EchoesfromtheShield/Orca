@@ -1345,6 +1345,16 @@ try {
 
   const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid);
 
+  // High-level layout type for the overlay:
+  // - "dungeon"  -> dungeon rules (per-room guards, fixed FOV, etc.)
+  // - everything else ("arena", "rooms_line", ...) -> arena-style rules
+  const layoutType =
+    (layout === 'dungeon')
+      ? 'dungeon'
+      : 'arena';
+
+  jsonConfig.layoutType = layoutType;
+
   fs.writeFileSync(outOrcaPath, orcaGrid, 'utf8');
   fs.writeFileSync(outJsonPath, JSON.stringify(jsonConfig, null, 2), 'utf8');
 
@@ -1353,6 +1363,7 @@ try {
   console.log('  JSON config:', outJsonPath);
   console.log('  Detected patches:', commentBlocksGlobal.length);
   console.log('  Layout:', layout, 'GUARDS_PER_PATCH:', GUARDS_PER_PATCH);
+  console.log('  layoutType exported for overlay:', layoutType);
   if (playerSpawn) {
     console.log(
       '  Player spawn:',
@@ -1360,6 +1371,7 @@ try {
       'row =', playerSpawn.row
     );
   }
+
 } catch (err) {
   console.error('[patch_to_level] Error:', err.message);
   process.exit(1);

@@ -61,6 +61,18 @@
   // Alert / memory (how long sectors remember player absolute position after losing sight)
   const ALERT_MEMORY_TICKS          = 12; // ~3s at 250ms
 
+ // Guard FOV mode di base:
+  //  - "wobble": guards sweep their view left/right (testa che oscilla)
+  //  - "fixed":  FOV sempre centrato nella direzione di movimento
+  const GUARD_FOV_MODE = 'wobble'; // default globale se non arriva layout dal JSON
+
+  // Flag runtime: può essere modificato per layout (arena vs dungeon).
+  // - true  -> FOV wobble (rotazione testa)
+  // - false -> FOV fisso (solo 'center')
+  let GUARD_FOV_WOBBLE_ENABLED = (GUARD_FOV_MODE === 'wobble');
+
+
+
   function log() {
     if (!DEBUG) return;
     console.log('[overlay]', ...arguments);
@@ -70,7 +82,12 @@
   // Level config (minimal sandbox for guards) + hook for external generator
   // --------------------------------------------------
 
-  const defaultLevelConfig = {
+    const defaultLevelConfig = {
+    // High-level layout type:
+    // "arena"   -> arena-style behavior (sector-based alert, wobbling FOV, etc.)
+    // "dungeon" -> dungeon-style behavior (room-based alert, fixed FOV, etc.)
+    layoutType: 'arena',
+
     guards: [
       {
         id: 'g1',
@@ -129,6 +146,7 @@
     playerSpawn: null
   };
 
+
   // Shallow merge of defaults with an optional external config.
   // Intended shape of external config (window.orcaStealthLevelConfig or JSON):
   // {
@@ -136,7 +154,7 @@
   //   fovProfiles: { ... },
   //   liberationTriggers: [...]
   // }
-    function mergeLevelConfig(baseCfg, externalCfg) {
+  function mergeLevelConfig(baseCfg, externalCfg) {
     if (!externalCfg || typeof externalCfg !== 'object') {
       return baseCfg;
     }
@@ -156,10 +174,12 @@
         ? externalCfg.liberationTriggers
         : (baseCfg.liberationTriggers || []),
 
-      playerSpawn: externalCfg.playerSpawn || baseCfg.playerSpawn || null
+      playerSpawn: externalCfg.playerSpawn || baseCfg.playerSpawn || null,
+
+      // New: carry high-level layout type from JSON
+      layoutType: externalCfg.layoutType || baseCfg.layoutType || 'arena'
     };
   }
-
 
   // Mutable current level config (starts from defaults, can be updated later).
   let levelConfig = mergeLevelConfig(
@@ -176,7 +196,7 @@
   // Put generated-level.json next to index.html / overlay.js, or change the path.
   const LEVEL_JSON_URL = 'generated-level.json';
 
-    function applyExternalLevelConfig(externalCfg) {
+      function applyExternalLevelConfig(externalCfg) {
     const merged = mergeLevelConfig(defaultLevelConfig, externalCfg);
     levelConfig = merged;
     liberationTriggers = Array.isArray(merged.liberationTriggers)
@@ -193,14 +213,31 @@
       playerRow = merged.playerSpawn.row;
     }
 
-    console.log('[overlay] Level config updated from external config:', merged);
+    // Decide behavior based on layoutType
+    const layoutType = merged.layoutType || 'arena';
+
+    // In dungeon: fixed FOV (no wobble).
+    // In arena: wobbling FOV.
+    if (layoutType === 'dungeon') {
+      GUARD_FOV_WOBBLE_ENABLED = false;
+    } else {
+      GUARD_FOV_WOBBLE_ENABLED = true;
+    }
+
+    console.log(
+      '[overlay] Level config updated from external config:',
+      merged,
+      'layoutType =',
+      layoutType,
+      'FOV wobble =',
+      GUARD_FOV_WOBBLE_ENABLED ? 'ON' : 'OFF'
+    );
 
     // Rebuild guards and patch markers according to the new config.
     initGuardsFromConfig();
     initPatchMarkersDom();
     syncGeometry();
   }
-
 
   function loadExternalLevelConfig() {
     // 1) If something already wrote window.orcaStealthLevelConfig (via <script>),
@@ -784,13 +821,28 @@ function updateHudLayout() {
 
   function ensureGuardsOnWalkableCells() {
     guards.forEach((g) => {
+      // If the guard is already on a walkable cell, do nothing
+      if (isWalkable(g.col, g.row)) {
+        return;
+      }
+
       const res = findNearestWalkableCell(g.col, g.row);
       if (res) {
         g.col = res.col;
         g.row = res.row;
+        clampGuard(g);
+        updateGuardPosition(g);
+        log(
+          '[overlay] Guard',
+          g.id,
+          'snapped from wall to nearest walkable at',
+          g.col,
+          g.row
+        );
       }
     });
   }
+
 
 
   // --------------------------------------------------
@@ -1462,6 +1514,53 @@ function updateHudLayout() {
     spawnBulletFromGuard(guard, realTargetCol, realTargetRow);
   }
 
+  // Line-of-sight for FOV: returns true only if all cells
+  // between (fromCol,fromRow) and (toCol,toRow) are walkable.
+  // We skip the starting cell (guard position) and require
+  // every intermediate + target cell to be walkable.
+  function hasLineOfSightForFov(fromCol, fromRow, toCol, toRow) {
+    let x0 = fromCol;
+    let y0 = fromRow;
+    const x1 = toCol;
+    const y1 = toRow;
+
+    const dx = Math.abs(x1 - x0);
+    const dy = Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+
+    let err = dx - dy;
+    let firstStep = true;
+
+    while (true) {
+      // Skip the starting cell (guard position), test everything else
+      if (!firstStep) {
+        if (!isWalkable(x0, y0)) {
+          return false;
+        }
+      } else {
+        firstStep = false;
+      }
+
+      // Reached destination
+      if (x0 === x1 && y0 === y1) {
+        break;
+      }
+
+      const e2 = 2 * err;
+      if (e2 > -dy) {
+        err -= dy;
+        x0 += sx;
+      }
+      if (e2 < dx) {
+        err += dx;
+        y0 += sy;
+      }
+    }
+
+    return true;
+  }
+
   // --------------------------------------------------
   // FOV for guards
   // --------------------------------------------------
@@ -1473,21 +1572,34 @@ function updateHudLayout() {
   }
 
   function getLookMode(guard) {
+    // Se il wobble è disabilitato (es. layout "dungeon"), FOV sempre centrato.
+    if (!GUARD_FOV_WOBBLE_ENABLED) {
+      return 'center';
+    }
+
+    // Comportamento "wobble": testa che oscilla fra center / positive / negative
     const phase = guard.lookPhase || 0;
     if (phase === 1) return 'positive';
     if (phase === 3) return 'negative';
     return 'center';
   }
 
-  function computeGuardFovCellsForGuard(guard) {
-    const cells = [];
 
+
+    function computeGuardFovCellsForGuard(guard) {
+    const result = [];
+
+    // Stunned guards have no FOV
     if (guard.state === 'stunned') {
-      return cells;
+      return result;
     }
 
-    if (guard.col < 0 || guard.col >= gridCols || guard.row < 0 || guard.row >= gridRows) {
-      return cells;
+    // Guard must be on-grid
+    if (
+      guard.col < 0 || guard.col >= gridCols ||
+      guard.row < 0 || guard.row >= gridRows
+    ) {
+      return result;
     }
 
     const profile = getFovProfile(guard) || {};
@@ -1496,85 +1608,148 @@ function updateHudLayout() {
 
     const dx = guard.dirX;
     const dy = guard.dirY;
+
+    // If guard has no facing direction, no FOV
+    if (dx === 0 && dy === 0) {
+      return result;
+    }
+
     const lookMode = getLookMode(guard);
+    const candidates = [];
 
-    for (let d = 1; d <= maxDist; d++) {
-      const w = widths[d - 1];
-      const half = (w - 1) / 2;
-
-      if (dx !== 0 && dy === 0) {
-        // Horizontal guard (right/left)
+    // --------------------------------------------------
+    // Horizontal facing (dx != 0, dy == 0)
+    // --------------------------------------------------
+    if (dx !== 0 && dy === 0) {
+      for (let d = 1; d <= maxDist; d++) {
         const forwardCol = guard.col + dx * d;
-        if (forwardCol < 0 || forwardCol >= gridCols) break;
+        if (forwardCol < 0 || forwardCol >= gridCols) {
+          break;
+        }
 
         const baseRow = guard.row;
+        const w = widths[d - 1];
+        const half = (w - 1) / 2;
+
         let startRow, endRow;
 
         if (lookMode === 'center') {
+          // Symmetric cone
           startRow = baseRow - half;
-          endRow = baseRow + half;
+          endRow   = baseRow + half;
         } else if (lookMode === 'positive') {
-          // Looking "down" (south): flat on the north side
+          // Tilted "down" (south): flat on the north side
           startRow = baseRow;
-          endRow = baseRow + (w - 1);
+          endRow   = baseRow + (w - 1);
         } else {
-          // Looking "up" (north): flat on the south side
+          // "negative": tilted "up" (north): flat on the south side
           startRow = baseRow - (w - 1);
-          endRow = baseRow;
+          endRow   = baseRow;
         }
 
         if (startRow > endRow) {
           const tmp = startRow;
           startRow = endRow;
-          endRow = tmp;
+          endRow   = tmp;
         }
 
-        if (endRow < 0 || startRow > gridRows - 1) continue;
+        if (endRow < 0 || startRow > gridRows - 1) {
+          continue;
+        }
+
         if (startRow < 0) startRow = 0;
-        if (endRow > gridRows - 1) endRow = gridRows - 1;
+        if (endRow   > gridRows - 1) endRow = gridRows - 1;
 
         for (let ry = startRow; ry <= endRow; ry++) {
-          cells.push({ col: forwardCol, row: ry });
+          candidates.push({ col: forwardCol, row: ry });
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // Vertical facing (dy != 0, dx == 0)
+    // --------------------------------------------------
+    else if (dy !== 0 && dx === 0) {
+      for (let d = 1; d <= maxDist; d++) {
+        const forwardRow = guard.row + dy * d;
+        if (forwardRow < 0 || forwardRow >= gridRows) {
+          break;
         }
 
-      } else if (dy !== 0 && dx === 0) {
-        // Vertical guard (up/down)
-        const forwardRow = guard.row + dy * d;
-        if (forwardRow < 0 || forwardRow >= gridRows) break;
-
         const baseCol = guard.col;
+        const w = widths[d - 1];
+        const half = (w - 1) / 2;
+
         let startCol, endCol;
 
         if (lookMode === 'center') {
+          // Symmetric cone
           startCol = baseCol - half;
-          endCol = baseCol + half;
+          endCol   = baseCol + half;
         } else if (lookMode === 'positive') {
-          // Looking "right" (east): flat on the west side
+          // Tilted "right" (east): flat on the west side
           startCol = baseCol;
-          endCol = baseCol + (w - 1);
+          endCol   = baseCol + (w - 1);
         } else {
-          // Looking "left" (west): flat on the east side
+          // "negative": tilted "left" (west): flat on the east side
           startCol = baseCol - (w - 1);
-          endCol = baseCol;
+          endCol   = baseCol;
         }
 
         if (startCol > endCol) {
           const tmp = startCol;
           startCol = endCol;
-          endCol = tmp;
+          endCol   = tmp;
         }
 
-        if (endCol < 0 || startCol > gridCols - 1) continue;
+        if (endCol < 0 || startCol > gridCols - 1) {
+          continue;
+        }
+
         if (startCol < 0) startCol = 0;
-        if (endCol > gridCols - 1) endCol = gridCols - 1;
+        if (endCol   > gridCols - 1) endCol = gridCols - 1;
 
         for (let cx = startCol; cx <= endCol; cx++) {
-          cells.push({ col: cx, row: forwardRow });
+          candidates.push({ col: cx, row: forwardRow });
         }
       }
     }
 
-    return cells;
+    // --------------------------------------------------
+    // Filter: bounds, walkable, LOS, dedupe
+    // --------------------------------------------------
+    const seen = new Set();
+
+    for (let i = 0; i < candidates.length; i++) {
+      const cell = candidates[i];
+      const c = cell.col;
+      const r = cell.row;
+
+      if (c < 0 || r < 0 || c >= gridCols || r >= gridRows) {
+        continue;
+      }
+
+      const key = c + ':' + r;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      // Do not draw FOV on non-walkable cells (walls, Orca code)
+      if (!isWalkable(c, r)) {
+        continue;
+      }
+
+      // Check line-of-sight from guard to this cell:
+      // if any non-walkable cell lies in between, this cell is occluded.
+      if (!hasLineOfSightForFov(guard.col, guard.row, c, r)) {
+        continue;
+      }
+
+      result.push({ col: c, row: r });
+    }
+
+    return result;
   }
 
   function renderGuardFov() {
@@ -2191,8 +2366,13 @@ function updateHudLayout() {
   // Guards tick
   // --------------------------------------------------
 
-    function stepAllGuards() {
+  function stepAllGuards() {
     if (mode !== 'game') return;
+
+    // Hard safety: make sure guards are never stuck inside walls.
+    // If a guard starts in a non-walkable cell (e.g. dungeon generator edge cases),
+    // we snap it once per tick to the nearest walkable cell.
+    ensureGuardsOnWalkableCells();
 
     // Cooldown danno al player
     if (playerHitCooldown > 0) {
@@ -2220,6 +2400,7 @@ function updateHudLayout() {
     // 6) Collisioni corpo a corpo (stealth / danno)
     checkGuardPlayerCollisions();
   }
+
 
 
   // --------------------------------------------------
