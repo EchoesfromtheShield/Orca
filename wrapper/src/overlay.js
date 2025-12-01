@@ -125,7 +125,8 @@
           h: 12
         }
       }
-    ]
+    ],
+    playerSpawn: null
   };
 
   // Shallow merge of defaults with an optional external config.
@@ -135,7 +136,7 @@
   //   fovProfiles: { ... },
   //   liberationTriggers: [...]
   // }
-  function mergeLevelConfig(baseCfg, externalCfg) {
+    function mergeLevelConfig(baseCfg, externalCfg) {
     if (!externalCfg || typeof externalCfg !== 'object') {
       return baseCfg;
     }
@@ -153,9 +154,12 @@
 
       liberationTriggers: Array.isArray(externalCfg.liberationTriggers)
         ? externalCfg.liberationTriggers
-        : (baseCfg.liberationTriggers || [])
+        : (baseCfg.liberationTriggers || []),
+
+      playerSpawn: externalCfg.playerSpawn || baseCfg.playerSpawn || null
     };
   }
+
 
   // Mutable current level config (starts from defaults, can be updated later).
   let levelConfig = mergeLevelConfig(
@@ -172,12 +176,22 @@
   // Put generated-level.json next to index.html / overlay.js, or change the path.
   const LEVEL_JSON_URL = 'generated-level.json';
 
-  function applyExternalLevelConfig(externalCfg) {
+    function applyExternalLevelConfig(externalCfg) {
     const merged = mergeLevelConfig(defaultLevelConfig, externalCfg);
     levelConfig = merged;
     liberationTriggers = Array.isArray(merged.liberationTriggers)
       ? merged.liberationTriggers
       : [];
+
+    // If the level config provides an explicit player spawn, use it.
+    if (
+      merged.playerSpawn &&
+      typeof merged.playerSpawn.col === 'number' &&
+      typeof merged.playerSpawn.row === 'number'
+    ) {
+      playerCol = merged.playerSpawn.col;
+      playerRow = merged.playerSpawn.row;
+    }
 
     console.log('[overlay] Level config updated from external config:', merged);
 
@@ -186,6 +200,7 @@
     initPatchMarkersDom();
     syncGeometry();
   }
+
 
   function loadExternalLevelConfig() {
     // 1) If something already wrote window.orcaStealthLevelConfig (via <script>),
@@ -688,7 +703,7 @@ function updateHudLayout() {
     return client.orca.glyphAt(col, row);
   }
 
-  function isWalkable(col, row) {
+    function isWalkable(col, row) {
     const g = getOrcaGlyph(col, row);
     const walkable = (g === '.');
     if (DEBUG) {
@@ -706,6 +721,77 @@ function updateHudLayout() {
     }
     return walkable;
   }
+
+  // --------------------------------------------------
+  // Spawn helpers: keep entities off walls
+  // --------------------------------------------------
+
+  // BFS search for nearest walkable cell starting from (startCol, startRow).
+  // Returns { col, row } or null if none found.
+  function findNearestWalkableCell(startCol, startRow) {
+    const client = window.orcaClient;
+    if (!client || !client.orca) {
+      // Orca not ready yet, do nothing special.
+      return null;
+    }
+
+    const width = gridCols;
+    const height = gridRows;
+
+    function idx(c, r) {
+      return r * width + c;
+    }
+
+    const visited = new Array(width * height).fill(false);
+    const queue = [];
+
+    function enqueue(c, r) {
+      if (c < 0 || r < 0 || c >= width || r >= height) return;
+      const i = idx(c, r);
+      if (visited[i]) return;
+      visited[i] = true;
+      queue.push({ col: c, row: r });
+    }
+
+    enqueue(startCol, startRow);
+
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      const c = cur.col;
+      const r = cur.row;
+
+      if (isWalkable(c, r)) {
+        return { col: c, row: r };
+      }
+
+      // 4-neighborhood
+      enqueue(c + 1, r);
+      enqueue(c - 1, r);
+      enqueue(c, r + 1);
+      enqueue(c, r - 1);
+    }
+
+    return null;
+  }
+
+  function ensurePlayerOnWalkableCell() {
+    const res = findNearestWalkableCell(playerCol, playerRow);
+    if (res) {
+      playerCol = res.col;
+      playerRow = res.row;
+    }
+  }
+
+  function ensureGuardsOnWalkableCells() {
+    guards.forEach((g) => {
+      const res = findNearestWalkableCell(g.col, g.row);
+      if (res) {
+        g.col = res.col;
+        g.row = res.row;
+      }
+    });
+  }
+
 
   // --------------------------------------------------
   // Geometry 1:1 with Orca
@@ -739,12 +825,16 @@ function updateHudLayout() {
     midCol = Math.floor(gridCols / 2);
     midRow = Math.floor(gridRows / 2);
 
-    if (playerCol >= gridCols) playerCol = gridCols - 1;
+        if (playerCol >= gridCols) playerCol = gridCols - 1;
     if (playerRow >= gridRows) playerRow = gridRows - 1;
     if (playerCol < 0) playerCol = 0;
     if (playerRow < 0) playerRow = 0;
 
-     clampGuards();
+    clampGuards();
+
+    // Make sure player and guards do not start inside walls.
+    ensurePlayerOnWalkableCell();
+    ensureGuardsOnWalkableCells();
 
     updatePlayerPosition();
     updatePlayerDirectionVisual();
@@ -754,6 +844,7 @@ function updateHudLayout() {
 
     // only FOV, no alert memory
     updateAllFovAndAlert(false);
+
 
 
     // Re-position HUD according to new canvas size / grid

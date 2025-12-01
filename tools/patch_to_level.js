@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//   node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch]
+//   node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -30,22 +30,20 @@
 //    - Liberation triggers are one per patch (one targetBlock per frame).
 //
 // 2) layout = "rooms_line"
-//    - Each patch (comment block) is extracted as its own patch grid.
-//    - For each patch we build a rectangular "room" with walls in 'y':
-//        - outer border: 'y' (non-walkable walls in the game)
-//        - interior: '.' (walkable floor)
-//        - patch (with its '#' frame) embedded inside, with margins
-//    - Rooms are placed in a horizontal line, with a configurable gap.
-//    - Below the rooms we create a corridor band:
-//        - center row: '.' (walkable corridor)
-//        - row above and below: 'y' (corridor walls)
-//    - Each room is connected to the corridor by a vertical shaft of '.'.
+//    - Ogni patch diventa una stanza rettangolare, chiusa da muri (WALL_CHAR),
+//      con il codice patch dentro e margini di pavimento '.' attorno.
+//    - Le stanze sono disposte in linea orizzontale, collegate da un corridoio
+//      orizzontale in basso e da un “pozzo” verticale per stanza.
 //
-// Room size is automatically adapted to patch size:
-//   innerW = patchWidth  + 2 * ROOM_MARGIN_X
-//   innerH = patchHeight + 2 * ROOM_MARGIN_Y
-//   roomW  = innerW + 2  (walls)
-//   roomH  = innerH + 2  (walls)
+// 3) layout = "dungeon"
+//    - Layout “dungeon-like” basato su stanze rettangolari + corridoi a L:
+//      * la griglia parte tutta piena di muri (WALL_CHAR);
+//      * per ogni patch viene “scavata” una stanza abbastanza grande per
+//        contenere la patch + margini (pavimento '.');
+//      * le stanze sono collegate fra loro in catena con corridoi a L
+//        (prima orizzontali, poi verticali) fra i loro centri;
+//      * le patch vengono infine inserite dentro le stanze; tutto il resto
+//        rimane muro.
 //
 // GUARDS:
 //
@@ -68,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar]');
   process.exit(1);
 }
 
@@ -82,18 +80,42 @@ let layout = layoutArg.toLowerCase();
 const guardsArg = process.argv[6] || process.env.GUARDS_PER_PATCH || process.env.GPP;
 const GUARDS_PER_PATCH = guardsArg ? Math.max(0, parseInt(guardsArg, 10) || 0) : 0;
 
+// Wall char: 7th CLI arg OR env.WALL_CHAR, default 'y'
+const wallCharCli  = process.argv[7];
+const wallCharEnv  = process.env.WALL_CHAR;
+const WALL_CHAR_RAW = (wallCharCli && wallCharCli.length > 0)
+  ? wallCharCli
+  : (wallCharEnv && wallCharEnv.length > 0 ? wallCharEnv : 'y');
+const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
+
 // Room size can be overridden via environment variables, e.g.
 //   ROOM_W=100 ROOM_H=40 node ...
-const ROOM_W = parseInt(process.env.ROOM_W, 10) || 80;
+const ROOM_W = parseInt(process.env.ROOM_W, 10) || 140;
 const ROOM_H = parseInt(process.env.ROOM_H, 10) || 40;
 
-// Margins for "rooms_line" layout (can be overridden via env)
+// Margins for layouts that build rooms from patches
+// rooms_line usa ROOM_MARGIN_X / ROOM_MARGIN_Y fissi.
+// dungeon usa i range MIN/MAX qui sotto per creare variabilita.
 const ROOM_MARGIN_X   = parseInt(process.env.ROOM_MARGIN_X, 10) || 2;
 const ROOM_MARGIN_Y   = parseInt(process.env.ROOM_MARGIN_Y, 10) || 1;
 const ROOM_GAP_COLS   = parseInt(process.env.ROOM_GAP_COLS, 10) || 4;
 
+// Dungeon: per lato, margini minimi e massimi intorno alla patch.
+// Default: 2..4 celle per lato, ma puoi alzare con
+//   ROOM_MARGIN_X_MAX / ROOM_MARGIN_Y_MAX
+const ROOM_MARGIN_X_MIN = parseInt(process.env.ROOM_MARGIN_X_MIN, 10) || ROOM_MARGIN_X;
+const ROOM_MARGIN_X_MAX = parseInt(process.env.ROOM_MARGIN_X_MAX, 10) || (ROOM_MARGIN_X + 2);
+const ROOM_MARGIN_Y_MIN = parseInt(process.env.ROOM_MARGIN_Y_MIN, 10) || ROOM_MARGIN_Y;
+const ROOM_MARGIN_Y_MAX = parseInt(process.env.ROOM_MARGIN_Y_MAX, 10) || (ROOM_MARGIN_Y + 2);
+
+// Dungeon: spessore corridoi (in celle), min/max.
+// Default: 1..4
+const CORRIDOR_WIDTH_MIN = parseInt(process.env.CORRIDOR_WIDTH_MIN, 10) || 1;
+const CORRIDOR_WIDTH_MAX = parseInt(process.env.CORRIDOR_WIDTH_MAX, 10) || 4;
+
+
 // Sanitize layout
-if (layout !== 'arena' && layout !== 'rooms_line') {
+if (layout !== 'arena' && layout !== 'rooms_line' && layout !== 'dungeon') {
   console.warn('[patch_to_level] Unknown layout "' + layout + '", falling back to "arena".');
   layout = 'arena';
 }
@@ -361,11 +383,238 @@ function buildLevelGrid(roomW, roomH, clusterGrid, originX, originY) {
   return grid.map((row) => row.join('')).join('\n') + '\n';
 }
 
+// ----- Generic helpers to work on ORCA grid strings -------------------
+
+// Convert "\n"-joined ORCA text into { grid, width, height }
+function stringToGrid(str) {
+  const lines = str.replace(/\n$/, '').split('\n');
+  const height = lines.length;
+  const width = lines[0].length;
+  const grid = lines.map((line) => line.split(''));
+  return { grid, width, height };
+}
+
+// Convert 2D char array back into ORCA text.
+function gridToString(grid) {
+  return grid.map((row) => row.join('')).join('\n') + '\n';
+}
+
+// Heuristically detect the wall character in a dungeon:
+// pick the most frequent non-dot, non-# glyph.
+function detectWallChar(grid) {
+  const counts = new Map();
+  for (let y = 0; y < grid.length; y++) {
+    const row = grid[y];
+    for (let x = 0; x < row.length; x++) {
+      const ch = row[x];
+      if (ch === '.' || ch === '#') continue;
+      const prev = counts.get(ch) || 0;
+      counts.set(ch, prev + 1);
+    }
+  }
+
+  let wallChar = 'x';
+  let bestCount = 0;
+  for (const [ch, count] of counts.entries()) {
+    if (count > bestCount) {
+      bestCount = count;
+      wallChar = ch;
+    }
+  }
+  return wallChar;
+}
+
+// BFS corridor digging: connect spawn room door to nearest existing floor cell ('.')
+function connectSpawnRoomToDungeon(
+  grid,
+  wallChar,
+  doorCol,
+  doorRow,
+  innerMinX,
+  innerMinY,
+  innerMaxX,
+  innerMaxY
+) {
+  const height = grid.length;
+  const width = grid[0].length;
+
+  function inSpawnInterior(x, y) {
+    return (
+      x >= innerMinX &&
+      x <= innerMaxX &&
+      y >= innerMinY &&
+      y <= innerMaxY
+    );
+  }
+
+  function idx(x, y) {
+    return y * width + x;
+  }
+
+  const visited = new Array(width * height).fill(false);
+  const prev = new Array(width * height).fill(-1);
+  const queue = [];
+
+  queue.push({ x: doorCol, y: doorRow });
+  visited[idx(doorCol, doorRow)] = true;
+
+  const dirs = [
+    { dx: 1, dy: 0 },
+    { dx: -1, dy: 0 },
+    { dx: 0, dy: 1 },
+    { dx: 0, dy: -1 }
+  ];
+
+  let targetIndex = -1;
+
+  while (queue.length > 0 && targetIndex === -1) {
+    const cur = queue.shift();
+    const cx = cur.x;
+    const cy = cur.y;
+
+    for (let i = 0; i < dirs.length; i++) {
+      const nx = cx + dirs[i].dx;
+      const ny = cy + dirs[i].dy;
+
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+
+      const ch = grid[ny][nx];
+
+      // For the search we allow existing floor '.' and solid walls `wallChar`.
+      // All other glyphs (patch code, operators, etc) are treated as obstacles.
+      if (ch !== wallChar && ch !== '.') continue;
+
+      const index = idx(nx, ny);
+      if (visited[index]) continue;
+
+      visited[index] = true;
+      prev[index] = idx(cx, cy);
+
+      // First floor we find that is NOT inside the spawn interior becomes our target.
+      if (ch === '.' && !inSpawnInterior(nx, ny)) {
+        targetIndex = index;
+        break;
+      }
+
+      queue.push({ x: nx, y: ny });
+    }
+  }
+
+  if (targetIndex === -1) {
+    console.warn(
+      '[patch_to_level] Spawn room created but no existing dungeon floor found to connect to.'
+    );
+    return;
+  }
+
+  const startIndex = idx(doorCol, doorRow);
+  let cur = targetIndex;
+
+  // Walk back from target to door and carve walls into floor.
+  while (cur !== -1 && cur !== startIndex) {
+    const cx = cur % width;
+    const cy = (cur - cx) / width;
+
+    if (!inSpawnInterior(cx, cy) && grid[cy][cx] === wallChar) {
+      grid[cy][cx] = '.';
+    }
+
+    cur = prev[cur];
+  }
+}
+
+// Inject a small 3x3 spawn room (5x5 including walls) into a dungeon layout,
+// connect it with a 1-tile corridor to the nearest existing floor,
+// and return the modified ORCA grid string plus playerSpawn coordinates.
+function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
+  const { grid, width, height } = stringToGrid(orcaGridStr);
+
+  // Detect which glyph is being used as "wall".
+  const wallChar = detectWallChar(grid);
+
+  const roomW = 5; // 3x3 interior + 1 wall on each side
+  const roomH = 5;
+
+  let spawnRoomX = null;
+  let spawnRoomY = null;
+
+  const maxStartX = Math.max(1, width - roomW - 1);
+  const maxStartY = Math.max(1, height - roomH - 1);
+
+  // Find a 5x5 area made entirely of walls, leaving a small border.
+  outer:
+  for (let y = 1; y <= maxStartY; y++) {
+    for (let x = 1; x <= maxStartX; x++) {
+      let ok = true;
+      for (let yy = 0; yy < roomH && ok; yy++) {
+        for (let xx = 0; xx < roomW; xx++) {
+          if (grid[y + yy][x + xx] !== wallChar) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if (ok) {
+        spawnRoomX = x;
+        spawnRoomY = y;
+        break outer;
+      }
+    }
+  }
+
+  // Fallback: if we did not find a full-wall region, just pick (1,1)
+  // and overwrite whatever is there (should be very rare).
+  if (spawnRoomX === null) {
+    spawnRoomX = 1;
+    spawnRoomY = 1;
+  }
+
+  const innerMinX = spawnRoomX + 1;
+  const innerMaxX = spawnRoomX + roomW - 2;
+  const innerMinY = spawnRoomY + 1;
+  const innerMaxY = spawnRoomY + roomH - 2;
+
+  // Carve 3x3 interior as walkable floor.
+  for (let y = innerMinY; y <= innerMaxY; y++) {
+    for (let x = innerMinX; x <= innerMaxX; x++) {
+      grid[y][x] = '.';
+    }
+  }
+
+  // Player spawn in the center of the 3x3 interior.
+  const spawnCol = innerMinX + Math.floor((innerMaxX - innerMinX) / 2);
+  const spawnRow = innerMinY + Math.floor((innerMaxY - innerMinY) / 2);
+
+  // Door cell: bottom-middle of the interior.
+  const doorCol = spawnCol;
+  const doorRow = innerMaxY;
+
+  // Dig a 1-tile corridor from the door to the nearest existing dungeon floor.
+  connectSpawnRoomToDungeon(
+    grid,
+    wallChar,
+    doorCol,
+    doorRow,
+    innerMinX,
+    innerMinY,
+    innerMaxX,
+    innerMaxY
+  );
+
+  const newStr = gridToString(grid);
+
+  return {
+    orcaGrid: newStr,
+    playerSpawn: { col: spawnCol, row: spawnRow }
+  };
+}
+
 // ----- JSON config generation -----------------------------------------
 //
-// commentBlocksGlobal: array of { id, x, y, w, h } in ROOM coordinates.
-
-function createLevelJson(commentBlocksGlobal) {
+// commentBlocksGlobal: array di { id, x, y, w, h } in coordinate ROOM.
+// playerSpawn: opzionale { col, row } con posizione di spawn suggerita del player.
+// levelGrid: griglia 2D di caratteri (array di righe) dell'ORCA level finale.
+function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
   const fovProfiles = {
     A: {
       depth: 9,
@@ -375,8 +624,29 @@ function createLevelJson(commentBlocksGlobal) {
 
   const guards = [];
 
+  // Helper: ritorna tutte le celle walkable ('.') dentro un rettangolo.
+  function collectWalkableCells(minCol, maxCol, minRow, maxRow) {
+    const cells = [];
+    if (!levelGrid || levelGrid.length === 0) {
+      return cells;
+    }
+    const h = levelGrid.length;
+    const w = levelGrid[0].length;
+
+    for (let row = minRow; row <= maxRow; row++) {
+      if (row < 0 || row >= h) continue;
+      for (let col = minCol; col <= maxCol; col++) {
+        if (col < 0 || col >= w) continue;
+        if (levelGrid[row][col] === '.') {
+          cells.push({ col, row });
+        }
+      }
+    }
+    return cells;
+  }
+
   if (GUARDS_PER_PATCH > 0 && commentBlocksGlobal.length > 0) {
-    // Data-driven guards around each patch
+    // Guards basate sui patch, ma stavolta agganciate a celle walkable.
     const margin = 2;
 
     commentBlocksGlobal.forEach((b, patchIndex) => {
@@ -388,14 +658,33 @@ function createLevelJson(commentBlocksGlobal) {
       const rectWidth  = Math.max(1, maxCol - minCol + 1);
       const rectHeight = Math.max(1, maxRow - minRow + 1);
 
+      const walkableCells = collectWalkableCells(minCol, maxCol, minRow, maxRow);
+
+      if (walkableCells.length === 0) {
+        console.warn(
+          '[patch_to_level] WARNING: no walkable cells found around patch',
+          b.id || patchIndex,
+          '— guards will fall back to rect center.'
+        );
+      }
+
       for (let i = 0; i < GUARDS_PER_PATCH; i++) {
         const gid = `g_${patchIndex}_${i}`;
 
-        // Simple spread of starting positions inside the rect
-        const offX = i % rectWidth;
-        const offY = Math.floor(i / rectWidth) % rectHeight;
-        const startCol = minCol + offX;
-        const startRow = minRow + offY;
+        let startCol;
+        let startRow;
+
+        if (walkableCells.length > 0) {
+          // Distribuiamo in modo deterministico le guardie sui walkable.
+          const idx = (patchIndex * GUARDS_PER_PATCH + i) % walkableCells.length;
+          startCol = walkableCells[idx].col;
+          startRow = walkableCells[idx].row;
+        } else {
+          // Fallback estremo: centro del rettangolo (potrebbe cadere su non-walkable,
+          // ma dovrebbe essere praticamente impossibile nel dungeon).
+          startCol = minCol + Math.floor(rectWidth / 2);
+          startRow = minRow + Math.floor(rectHeight / 2);
+        }
 
         guards.push({
           id: gid,
@@ -454,7 +743,6 @@ function createLevelJson(commentBlocksGlobal) {
     );
   }
 
-  // One liberation trigger per comment block, all using "fourCorners" for now.
   const liberationTriggers = commentBlocksGlobal.map((b, idx) => {
     const x = b.x;
     const y = b.y;
@@ -484,7 +772,8 @@ function createLevelJson(commentBlocksGlobal) {
   return {
     guards,
     fovProfiles,
-    liberationTriggers
+    liberationTriggers,
+    playerSpawn: playerSpawn || null
   };
 }
 
@@ -527,12 +816,6 @@ function buildArenaLayout(fullGrid) {
 }
 
 // ----- Layout: rooms_line ---------------------------------------------
-//
-// For each patch (comment block), build a "room" with walls = 'y',
-// interior = '.', and the patch embedded inside with margins.
-// Rooms are placed in a horizontal line, spaced by ROOM_GAP_COLS.
-// Below the rooms we create a corridor band (walls + floor) and connect
-// each room with a vertical shaft of '.'.
 
 function buildRoomsLineLayout(fullGrid) {
   const {
@@ -565,10 +848,10 @@ function buildRoomsLineLayout(fullGrid) {
     const roomW = innerW + 2; // walls left/right
     const roomH = innerH + 2; // walls top/bottom
 
-    // Room grid: start fully 'y' (walls)
+    // Room grid: start fully WALL_CHAR (walls)
     const roomGrid = [];
     for (let ry = 0; ry < roomH; ry++) {
-      const row = new Array(roomW).fill('y');
+      const row = new Array(roomW).fill(WALL_CHAR);
       roomGrid.push(row);
     }
 
@@ -695,12 +978,12 @@ function buildRoomsLineLayout(fullGrid) {
   for (let x = corridorStartX; x <= corridorEndX; x++) {
     if (corridorTopWall >= 0 && corridorTopWall < ROOM_H) {
       if (finalGrid[corridorTopWall][x] === '.') {
-        finalGrid[corridorTopWall][x] = 'y';
+        finalGrid[corridorTopWall][x] = WALL_CHAR;
       }
     }
     if (corridorBottomWall >= 0 && corridorBottomWall < ROOM_H) {
       if (finalGrid[corridorBottomWall][x] === '.') {
-        finalGrid[corridorBottomWall][x] = 'y';
+        finalGrid[corridorBottomWall][x] = WALL_CHAR;
       }
     }
     // corridorY row itself remains '.' as walkable floor
@@ -753,6 +1036,277 @@ function buildRoomsLineLayout(fullGrid) {
   return { orcaGrid, commentBlocksGlobal };
 }
 
+// ----- Layout: dungeon ------------------------------------------------
+
+function rectsOverlap(a, b) {
+  return !(
+    a.x + a.w <= b.x ||
+    b.x + b.w <= a.x ||
+    a.y + a.h <= b.y ||
+    b.y + b.h <= a.y
+  );
+}
+
+function randInt(min, max) {
+  if (max < min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+// Carve a horizontal corridor centered on centerY, from x1 to x2,
+// with a given vertical thickness "width".
+function carveHorizontalCorridor(grid, centerY, x1, x2, width) {
+  const h = grid.length;
+  const w = grid[0].length;
+
+  const startX = Math.max(0, Math.min(x1, x2));
+  const endX   = Math.min(w - 1, Math.max(x1, x2));
+
+  const halfBelow = Math.floor((width - 1) / 2);
+  const halfAbove = width - 1 - halfBelow;
+
+  const yStart = Math.max(0, centerY - halfBelow);
+  const yEnd   = Math.min(h - 1, centerY + halfAbove);
+
+  for (let y = yStart; y <= yEnd; y++) {
+    for (let x = startX; x <= endX; x++) {
+      grid[y][x] = '.';
+    }
+  }
+}
+
+// Carve a vertical corridor centered on centerX, from y1 to y2,
+// with a given horizontal thickness "width".
+function carveVerticalCorridor(grid, centerX, y1, y2, width) {
+  const h = grid.length;
+  const w = grid[0].length;
+
+  const startY = Math.max(0, Math.min(y1, y2));
+  const endY   = Math.min(h - 1, Math.max(y1, y2));
+
+  const halfLeft  = Math.floor((width - 1) / 2);
+  const halfRight = width - 1 - halfLeft;
+
+  const xStart = Math.max(0, centerX - halfLeft);
+  const xEnd   = Math.min(w - 1, centerX + halfRight);
+
+  for (let y = startY; y <= endY; y++) {
+    for (let x = xStart; x <= xEnd; x++) {
+      grid[y][x] = '.';
+    }
+  }
+}
+
+function buildDungeonLayout(fullGrid) {
+  const {
+    clusterGrid,
+    clusterWidth,
+    clusterHeight,
+    blocks
+  } = prepareCommentedCluster(fullGrid);
+
+  if (blocks.length === 0) {
+    throw new Error('buildDungeonLayout: no patches found.');
+  }
+
+  // Extract patches as independent blocks
+  const patchDescs = blocks.map((b, idx) => {
+    const sub = sliceGrid(
+      clusterGrid,
+      b.x,
+      b.y,
+      b.x + b.w - 1,
+      b.y + b.h - 1
+    );
+    return {
+      id: `patch_${idx}`,
+      patchWidth: sub.width,
+      patchHeight: sub.height,
+      patchGrid: sub.grid
+    };
+  });
+
+  // Final grid: initially full of walls
+  const finalGrid = [];
+  for (let y = 0; y < ROOM_H; y++) {
+    const row = new Array(ROOM_W).fill(WALL_CHAR);
+    finalGrid.push(row);
+  }
+
+  const placedRooms = [];
+  const roomRects = [];
+
+    // Place rooms like a simple random-dungeon algorithm,
+  // but with variable margins per room and HARD no-overlap.
+  patchDescs.forEach((p) => {
+    const pw = p.patchWidth;
+    const ph = p.patchHeight;
+
+    // Random margins around patch
+    const marginX = randInt(ROOM_MARGIN_X_MIN, ROOM_MARGIN_X_MAX);
+    const marginY = randInt(ROOM_MARGIN_Y_MIN, ROOM_MARGIN_Y_MAX);
+
+    const innerW = pw + marginX * 2;
+    const innerH = ph + marginY * 2;
+
+    const fullW = innerW + 2; // + walls
+    const fullH = innerH + 2;
+
+    let rectX = 0;
+    let rectY = 0;
+
+    const maxRectX = Math.max(0, ROOM_W - fullW);
+    const maxRectY = Math.max(0, ROOM_H - fullH);
+
+    let placed = false;
+
+    if (maxRectX < 0 || maxRectY < 0) {
+      // Room larger than map: we accept clipping, but still avoid crashing.
+      console.warn(
+        '[patch_to_level] Dungeon: room for',
+        p.id,
+        'bigger than map, clipping at (0,0).'
+      );
+      rectX = 0;
+      rectY = 0;
+      placed = true;
+    } else {
+      // 1) Random attempts for variety
+      let attempts = 0;
+      const MAX_RANDOM_ATTEMPTS = 100;
+
+      while (attempts < MAX_RANDOM_ATTEMPTS && !placed) {
+        const candidate = {
+          x: randInt(0, maxRectX),
+          y: randInt(0, maxRectY),
+          w: fullW,
+          h: fullH
+        };
+        const overlap = roomRects.some((rr) => rectsOverlap(rr, candidate));
+        if (!overlap) {
+          rectX = candidate.x;
+          rectY = candidate.y;
+          placed = true;
+          break;
+        }
+        attempts++;
+      }
+
+      // 2) Deterministic scan: guarantee non-overlap if it exists
+      if (!placed) {
+        outerScan:
+        for (let y = 0; y <= maxRectY; y++) {
+          for (let x = 0; x <= maxRectX; x++) {
+            const candidate = { x, y, w: fullW, h: fullH };
+            const overlap = roomRects.some((rr) => rectsOverlap(rr, candidate));
+            if (!overlap) {
+              rectX = x;
+              rectY = y;
+              placed = true;
+              break outerScan;
+            }
+          }
+        }
+      }
+
+      // 3) Se ancora non c'è spazio, falliamo con errore esplicito
+      if (!placed) {
+        throw new Error(
+          '[patch_to_level] Dungeon: could not place room for ' +
+          p.id +
+          ' without overlap. Increase ROOM_W/ROOM_H or reduce number/size of patches.'
+        );
+      }
+    }
+
+    const floorX = rectX + 1;
+    const floorY = rectY + 1;
+
+    // Dig interior floor
+    for (let y = floorY; y < floorY + innerH; y++) {
+      if (y < 0 || y >= ROOM_H) continue;
+      for (let x = floorX; x < floorX + innerW; x++) {
+        if (x < 0 || x >= ROOM_W) continue;
+        finalGrid[y][x] = '.';
+      }
+    }
+
+    const centerX = floorX + Math.floor(innerW / 2);
+    const centerY = floorY + Math.floor(innerH / 2);
+
+    const patchOffsetX = floorX + marginX;
+    const patchOffsetY = floorY + marginY;
+
+    const roomInfo = {
+      ...p,
+      innerW,
+      innerH,
+      fullW,
+      fullH,
+      rectX,
+      rectY,
+      floorX,
+      floorY,
+      centerX,
+      centerY,
+      patchOffsetX,
+      patchOffsetY
+    };
+
+    placedRooms.push(roomInfo);
+    roomRects.push({ x: rectX, y: rectY, w: fullW, h: fullH });
+  });
+
+
+  // Connect rooms with L-shaped corridors of variable thickness
+  for (let i = 0; i < placedRooms.length - 1; i++) {
+    const r1 = placedRooms[i];
+    const r2 = placedRooms[i + 1];
+
+    const x1 = r1.centerX;
+    const y1 = r1.centerY;
+    const x2 = r2.centerX;
+    const y2 = r2.centerY;
+
+    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, CORRIDOR_WIDTH_MAX);
+    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, CORRIDOR_WIDTH_MAX);
+
+    // Horizontal segment
+    carveHorizontalCorridor(finalGrid, y1, x1, x2, corridorWidthH);
+    // Vertical segment
+    carveVerticalCorridor(finalGrid, x2, y1, y2, corridorWidthV);
+  }
+
+  // Insert patch grids into their rooms
+  const commentBlocksGlobal = [];
+
+  placedRooms.forEach((r) => {
+    const pw = r.patchWidth;
+    const ph = r.patchHeight;
+
+    for (let py = 0; py < ph; py++) {
+      const gy = r.patchOffsetY + py;
+      if (gy < 0 || gy >= ROOM_H) continue;
+      for (let px = 0; px < pw; px++) {
+        const gx = r.patchOffsetX + px;
+        if (gx < 0 || gx >= ROOM_W) continue;
+        finalGrid[gy][gx] = r.patchGrid[py][px];
+      }
+    }
+
+    commentBlocksGlobal.push({
+      id: r.id,
+      x: r.patchOffsetX,
+      y: r.patchOffsetY,
+      w: r.patchWidth,
+      h: r.patchHeight
+    });
+  });
+
+  const orcaGrid = finalGrid.map((row) => row.join('')).join('\n') + '\n';
+  return { orcaGrid, commentBlocksGlobal };
+}
+
+
 // ----- Main -----------------------------------------------------------
 
 try {
@@ -764,15 +1318,32 @@ try {
   if (layout === 'rooms_line') {
     console.log('[patch_to_level] Using layout: rooms_line');
     layoutResult = buildRoomsLineLayout(fullGrid);
+  } else if (layout === 'dungeon') {
+    console.log('[patch_to_level] Using layout: dungeon');
+    // Usa il tuo generatore dungeon esistente.
+    layoutResult = buildDungeonLayout(fullGrid);
   } else {
     console.log('[patch_to_level] Using layout: arena');
     layoutResult = buildArenaLayout(fullGrid);
   }
 
-  const orcaGrid   = layoutResult.orcaGrid;
-  const commentBlocksGlobal = layoutResult.commentBlocksGlobal;
+  let orcaGrid = layoutResult.orcaGrid;
+  const commentBlocksGlobal = layoutResult.commentBlocksGlobal || [];
+  let playerSpawn = layoutResult.playerSpawn || null;
 
-  const jsonConfig = createLevelJson(commentBlocksGlobal);
+  // Solo per il layout dungeon: aggiungi una piccola stanza di spawn
+  // dedicata, collegata al dungeon con un corridoio 1-cella.
+  if (layout === 'dungeon') {
+    const spawnResult = injectPlayerSpawnRoomIntoDungeon(orcaGrid);
+    orcaGrid = spawnResult.orcaGrid;
+    playerSpawn = spawnResult.playerSpawn;
+  }
+
+    // Converto l'ORCA finale in griglia per sapere dove sono i muri/floor.
+  const levelGridInfo = stringToGrid(orcaGrid);
+  const levelGrid = levelGridInfo.grid;
+
+  const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid);
 
   fs.writeFileSync(outOrcaPath, orcaGrid, 'utf8');
   fs.writeFileSync(outJsonPath, JSON.stringify(jsonConfig, null, 2), 'utf8');
@@ -782,7 +1353,15 @@ try {
   console.log('  JSON config:', outJsonPath);
   console.log('  Detected patches:', commentBlocksGlobal.length);
   console.log('  Layout:', layout, 'GUARDS_PER_PATCH:', GUARDS_PER_PATCH);
+  if (playerSpawn) {
+    console.log(
+      '  Player spawn:',
+      'col =', playerSpawn.col,
+      'row =', playerSpawn.row
+    );
+  }
 } catch (err) {
   console.error('[patch_to_level] Error:', err.message);
   process.exit(1);
 }
+
