@@ -611,10 +611,11 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
 
 // ----- JSON config generation -----------------------------------------
 //
-// commentBlocksGlobal: array di { id, x, y, w, h } in coordinate ROOM.
-// playerSpawn: opzionale { col, row } con posizione di spawn suggerita del player.
-// levelGrid: griglia 2D di caratteri (array di righe) dell'ORCA level finale.
-function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
+// commentBlocksGlobal: array of { id, x, y, w, h } in ROOM coordinates.
+// playerSpawn: optional { col, row } suggested spawn for the player.
+// levelGrid: 2D grid (array of rows) of the final ORCA level.
+// layout: string, "arena" | "rooms_line" | "dungeon".
+function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   const fovProfiles = {
     A: {
       depth: 9,
@@ -624,7 +625,24 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
 
   const guards = [];
 
-  // Helper: ritorna tutte le celle walkable ('.') dentro un rettangolo.
+  // Decide high-level layout type used by overlay.js
+  const layoutType = (layout === 'dungeon') ? 'dungeon' : 'arena';
+
+  // Defaults:
+  // - dungeon  -> guards per room (per patch) default 2
+  // - arena    -> guards per sector (N/S/W/E) default 3
+  const DEFAULT_DUNGEON_GUARDS_PER_ROOM   = 2;
+  const DEFAULT_ARENA_GUARDS_PER_SECTOR   = 3;
+
+  // GUARDS_PER_PATCH is reused:
+  // - in dungeon: "guards per room"
+  // - in arena:   "guards per sector"
+  const dungeonGuardsPerRoom =
+    (GUARDS_PER_PATCH > 0) ? GUARDS_PER_PATCH : DEFAULT_DUNGEON_GUARDS_PER_ROOM;
+  const arenaGuardsPerSector =
+    (GUARDS_PER_PATCH > 0) ? GUARDS_PER_PATCH : DEFAULT_ARENA_GUARDS_PER_SECTOR;
+
+  // Helper: collect all walkable ('.') cells inside a rectangle.
   function collectWalkableCells(minCol, maxCol, minRow, maxRow) {
     const cells = [];
     if (!levelGrid || levelGrid.length === 0) {
@@ -645,68 +663,226 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
     return cells;
   }
 
-  if (GUARDS_PER_PATCH > 0 && commentBlocksGlobal.length > 0) {
-    // Guards basate sui patch, ma stavolta agganciate a celle walkable.
-    const margin = 2;
+  // Helper: choose up to "count" cells with the constraint
+  // that no two chosen cells share the same row or column.
+  // If strict placement is impossible, we relax to "unique cell only".
+  function pickGuardSpawnsInArea(allCells, count) {
+    const result = [];
+    if (!allCells || allCells.length === 0 || count <= 0) {
+      return result;
+    }
 
-    commentBlocksGlobal.forEach((b, patchIndex) => {
-      const minCol = Math.max(0, b.x - margin);
-      const maxCol = Math.min(ROOM_W - 1, b.x + b.w - 1 + margin);
-      const minRow = Math.max(0, b.y - margin);
-      const maxRow = Math.min(ROOM_H - 1, b.y + b.h - 1 + margin);
+    // Fisher–Yates shuffle to randomize candidates
+    const cells = allCells.slice();
+    for (let i = cells.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = cells[i];
+      cells[i] = cells[j];
+      cells[j] = tmp;
+    }
 
-      const rectWidth  = Math.max(1, maxCol - minCol + 1);
-      const rectHeight = Math.max(1, maxRow - minRow + 1);
-
-      const walkableCells = collectWalkableCells(minCol, maxCol, minRow, maxRow);
-
-      if (walkableCells.length === 0) {
-        console.warn(
-          '[patch_to_level] WARNING: no walkable cells found around patch',
-          b.id || patchIndex,
-          '— guards will fall back to rect center.'
-        );
+    function isOkStrict(cell) {
+      // No same row, no same column among already chosen cells
+      for (let i = 0; i < result.length; i++) {
+        const p = result[i];
+        if (p.col === cell.col) return false;
+        if (p.row === cell.row) return false;
       }
+      return true;
+    }
 
-      for (let i = 0; i < GUARDS_PER_PATCH; i++) {
-        const gid = `g_${patchIndex}_${i}`;
+    function isOkRelaxed(cell) {
+      // Only avoid exact duplicates (same cell)
+      for (let i = 0; i < result.length; i++) {
+        const p = result[i];
+        if (p.col === cell.col && p.row === cell.row) return false;
+      }
+      return true;
+    }
 
-        let startCol;
-        let startRow;
+    // First pass: try strict constraint
+    for (let i = 0; i < cells.length && result.length < count; i++) {
+      const c = cells[i];
+      if (isOkStrict(c)) {
+        result.push(c);
+      }
+    }
 
-        if (walkableCells.length > 0) {
-          // Distribuiamo in modo deterministico le guardie sui walkable.
-          const idx = (patchIndex * GUARDS_PER_PATCH + i) % walkableCells.length;
-          startCol = walkableCells[idx].col;
-          startRow = walkableCells[idx].row;
-        } else {
-          // Fallback estremo: centro del rettangolo (potrebbe cadere su non-walkable,
-          // ma dovrebbe essere praticamente impossibile nel dungeon).
-          startCol = minCol + Math.floor(rectWidth / 2);
-          startRow = minRow + Math.floor(rectHeight / 2);
+    // Second pass: relax constraint if we still don't have enough
+    if (result.length < count) {
+      for (let i = 0; i < cells.length && result.length < count; i++) {
+        const c = cells[i];
+        if (isOkRelaxed(c)) {
+          result.push(c);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  // --------------------------------------------------------------------
+  // DUNGEON: spawn per room (per patch), default 2 guards per room.
+  // Guards patrol a rectangle around the patch (patch rect expanded by margin).
+  // --------------------------------------------------------------------
+  if (layoutType === 'dungeon') {
+    if (commentBlocksGlobal.length === 0) {
+      console.warn('[patch_to_level] Dungeon layout but no patches; falling back to legacy guards.');
+    } else {
+      const margin = 2;
+
+      commentBlocksGlobal.forEach((b, patchIndex) => {
+        const minCol = Math.max(0, b.x - margin);
+        const maxCol = Math.min(ROOM_W - 1, b.x + b.w - 1 + margin);
+        const minRow = Math.max(0, b.y - margin);
+        const maxRow = Math.min(ROOM_H - 1, b.y + b.h - 1 + margin);
+
+        const walkableCells = collectWalkableCells(minCol, maxCol, minRow, maxRow);
+
+        if (walkableCells.length === 0) {
+          console.warn(
+            '[patch_to_level] WARNING (dungeon): no walkable cells around patch',
+            b.id || patchIndex,
+            '— guards will be skipped for this room.'
+          );
+          return;
         }
 
-        guards.push({
-          id: gid,
-          patrolType: 'rect',
-          startCol,
-          startRow,
-          rect: { minCol, maxCol, minRow, maxRow },
-          fovProfile: 'A',
-          behavior: 'chaser'
-        });
-      }
-    });
+        const spawnCells = pickGuardSpawnsInArea(walkableCells, dungeonGuardsPerRoom);
 
-    console.log(
-      '[patch_to_level] Guards generated from patches:',
-      guards.length,
-      '(per patch =',
-      GUARDS_PER_PATCH,
-      ')'
-    );
-  } else {
-    // Legacy static 3-guard config (fallback)
+        spawnCells.forEach((cell, i) => {
+          const gid = `room_${patchIndex}_${i}`;
+          guards.push({
+            id: gid,
+            patrolType: 'rect',
+            startCol: cell.col,
+            startRow: cell.row,
+            rect: { minCol, maxCol, minRow, maxRow },
+            fovProfile: 'A',
+            behavior: 'chaser'
+          });
+        });
+      });
+
+      console.log(
+        '[patch_to_level] Dungeon guards generated:',
+        guards.length,
+        '(per room =',
+        dungeonGuardsPerRoom,
+        ')'
+      );
+    }
+  }
+
+    // --------------------------------------------------------------------
+  // ARENA (and rooms_line treated as arena-style):
+  // spawn per quadrant: NW / NE / SW / SE.
+  //
+  // Partition strategy (disjoint rectangles, matching overlay.js):
+  //   - NW: row < midRow, col < midCol
+  //   - NE: row < midRow, col >= midCol
+  //   - SW: row >= midRow, col < midCol
+  //   - SE: row >= midRow, col >= midCol
+  //
+  // Default 3 guards per quadrant, never in "single-file" row/column if possible.
+  // --------------------------------------------------------------------
+  if (layoutType === 'arena') {
+    if (!levelGrid || levelGrid.length === 0) {
+      console.warn('[patch_to_level] Arena layout but empty levelGrid; no guards generated.');
+    } else {
+      const h = levelGrid.length;
+      const w = levelGrid[0].length;
+
+      // Same split logic used by overlay.js for sectorAlerts / getSector().
+      const midRow = Math.floor(h / 2);
+      const midCol = Math.floor(w / 2);
+
+      const sectors = {
+        NW: { cells: [], minCol: w, maxCol: -1, minRow: h, maxRow: -1 },
+        NE: { cells: [], minCol: w, maxCol: -1, minRow: h, maxRow: -1 },
+        SW: { cells: [], minCol: w, maxCol: -1, minRow: h, maxRow: -1 },
+        SE: { cells: [], minCol: w, maxCol: -1, minRow: h, maxRow: -1 }
+      };
+
+      // Assign every walkable cell ('.') to exactly one quadrant.
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          if (levelGrid[row][col] !== '.') continue;
+
+          let sectorName;
+          if (row < midRow) {
+            sectorName = (col < midCol) ? 'NW' : 'NE';
+          } else {
+            sectorName = (col < midCol) ? 'SW' : 'SE';
+          }
+
+          const s = sectors[sectorName];
+          s.cells.push({ col, row });
+
+          if (col < s.minCol) s.minCol = col;
+          if (col > s.maxCol) s.maxCol = col;
+          if (row < s.minRow) s.minRow = row;
+          if (row > s.maxRow) s.maxRow = row;
+        }
+      }
+
+      ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+        const s = sectors[name];
+        if (s.cells.length === 0) {
+          console.warn(
+            '[patch_to_level] Arena quadrant',
+            name,
+            'has no walkable cells; skipping guards for this quadrant.'
+          );
+          return;
+        }
+
+        // Safety: if min/max were never updated, skip this quadrant.
+        if (s.minCol > s.maxCol || s.minRow > s.maxRow) {
+          console.warn(
+            '[patch_to_level] Arena quadrant',
+            name,
+            'has invalid bounds; skipping.'
+          );
+          return;
+        }
+
+        const spawnCells = pickGuardSpawnsInArea(s.cells, arenaGuardsPerSector);
+
+        spawnCells.forEach((cell, i) => {
+          const gid = `sec_${name}_${i}`;
+          guards.push({
+            id: gid,
+            patrolType: 'rect',
+            startCol: cell.col,
+            startRow: cell.row,
+            rect: {
+              minCol: s.minCol,
+              maxCol: s.maxCol,
+              minRow: s.minRow,
+              maxRow: s.maxRow
+            },
+            fovProfile: 'A',
+            behavior: 'chaser'
+          });
+        });
+      });
+
+      console.log(
+        '[patch_to_level] Arena guards generated:',
+        guards.length,
+        '(per quadrant =',
+        arenaGuardsPerSector,
+        ')'
+      );
+    }
+  }
+
+  // --------------------------------------------------------------------
+  // Fallback: if for some reason we did not generate any guards at all,
+  // keep the old static 3-guards config.
+  // --------------------------------------------------------------------
+  if (guards.length === 0) {
     guards.push(
       {
         id: 'g1',
@@ -738,11 +914,12 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
     );
 
     console.log(
-      '[patch_to_level] Using legacy static guards (GUARDS_PER_PATCH=0 or no patches):',
+      '[patch_to_level] Using legacy static guards as fallback:',
       guards.length
     );
   }
 
+  // Liberation triggers: one per commented patch (frame), same as before.
   const liberationTriggers = commentBlocksGlobal.map((b, idx) => {
     const x = b.x;
     const y = b.y;
@@ -773,7 +950,8 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid) {
     guards,
     fovProfiles,
     liberationTriggers,
-    playerSpawn: playerSpawn || null
+    playerSpawn: playerSpawn || null,
+    layoutType
   };
 }
 
@@ -1343,17 +1521,17 @@ try {
   const levelGridInfo = stringToGrid(orcaGrid);
   const levelGrid = levelGridInfo.grid;
 
-  const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid);
+    const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout);
 
-  // High-level layout type for the overlay:
-  // - "dungeon"  -> dungeon rules (per-room guards, fixed FOV, etc.)
-  // - everything else ("arena", "rooms_line", ...) -> arena-style rules
+  // layoutType is already set inside createLevelJson, but we keep this
+  // for clarity and to override if needed.
   const layoutType =
     (layout === 'dungeon')
       ? 'dungeon'
       : 'arena';
 
   jsonConfig.layoutType = layoutType;
+
 
   fs.writeFileSync(outOrcaPath, orcaGrid, 'utf8');
   fs.writeFileSync(outJsonPath, JSON.stringify(jsonConfig, null, 2), 'utf8');
