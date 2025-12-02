@@ -721,25 +721,73 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     return result;
   }
 
-  // --------------------------------------------------------------------
+    // --------------------------------------------------------------------
   // DUNGEON: spawn per room (per patch), default 2 guards per room.
-  // Guards patrol a rectangle around the patch (patch rect expanded by margin).
+  //
+  // New rules:
+  // - patrol rect is the room interior (when available), not just patch+margin;
+  // - guards never spawn *inside* the commented patch block;
+  // - we try to slightly shrink the patrol rect so they don't hug walls;
+  // - spawn cells are chosen only from '.' floor tiles in that room.
   // --------------------------------------------------------------------
   if (layoutType === 'dungeon') {
     if (commentBlocksGlobal.length === 0) {
       console.warn('[patch_to_level] Dungeon layout but no patches; falling back to legacy guards.');
     } else {
-      const margin = 2;
+      const defaultMargin = 2;
+      const shrinkMargin = 1;
+
+      // Remove cells that fall inside the commented patch rectangle.
+      function filterCellsOutsidePatch(cells, patch) {
+        if (!cells || !cells.length || !patch) return cells;
+
+        const patchMinCol = patch.x;
+        const patchMaxCol = patch.x + patch.w - 1;
+        const patchMinRow = patch.y;
+        const patchMaxRow = patch.y + patch.h - 1;
+
+        return cells.filter((c) =>
+          c.col < patchMinCol ||
+          c.col > patchMaxCol ||
+          c.row < patchMinRow ||
+          c.row > patchMaxRow
+        );
+      }
 
       commentBlocksGlobal.forEach((b, patchIndex) => {
-        const minCol = Math.max(0, b.x - margin);
-        const maxCol = Math.min(ROOM_W - 1, b.x + b.w - 1 + margin);
-        const minRow = Math.max(0, b.y - margin);
-        const maxRow = Math.min(ROOM_H - 1, b.y + b.h - 1 + margin);
+        // 1) Base patrol rectangle:
+        //    - prefer the room interior we exported from buildDungeonLayout;
+        //    - fall back to patch rect + small margin.
+        let baseMinCol, baseMaxCol, baseMinRow, baseMaxRow;
 
-        const walkableCells = collectWalkableCells(minCol, maxCol, minRow, maxRow);
+        if (
+          typeof b.roomMinCol === 'number' &&
+          typeof b.roomMaxCol === 'number' &&
+          typeof b.roomMinRow === 'number' &&
+          typeof b.roomMaxRow === 'number'
+        ) {
+          baseMinCol = b.roomMinCol;
+          baseMaxCol = b.roomMaxCol;
+          baseMinRow = b.roomMinRow;
+          baseMaxRow = b.roomMaxRow;
+        } else {
+          baseMinCol = Math.max(0, b.x - defaultMargin);
+          baseMaxCol = Math.min(ROOM_W - 1, b.x + b.w - 1 + defaultMargin);
+          baseMinRow = Math.max(0, b.y - defaultMargin);
+          baseMaxRow = Math.min(ROOM_H - 1, b.y + b.h - 1 + defaultMargin);
+        }
 
-        if (walkableCells.length === 0) {
+        // Collect all walkable cells ('.') in the base rect,
+        // then remove those that are inside the patch frame.
+        let baseCells = collectWalkableCells(
+          baseMinCol,
+          baseMaxCol,
+          baseMinRow,
+          baseMaxRow
+        );
+        baseCells = filterCellsOutsidePatch(baseCells, b);
+
+        if (baseCells.length === 0) {
           console.warn(
             '[patch_to_level] WARNING (dungeon): no walkable cells around patch',
             b.id || patchIndex,
@@ -748,7 +796,54 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
           return;
         }
 
-        const spawnCells = pickGuardSpawnsInArea(walkableCells, dungeonGuardsPerRoom);
+        // 2) Try to shrink the patrol rectangle by 1 cell on each side,
+        //    so guards are less likely to get stuck hugging the walls.
+        let minCol = baseMinCol;
+        let maxCol = baseMaxCol;
+        let minRow = baseMinRow;
+        let maxRow = baseMaxRow;
+        let walkableCells = baseCells;
+
+        if (
+          baseMaxCol - baseMinCol >= 2 * shrinkMargin + 1 &&
+          baseMaxRow - baseMinRow >= 2 * shrinkMargin + 1
+        ) {
+          const tightMinCol = baseMinCol + shrinkMargin;
+          const tightMaxCol = baseMaxCol - shrinkMargin;
+          const tightMinRow = baseMinRow + shrinkMargin;
+          const tightMaxRow = baseMaxRow - shrinkMargin;
+
+          let tightCells = collectWalkableCells(
+            tightMinCol,
+            tightMaxCol,
+            tightMinRow,
+            tightMaxRow
+          );
+          tightCells = filterCellsOutsidePatch(tightCells, b);
+
+          // Use the tighter rect only if it still has valid floor cells.
+          if (tightCells.length > 0) {
+            minCol = tightMinCol;
+            maxCol = tightMaxCol;
+            minRow = tightMinRow;
+            maxRow = tightMaxRow;
+            walkableCells = tightCells;
+          }
+        }
+
+        const spawnCells = pickGuardSpawnsInArea(
+          walkableCells,
+          dungeonGuardsPerRoom
+        );
+
+        if (spawnCells.length === 0) {
+          console.warn(
+            '[patch_to_level] WARNING (dungeon): could not place guards for room',
+            b.id || patchIndex,
+            '— no valid spawn cells.'
+          );
+          return;
+        }
 
         spawnCells.forEach((cell, i) => {
           const gid = `room_${patchIndex}_${i}`;
@@ -774,7 +869,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     }
   }
 
-    // --------------------------------------------------------------------
+  // --------------------------------------------------------------------
   // ARENA (and rooms_line treated as arena-style):
   // spawn per quadrant: NW / NE / SW / SE.
   //
@@ -1313,7 +1408,7 @@ function buildDungeonLayout(fullGrid) {
   const placedRooms = [];
   const roomRects = [];
 
-    // Place rooms like a simple random-dungeon algorithm,
+  // Place rooms like a simple random-dungeon algorithm,
   // but with variable margins per room and HARD no-overlap.
   patchDescs.forEach((p) => {
     const pw = p.patchWidth;
@@ -1454,13 +1549,14 @@ function buildDungeonLayout(fullGrid) {
     carveVerticalCorridor(finalGrid, x2, y1, y2, corridorWidthV);
   }
 
-  // Insert patch grids into their rooms
+    // Insert patch grids into their rooms
   const commentBlocksGlobal = [];
 
   placedRooms.forEach((r) => {
     const pw = r.patchWidth;
     const ph = r.patchHeight;
 
+    // Copy patch glyphs into the room interior.
     for (let py = 0; py < ph; py++) {
       const gy = r.patchOffsetY + py;
       if (gy < 0 || gy >= ROOM_H) continue;
@@ -1471,18 +1567,32 @@ function buildDungeonLayout(fullGrid) {
       }
     }
 
+    // Room interior rectangle (only '.' floor area).
+    // We export it so that JSON generation can:
+    // - spawn guards inside the actual room,
+    // - use the room interior as patrol rect base.
+    const roomMinCol = r.floorX;
+    const roomMaxCol = r.floorX + r.innerW - 1;
+    const roomMinRow = r.floorY;
+    const roomMaxRow = r.floorY + r.innerH - 1;
+
     commentBlocksGlobal.push({
       id: r.id,
       x: r.patchOffsetX,
       y: r.patchOffsetY,
       w: r.patchWidth,
-      h: r.patchHeight
+      h: r.patchHeight,
+      roomMinCol,
+      roomMaxCol,
+      roomMinRow,
+      roomMaxRow
     });
   });
 
   const orcaGrid = finalGrid.map((row) => row.join('')).join('\n') + '\n';
   return { orcaGrid, commentBlocksGlobal };
 }
+
 
 
 // ----- Main -----------------------------------------------------------

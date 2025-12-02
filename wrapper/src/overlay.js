@@ -7,7 +7,7 @@
 // Guards: array of guards, rectangular patrol, cone-shaped FOV (9 cells).
 //
 // Guard states:
-//   state: "patrol" | "alert_chaser" | "stunned"
+//   state: "patrol" | "alert_chaser" | "return_to_patrol" | "stunned"
 //   behavior: "chaser"
 //
 // Sector alert logic:
@@ -55,8 +55,18 @@
   const ALERT_STEPS_PER_TICK  = 2;    // alert / chasing speed
 
   // Bullets
-  const BULLET_STEPS_PER_TICK       = 1;  // cells per tick
-  const GUARD_FIRE_COOLDOWN_TICKS   = 4;  // ticks between shots (~1s at 250ms)
+  const BULLET_STEPS_PER_TICK       = 4;  // cells per tick
+  const GUARD_FIRE_COOLDOWN_TICKS   = 2;  // ticks between shots (~1s at 250ms)
+
+  // Player ranged weapon
+  const PLAYER_BULLET_RANGE_CELLS   = 7;  // max distance (in cells) for player bullets
+  const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
+
+  const PLAYER_SHOOT_KEYS          = ['s', 'S']; // keys that fire the player weapon
+
+  // Guard HP
+  const GUARD_MAX_HP                = 2;  // guard max hit points
+
 
   // Alert / memory (how long sectors remember player absolute position after losing sight)
   const ALERT_MEMORY_TICKS          = 12; // ~3s at 250ms
@@ -202,6 +212,9 @@
     liberationTriggers = Array.isArray(merged.liberationTriggers)
       ? merged.liberationTriggers
       : [];
+    // Force a new spawn-adjustment pass for this level
+    guardSpawnsInitialized = false;
+
 
     // If the level config provides an explicit player spawn, use it.
     if (
@@ -298,10 +311,19 @@
   let playerHP = playerHPMax;
   let playerHitCooldown = 0; // invulnerability ticks after being hit
 
-  // Guards
+  // Player ammo
+  let playerAmmoMax = PLAYER_INITIAL_AMMO;
+  let playerAmmo = PLAYER_INITIAL_AMMO;
+
+
+    // Guards
   let guards = [];
   let guardTimer = null;
   let globalAlertLevel = 0; // 0 = no guard sees the player, 1 = at least one guard sees him
+
+  // Track if we already ran the spawn-adjustment pass for the current levelConfig
+  let guardSpawnsInitialized = false;
+
 
   // Bullets
   let bullets = [];
@@ -562,27 +584,41 @@
   if (mode === 'edit') {
     overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
     if (hud) {
-      hud.textContent = '[MODE: EDIT] HP ' + playerHP + '/' + playerHPMax;
+      hud.textContent =
+        '[MODE: EDIT] HP ' +
+        playerHP +
+        '/' +
+        playerHPMax +
+        '  AMMO ' +
+        playerAmmo +
+        '/' +
+        playerAmmoMax;
       hud.style.color = '#ffffff';
     }
   } else {
+
     const alertText = inAlert ? 'ALERT' : 'STEALTH';
     if (inAlert) {
       overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
     } else {
       overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
     }
-    if (hud) {
+      if (hud) {
       hud.textContent =
         '[MODE: GAME] HP ' +
         playerHP +
         '/' +
         playerHPMax +
+        '  AMMO ' +
+        playerAmmo +
+        '/' +
+        playerAmmoMax +
         '  [' +
         alertText +
-        ']  (F1: toggle, Arrows: move, Space: Orca clock)';
+        ']  (F1: toggle, Arrows: move, S: shoot, Space: Orca clock)';
       hud.style.color = '#ffffff';
     }
+
   }
 
   // Re-position HUD after any change
@@ -658,15 +694,17 @@ function updateHudLayout() {
       sprite.style.position = 'absolute';
       sprite.style.left = '50%';
       sprite.style.top = '50%';
-      sprite.style.width = '50%';
-      sprite.style.height = '50%';
+      sprite.style.width = '65%';   // slightly bigger
+      sprite.style.height = '65%';  // slightly bigger
       sprite.style.transform = 'translate(-50%, -50%)';
       sprite.style.borderRadius = '50%';
-      sprite.style.background = '#ff5555';
       sprite.style.boxSizing = 'border-box';
-      sprite.style.border = '1px solid #ffcccc';
+      sprite.style.border = '2px solid #ff7777';
+      sprite.style.background = '#ff3333';
       sprite.style.pointerEvents = 'none';
+      sprite.style.overflow = 'hidden'; // needed for half-fill effect
       inner.appendChild(sprite);
+
 
       // Optional per-guard FOV overlay (not used yet, kept for future use)
       const fovOverlay = document.createElement('div');
@@ -683,40 +721,68 @@ function updateHudLayout() {
       guardsContainer.appendChild(gEl);
 
       const rect = cfg.rect || {};
-      const guard = {
+            const guard = {
         id: cfg.id || ('guard_' + index),
         patrolType: cfg.patrolType || 'rect',
         behavior: cfg.behavior || 'chaser',
+
+        // Current position
         col: cfg.startCol || 0,
         row: cfg.startRow || 0,
+
+        // "Home" position used when returning to patrol after alert
+        homeCol: cfg.startCol || 0,
+        homeRow: cfg.startRow || 0,
+
+        // Patrol rectangle
         dirX: 1,
         dirY: 0,
         minCol: rect.minCol != null ? rect.minCol : 0,
         maxCol: rect.maxCol != null ? rect.maxCol : Math.max(0, gridCols - 1),
         minRow: rect.minRow != null ? rect.minRow : 0,
         maxRow: rect.maxRow != null ? rect.maxRow : Math.max(0, gridRows - 1),
+
         fovProfileId: cfg.fovProfile || 'A',
         el: gEl,
         inner,
         sprite,
+
+        // Look / FOV
         lookPhase: 0,
         lookTick: 0,
         fovCells: [],
         seenPlayer: false,
         wasSeeingPlayer: false,
+
+        // FSM / alert
         state: 'patrol',
         lastSeenPlayerCol: null,
         lastSeenPlayerRow: null,
         alertTimer: 0,
+
+        // Pathfinding
         path: null,
         pathTargetCol: null,
         pathTargetRow: null,
+
+        // Movement history for anti-stuck logic
+        lastPositions: [],
+        stuckCounter: 0,
+
+        // Stun / combat
         neutralized: false,
         stunTicks: 0,
-        shootCooldown: 0
+        shootCooldown: 0,
+
+        // HP
+        maxHP: GUARD_MAX_HP,
+        hp: GUARD_MAX_HP,
+        dead: false
       };
 
       guards.push(guard);
+      updateGuardSpriteAppearance(guard);
+
     });
 
     log('Guards initialized from config:', guards.length);
@@ -821,10 +887,15 @@ function updateHudLayout() {
 
   function ensureGuardsOnWalkableCells() {
     guards.forEach((g) => {
+      if (g.state === 'dead') {
+        return;
+      }
+
       // If the guard is already on a walkable cell, do nothing
       if (isWalkable(g.col, g.row)) {
         return;
       }
+
 
       const res = findNearestWalkableCell(g.col, g.row);
       if (res) {
@@ -843,7 +914,313 @@ function updateHudLayout() {
     });
   }
 
+    // --------------------------------------------------
+  // Spawn adjustment per layout (arena vs dungeon)
+  // --------------------------------------------------
 
+  // Utility: shuffle array in-place
+  function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+  }
+
+  // Compute all walkable candidate cells inside a rect, with optional inner margin
+  function buildWalkableCandidatesInRect(minCol, maxCol, minRow, maxRow, innerMargin) {
+    const margin = innerMargin || 0;
+
+    let c0 = Math.max(minCol + margin, 0);
+    let c1 = Math.min(maxCol - margin, gridCols - 1);
+    let r0 = Math.max(minRow + margin, 0);
+    let r1 = Math.min(maxRow - margin, gridRows - 1);
+
+    if (c0 > c1 || r0 > r1) {
+      // Margin too aggressive, fallback to no margin
+      c0 = Math.max(minCol, 0);
+      c1 = Math.min(maxCol, gridCols - 1);
+      r0 = Math.max(minRow, 0);
+      r1 = Math.min(maxRow, gridRows - 1);
+    }
+
+    const out = [];
+    for (let c = c0; c <= c1; c++) {
+      for (let r = r0; r <= r1; r++) {
+        if (!isWalkable(c, r)) continue;
+        out.push({ col: c, row: r });
+      }
+    }
+    return out;
+  }
+
+  function adjustGuardSpawnsByLayout() {
+    if (!guards || guards.length === 0) return;
+
+    const layoutType =
+      (levelConfig && levelConfig.layoutType) ? levelConfig.layoutType : 'arena';
+
+    if (layoutType === 'dungeon') {
+      adjustDungeonGuardSpawns();
+    } else {
+      adjustArenaGuardSpawns();
+    }
+  }
+
+  // DUNGEON: group guards by patrol rect ("room") and assign
+  // spawn positions on walkable cells inside the room, avoiding
+  // same row / same column within the same room.
+  function adjustDungeonGuardSpawns() {
+    if (!guards || guards.length === 0) return;
+
+    // Group guards by their patrol rect (approx. "room")
+    const rooms = {};
+    guards.forEach((g) => {
+      const key =
+        g.minCol + ',' + g.maxCol + ',' + g.minRow + ',' + g.maxRow;
+      if (!rooms[key]) {
+        rooms[key] = {
+          minCol: g.minCol,
+          maxCol: g.maxCol,
+          minRow: g.minRow,
+          maxRow: g.maxRow,
+          guards: []
+        };
+      }
+      rooms[key].guards.push(g);
+    });
+
+    Object.keys(rooms).forEach((key) => {
+      const room = rooms[key];
+      const list = room.guards;
+      if (!list || list.length === 0) return;
+
+      // Prefer cells not glued to the walls: margin=1
+      let candidates = buildWalkableCandidatesInRect(
+        room.minCol,
+        room.maxCol,
+        room.minRow,
+        room.maxRow,
+        1
+      );
+
+      if (candidates.length === 0) {
+        // If the room is very cramped, fallback to any walkable cell in the rect
+        candidates = buildWalkableCandidatesInRect(
+          room.minCol,
+          room.maxCol,
+          room.minRow,
+          room.maxRow,
+          0
+        );
+      }
+
+      if (candidates.length === 0) {
+        // No usable cells: keep existing positions
+        list.forEach((g) => {
+          g.homeCol = g.col;
+          g.homeRow = g.row;
+          clampGuard(g);
+          updateGuardPosition(g);
+        });
+        return;
+      }
+
+      shuffleArray(candidates);
+
+      const occupiedRows = new Set();
+      const occupiedCols = new Set();
+      const takenCells = new Set();
+
+      list.forEach((g) => {
+        let chosen = null;
+
+        // First pass: require unique row and unique column within the room
+        for (let i = 0; i < candidates.length; i++) {
+          const cell = candidates[i];
+          const keyCell = cell.col + ',' + cell.row;
+          if (takenCells.has(keyCell)) continue;
+          if (occupiedRows.has(cell.row)) continue;
+          if (occupiedCols.has(cell.col)) continue;
+          chosen = cell;
+          break;
+        }
+
+        // Second pass: relax to "not both row and column already used"
+        if (!chosen) {
+          for (let i = 0; i < candidates.length; i++) {
+            const cell = candidates[i];
+            const keyCell = cell.col + ',' + cell.row;
+            if (takenCells.has(keyCell)) continue;
+            if (occupiedRows.has(cell.row) && occupiedCols.has(cell.col)) continue;
+            chosen = cell;
+            break;
+          }
+        }
+
+        if (!chosen) {
+          // Last resort: just pick the first candidate
+          chosen = candidates[0];
+        }
+
+        const keyCell = chosen.col + ',' + chosen.row;
+        takenCells.add(keyCell);
+        occupiedRows.add(chosen.row);
+        occupiedCols.add(chosen.col);
+
+        g.col = chosen.col;
+        g.row = chosen.row;
+        g.homeCol = g.col;
+        g.homeRow = g.row;
+
+        clampGuard(g);
+        updateGuardPosition(g);
+      });
+    });
+  }
+
+    // ARENA: shrink patrol rects away from map borders based on FOV width,
+  // then reassign spawn positions per sector (NW/NE/SW/SE) on walkable cells,
+  // avoiding same row / same column per sector.
+  function adjustArenaGuardSpawns() {
+    if (!guards || guards.length === 0) return;
+
+    // 1) Shrink patrol rects away from borders using FOV max width as margin
+    guards.forEach((g) => {
+      const profile = getFovProfile(g) || {};
+      const widths = profile.widths || [1];
+      let maxW = 1;
+      for (let i = 0; i < widths.length; i++) {
+        if (widths[i] > maxW) maxW = widths[i];
+      }
+      const margin = Math.floor(maxW / 2);
+
+      // Keep original rect in case shrink completely collapses it
+      const orig = {
+        minCol: g.minCol,
+        maxCol: g.maxCol,
+        minRow: g.minRow,
+        maxRow: g.maxRow
+      };
+
+      let minCol = Math.max(g.minCol, margin);
+      let maxCol = Math.min(g.maxCol, gridCols - 1 - margin);
+      let minRow = Math.max(g.minRow, margin);
+      let maxRow = Math.min(g.maxRow, gridRows - 1 - margin);
+
+      if (minCol > maxCol || minRow > maxRow) {
+        // If shrink kills the rect, fallback to original
+        minCol = orig.minCol;
+        maxCol = orig.maxCol;
+        minRow = orig.minRow;
+        maxRow = orig.maxRow;
+      }
+
+      g.minCol = minCol;
+      g.maxCol = maxCol;
+      g.minRow = minRow;
+      g.maxRow = maxRow;
+
+      // Clamp current position inside rect
+      if (g.col < g.minCol) g.col = g.minCol;
+      if (g.col > g.maxCol) g.col = g.maxCol;
+      if (g.row < g.minRow) g.row = g.minRow;
+      if (g.row > g.maxRow) g.row = g.maxRow;
+
+      g.homeCol = g.col;
+      g.homeRow = g.row;
+    });
+
+    // 2) Reassign spawn positions per sector, avoiding "fila indiana"
+    const sectorGroups = { NW: [], NE: [], SW: [], SE: [] };
+
+    guards.forEach((g) => {
+      const s = getSector(g.col, g.row);
+      if (!sectorGroups[s]) sectorGroups[s] = [];
+      sectorGroups[s].push(g);
+    });
+
+    ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+      const list = sectorGroups[name];
+      if (!list || list.length === 0) return;
+
+      const occupiedRows = new Set();
+      const occupiedCols = new Set();
+      const takenCells = new Set();
+
+      list.forEach((g) => {
+        const candidates = [];
+
+        // Only consider walkable cells inside the guard rect and within this sector
+        for (let c = g.minCol; c <= g.maxCol; c++) {
+          for (let r = g.minRow; r <= g.maxRow; r++) {
+            if (c < 0 || r < 0 || c >= gridCols || r >= gridRows) continue;
+            if (!isWalkable(c, r)) continue;
+            if (getSector(c, r) !== name) continue;
+            candidates.push({ col: c, row: r });
+          }
+        }
+
+        if (candidates.length === 0) {
+          // No good candidate for this guard: keep current (already clamped)
+          const keyCell = g.col + ',' + g.row;
+          takenCells.add(keyCell);
+          occupiedRows.add(g.row);
+          occupiedCols.add(g.col);
+          g.homeCol = g.col;
+          g.homeRow = g.row;
+          clampGuard(g);
+          updateGuardPosition(g);
+          return;
+        }
+
+        shuffleArray(candidates);
+
+        let chosen = null;
+
+        // First pass: require unique row and column in this sector
+        for (let i = 0; i < candidates.length; i++) {
+          const cell = candidates[i];
+          const k = cell.col + ',' + cell.row;
+          if (takenCells.has(k)) continue;
+          if (occupiedRows.has(cell.row)) continue;
+          if (occupiedCols.has(cell.col)) continue;
+          chosen = cell;
+          break;
+        }
+
+        // Second pass: relax to "not both row and column already used"
+        if (!chosen) {
+          for (let i = 0; i < candidates.length; i++) {
+            const cell = candidates[i];
+            const k = cell.col + ',' + cell.row;
+            if (takenCells.has(k)) continue;
+            if (occupiedRows.has(cell.row) && occupiedCols.has(cell.col)) continue;
+            chosen = cell;
+            break;
+          }
+        }
+
+        if (!chosen) {
+          chosen = candidates[0];
+        }
+
+        const k = chosen.col + ',' + chosen.row;
+        takenCells.add(k);
+        occupiedRows.add(chosen.row);
+        occupiedCols.add(chosen.col);
+
+        g.col = chosen.col;
+        g.row = chosen.row;
+        g.homeCol = g.col;
+        g.homeRow = g.row;
+
+        clampGuard(g);
+        updateGuardPosition(g);
+      });
+    });
+  }
 
   // --------------------------------------------------
   // Geometry 1:1 with Orca
@@ -894,16 +1271,19 @@ function updateHudLayout() {
     updateAllBulletsPosition();
     updatePatchMarkersPosition();
 
-    // only FOV, no alert memory
+        // only FOV, no alert memory
     updateAllFovAndAlert(false);
-
-
 
     // Re-position HUD according to new canvas size / grid
     updateHudLayout();
 
-    log('Geometry synced:', {
+    // Spawn adjustment: run once per levelConfig (reset in applyExternalLevelConfig)
+    if (!guardSpawnsInitialized) {
+      adjustGuardSpawnsByLayout();
+      guardSpawnsInitialized = true;
+    }
 
+    log('Geometry synced:', {
       cssW,
       cssH,
       gridCols,
@@ -960,14 +1340,26 @@ function updateHudLayout() {
 
   function isCellOccupiedByOtherGuard(col, row, selfGuard) {
     for (let i = 0; i < guards.length; i++) {
-      const g = guards[i];
+            const g = guards[i];
       if (g === selfGuard) continue;
-      if (g.state === 'stunned') continue;
+      if (g.state === 'stunned' || g.state === 'dead') continue;
       if (g.col === col && g.row === row) {
         return true;
       }
     }
     return false;
+  }
+
+  // Find guard at given cell (ignoring dead guards if needed)
+  function findGuardAtCell(col, row) {
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (g.state === 'dead') continue;
+      if (g.col === col && g.row === row) {
+        return g;
+      }
+    }
+    return null;
   }
 
   // --------------------------------------------------
@@ -1065,8 +1457,12 @@ function updateHudLayout() {
     guard.pathTargetRow = targetRow;
   }
 
-  function stepGuardAlongPath(guard) {
+    function stepGuardAlongPath(guard) {
     if (!guard.path || guard.path.length <= 1) {
+      // No usable path: clear and report failure
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
       return false;
     }
 
@@ -1080,6 +1476,10 @@ function updateHudLayout() {
 
     const nextIndex = idxCurrent + 1;
     if (nextIndex >= guard.path.length) {
+      // We are already at the end of the path
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
       return false;
     }
 
@@ -1105,6 +1505,7 @@ function updateHudLayout() {
     guard.dirY = guard.row - oldRow;
 
     if (nextIndex === guard.path.length - 1) {
+      // Reached final target: clear path
       guard.path = null;
       guard.pathTargetCol = null;
       guard.pathTargetRow = null;
@@ -1128,8 +1529,16 @@ function updateHudLayout() {
     guard.el.style.transform = 'translate(' + gx + 'px, ' + gy + 'px)';
     guard.el.style.width = cellW + 'px';
     guard.el.style.height = cellH + 'px';
-    guard.el.style.opacity = guard.state === 'stunned' ? '0.25' : '1.0';
+
+    if (guard.state === 'stunned') {
+      guard.el.style.opacity = '0.25';
+    } else if (guard.state === 'dead') {
+      guard.el.style.opacity = '0.9';
+    } else {
+      guard.el.style.opacity = '1.0';
+    }
   }
+
 
   // --------------------------------------------------
   // Bullet logic (ranged attacks from guards)
@@ -1223,8 +1632,11 @@ function updateHudLayout() {
       dy: stepY,
       el: bulletEl,
       alive: true,
-      fromGuardId: guard.id || 'guard'
+      ownerType: 'guard',
+      fromGuardId: guard.id || 'guard',
+      rangeLeft: null // unlimited, stops only on wall / edge / player
     };
+
 
     bullets.push(bullet);
     updateBulletPosition(bullet);
@@ -1232,6 +1644,88 @@ function updateHudLayout() {
     guard.shootCooldown = GUARD_FIRE_COOLDOWN_TICKS;
 
     console.log('[overlay] GUARD', guard.id, 'shoots.');
+  }
+
+  function spawnBulletFromPlayer() {
+    if (!bulletsContainer) return;
+
+    // No ammo, no shot
+    if (playerAmmo <= 0) {
+      console.log('[overlay] PLAYER tried to shoot but has no ammo.');
+      return;
+    }
+
+    // Direction from playerDir
+    let dx = 0;
+    let dy = 0;
+    if (playerDir === 'up') {
+      dy = -1;
+    } else if (playerDir === 'down') {
+      dy = 1;
+    } else if (playerDir === 'left') {
+      dx = -1;
+    } else if (playerDir === 'right') {
+      dx = 1;
+    }
+
+    // If no valid facing direction, do nothing
+    if (dx === 0 && dy === 0) {
+      return;
+    }
+
+    const startCol = playerCol + dx;
+    const startRow = playerRow + dy;
+
+    // Out of bounds
+    if (
+      startCol < 0 ||
+      startRow < 0 ||
+      startCol >= gridCols ||
+      startRow >= gridRows
+    ) {
+      return;
+    }
+
+    // Cannot shoot directly into non-walkable cell
+    if (!isWalkable(startCol, startRow)) {
+      return;
+    }
+
+    const bulletEl = document.createElement('div');
+    bulletEl.className = 'orca-stealth-bullet';
+    bulletEl.style.position = 'absolute';
+    bulletEl.style.background = '#ffcc00';
+    bulletEl.style.borderRadius = '50%';
+    bulletEl.style.pointerEvents = 'none';
+
+    bulletsContainer.appendChild(bulletEl);
+
+    const bullet = {
+      col: startCol,
+      row: startRow,
+      dx: dx,
+      dy: dy,
+      el: bulletEl,
+      alive: true,
+      ownerType: 'player',
+      fromGuardId: null,
+      rangeLeft: PLAYER_BULLET_RANGE_CELLS // limited range
+    };
+
+    bullets.push(bullet);
+    updateBulletPosition(bullet);
+
+    // Consume ammo and update HUD
+    playerAmmo--;
+    if (playerAmmo < 0) playerAmmo = 0;
+    updateModeVisual();
+
+    console.log(
+      '[overlay] PLAYER shoots. Ammo:',
+      playerAmmo,
+      '/',
+      playerAmmoMax
+    );
   }
 
   function stepBullets() {
@@ -1268,14 +1762,31 @@ function updateHudLayout() {
           break;
         }
 
-        // Player hit
-        if (nextCol === playerCol && nextRow === playerRow) {
+        // Player hit (only for guard bullets)
+        if (
+          b.ownerType === 'guard' &&
+          nextCol === playerCol &&
+          nextRow === playerRow
+        ) {
           applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
           if (b.el.parentNode) {
             b.el.parentNode.removeChild(b.el);
           }
           alive = false;
           break;
+        }
+
+        // Guard hit (only for player bullets)
+        if (b.ownerType === 'player') {
+          const hitGuard = findGuardAtCell(nextCol, nextRow);
+          if (hitGuard) {
+            applyGuardHit(hitGuard, b);
+            if (b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+            alive = false;
+            break;
+          }
         }
 
         // Wall / Orca code hit
@@ -1290,6 +1801,18 @@ function updateHudLayout() {
         // Move bullet forward
         b.col = nextCol;
         b.row = nextRow;
+
+        // Range handling for bullets that have it
+        if (typeof b.rangeLeft === 'number') {
+          b.rangeLeft--;
+          if (b.rangeLeft <= 0) {
+            if (b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+            alive = false;
+            break;
+          }
+        }
       }
 
       if (alive) {
@@ -1300,6 +1823,7 @@ function updateHudLayout() {
 
     bullets = survivors;
   }
+
 
   // --------------------------------------------------
   // Patch liberation markers + ORCA injection
@@ -1340,7 +1864,7 @@ function updateHudLayout() {
         el.style.fontFamily = 'monospace';
         el.style.fontSize = '12px';
         el.style.fontWeight = 'bold';
-        el.style.color = '#ff5555'; // red
+        el.style.color = '#df0a0aff'; // red
         el.textContent = 'X';
 
         patchMarkersContainer.appendChild(el);
@@ -1487,12 +2011,11 @@ function updateHudLayout() {
 
   }
 
-
-
   function shootingTickForGuard(guard) {
     if (mode !== 'game') return;
     if (guard.state !== 'alert_chaser') return;
-    if (guard.state === 'stunned') return;
+    if (guard.state === 'stunned' || guard.state === 'dead') return;
+
 
     if (guard.shootCooldown > 0) {
       guard.shootCooldown--;
@@ -1589,10 +2112,11 @@ function updateHudLayout() {
     function computeGuardFovCellsForGuard(guard) {
     const result = [];
 
-    // Stunned guards have no FOV
-    if (guard.state === 'stunned') {
+    // Stunned or dead guards have no FOV
+    if (guard.state === 'stunned' || guard.state === 'dead') {
       return result;
     }
+
 
     // Guard must be on-grid
     if (
@@ -1764,7 +2288,8 @@ function updateHudLayout() {
     const baseAlpha = (globalAlertLevel > 0 || anySectorTracking()) ? 0.35 : 0.20;
 
     guards.forEach((guard) => {
-      if (guard.state === 'stunned') return;
+      if (guard.state === 'stunned' || guard.state === 'dead') return;
+
       const color = guard.seenPlayer
         ? 'rgba(255, 64, 64, ' + baseAlpha + ')'
         : 'rgba(255, 0, 0, ' + baseAlpha + ')';
@@ -1799,7 +2324,7 @@ function updateHudLayout() {
     const sectorSaw = { NW: false, NE: false, SW: false, SE: false };
 
     guards.forEach((guard) => {
-      if (guard.state === 'stunned') {
+      if (guard.state === 'stunned' || guard.state === 'dead') {
         guard.fovCells = [];
         guard.wasSeeingPlayer = guard.seenPlayer;
         guard.seenPlayer = false;
@@ -1871,22 +2396,27 @@ function updateHudLayout() {
 
       // Allinea stati delle guardie al loro settore
       guards.forEach((g) => {
-        if (g.state === 'stunned') return;
+        if (g.state === 'stunned' || g.state === 'dead') return;
+
+
         const s = getSector(g.col, g.row);
         const sa = sectorAlerts[s];
 
         if (sa.state === 'tracking') {
+          // Sector currently tracking: guard is in full alert / chasing mode
           g.state = 'alert_chaser';
         } else {
-          // Settore tornato idle: la guardia torna a PATROL quando non ha più target diretto
+          // Sector is idle: if guard was in alert and no longer sees the player,
+          // switch to "return_to_patrol" so it can go back to its home cell via BFS.
           if (g.state === 'alert_chaser' && !g.seenPlayer) {
-            g.state = 'patrol';
+            g.state = 'return_to_patrol';
             g.path = null;
             g.pathTargetCol = null;
             g.pathTargetRow = null;
           }
         }
       });
+
 
       updateModeVisual();
     }
@@ -2046,7 +2576,7 @@ function updateHudLayout() {
 
   function getSectorGuards(sectorName) {
     return guards.filter((g) => {
-      if (g.state === 'stunned') return false;
+      if (g.state === 'stunned' || g.state === 'dead') return false;
       const s = getSector(g.col, g.row);
       return s === sectorName;
     });
@@ -2059,10 +2589,11 @@ function updateHudLayout() {
     const sectors = { NW: [], NE: [], SW: [], SE: [] };
 
     guards.forEach((g) => {
-      if (g.state === 'stunned') {
+      if (g.state === 'stunned' || g.state === 'dead') {
         g.preferredCardinal = null;
         return;
       }
+
       const s = getSector(g.col, g.row);
       if (!sectors[s]) sectors[s] = [];
       sectors[s].push(g);
@@ -2238,20 +2769,126 @@ function updateHudLayout() {
     updateGuardLookDirection(guard);
   }
 
+    function stepGuardReturnToPatrol(guard) {
+    // If no valid home is defined, fall back to patrol
+    if (typeof guard.homeCol !== 'number' || typeof guard.homeRow !== 'number') {
+      guard.state = 'patrol';
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
+      return;
+    }
+
+    // If close enough to home, resume patrol
+    const dxHome = guard.homeCol - guard.col;
+    const dyHome = guard.homeRow - guard.row;
+    if (Math.abs(dxHome) + Math.abs(dyHome) <= 1) {
+      guard.state = 'patrol';
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
+      return;
+    }
+
+    // Face home (only for visuals / FOV orientation)
+    aimGuardAtTarget(guard, guard.homeCol, guard.homeRow);
+
+    // Path back to home
+    ensureGuardPath(guard, guard.homeCol, guard.homeRow);
+
+    if (!guard.path) {
+      // No path found: avoid being stuck forever, just go back to patrol
+      guard.state = 'patrol';
+      return;
+    }
+
+    const moved = stepGuardAlongPath(guard);
+    if (!moved) {
+      // If we cannot move along the path this tick, do nothing.
+      // Anti-stuck logic on movement history will eventually reset the path.
+      updateGuardPosition(guard);
+    }
+  }
+
+    function registerGuardMovementHistory(guard) {
+    // Initialize storage
+    if (!guard.lastPositions) {
+      guard.lastPositions = [];
+    }
+
+    // Append current position (we also want duplicates to detect "standing still")
+    guard.lastPositions.push({ col: guard.col, row: guard.row });
+    if (guard.lastPositions.length > 4) {
+      guard.lastPositions.shift();
+    }
+
+    if (guard.lastPositions.length < 4) {
+      guard.stuckCounter = 0;
+      return;
+    }
+
+    const p0 = guard.lastPositions[0];
+    const p1 = guard.lastPositions[1];
+    const p2 = guard.lastPositions[2];
+    const p3 = guard.lastPositions[3];
+
+    const same = (a, b) => a.col === b.col && a.row === b.row;
+
+    // A-B-A-B oscillation
+    const oscillation =
+      same(p0, p2) &&
+      same(p1, p3) &&
+      !same(p0, p1);
+
+    // Fully stuck in one cell
+    const fullyStuck =
+      same(p0, p1) &&
+      same(p1, p2) &&
+      same(p2, p3);
+
+    if (oscillation || fullyStuck) {
+      guard.stuckCounter = (guard.stuckCounter || 0) + 1;
+    } else {
+      guard.stuckCounter = 0;
+    }
+
+    if (guard.stuckCounter >= 2) {
+      // Guard considered stuck: reset path
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
+
+      // Only shuffle preferred cardinal if this guard is actually chasing
+      if (guard.state === 'alert_chaser') {
+        const dirs = ['N', 'E', 'S', 'W'];
+        guard.preferredCardinal = dirs[Math.floor(Math.random() * dirs.length)];
+      }
+
+      guard.stuckCounter = 0;
+    }
+  }
+
   function stepGuard(guard) {
+    // DEAD state: no movement, no behavior
+    if (guard.state === 'dead') {
+      return;
+    }
+
     // STUNNED state
     if (guard.state === 'stunned') {
+
       if (guard.stunTicks > 0) {
         guard.stunTicks--;
-        return;
       } else {
         // Wake up and go back to PATROL
         guard.state = 'patrol';
         guard.neutralized = false;
         guard.stunTicks = 0;
         if (guard.el) guard.el.style.opacity = '1.0';
-        return;
       }
+      // Even if stunned, keep history updated (mostly harmless)
+      registerGuardMovementHistory(guard);
+      return;
     }
 
     // ALERT_CHASER state: faster movement (multiple steps per tick)
@@ -2262,6 +2899,14 @@ function updateHudLayout() {
           break;
         }
       }
+      registerGuardMovementHistory(guard);
+      return;
+    }
+
+    // RETURN_TO_PATROL: go back "home" using BFS, then resume patrol
+    if (guard.state === 'return_to_patrol') {
+      stepGuardReturnToPatrol(guard);
+      registerGuardMovementHistory(guard);
       return;
     }
 
@@ -2269,11 +2914,83 @@ function updateHudLayout() {
     for (let i = 0; i < PATROL_STEPS_PER_TICK; i++) {
       stepGuardPatrol(guard);
     }
+    registerGuardMovementHistory(guard);
+  }
+  
+  // Update guard sprite appearance based on HP / dead state
+  function updateGuardSpriteAppearance(guard) {
+    if (!guard || !guard.sprite) return;
+
+    const sprite = guard.sprite;
+
+    // Base style (size & border are fixed)
+    sprite.style.borderRadius = '50%';
+    sprite.style.boxSizing = 'border-box';
+    sprite.style.overflow = 'hidden';
+
+    // Dead: outline only
+    if (guard.state === 'dead' || guard.dead || guard.hp <= 0) {
+      sprite.style.background = 'transparent';
+      sprite.style.border = '2px solid #df0a0aff';
+      return;
+    }
+
+    // Alive: decide full vs half fill based on HP
+    if (guard.hp >= guard.maxHP) {
+      // Full HP: solid bright red circle
+      sprite.style.background = '#df0a0aff';
+      sprite.style.border = '2px solid #df0a0aff';
+    } else {
+      // Wounded: half filled (top half red, bottom empty)
+      sprite.style.background =
+        'linear-gradient(to bottom, #df0a0aff 50%, rgba(0,0,0,0) 50%)';
+      sprite.style.border = '2px solid #df0a0aff';
+    }
   }
 
   // --------------------------------------------------
   // Collisions & damage
   // --------------------------------------------------
+
+  function killGuard(guard) {
+    if (!guard || guard.state === 'dead') return;
+
+    guard.state = 'dead';
+    guard.dead = true;
+    guard.hp = 0;
+    guard.neutralized = true;
+    guard.stunTicks = 0;
+    guard.path = null;
+    guard.pathTargetCol = null;
+    guard.pathTargetRow = null;
+    guard.seenPlayer = false;
+    guard.wasSeeingPlayer = false;
+    guard.fovCells = [];
+
+    if (guard.el) {
+      guard.el.style.opacity = '0.9';
+    }
+
+    updateGuardSpriteAppearance(guard);
+    console.log('[overlay] GUARD KILLED by player:', guard.id);
+  }
+
+  function applyGuardHit(guard, sourceBullet) {
+    if (!guard || guard.state === 'dead') return;
+
+    guard.hp--;
+    if (guard.hp <= 0) {
+      killGuard(guard);
+    } else {
+      updateGuardSpriteAppearance(guard);
+      console.log(
+        '[overlay] GUARD HIT by player bullet. HP:',
+        guard.hp,
+        '/',
+        guard.maxHP
+      );
+    }
+  }
 
   function neutralizeGuard(guard) {
     if (guard.state === 'stunned') return;
@@ -2290,6 +3007,7 @@ function updateHudLayout() {
       guard.el.style.opacity = '0.25';
     }
     console.log('[overlay] GUARD STUNNED by player (3s):', guard.id);
+    updateGuardSpriteAppearance(guard);
   }
 
   function applyPlayerHit(source) {
@@ -2348,7 +3066,7 @@ function updateHudLayout() {
 
   function checkGuardPlayerCollisions() {
     guards.forEach((guard) => {
-      if (guard.state === 'stunned') return;
+      if (guard.state === 'stunned' || guard.state === 'dead') return;
       if (guard.col === playerCol && guard.row === playerRow) {
         if (isPlayerBehindGuard(guard)) {
           // Stealth takedown from behind
@@ -2491,7 +3209,11 @@ function updateHudLayout() {
     } else if (key === 'a' || key === 'A') {
       // Interaction key: try to activate a nearby marker
       tryActivateNearbyMarker();
+    } else if (PLAYER_SHOOT_KEYS.indexOf(key) !== -1) {
+      // Player shoots in the facing direction
+      spawnBulletFromPlayer();
     } else {
+
       if (DEBUG) {
         console.log(
           '[overlay] Key blocked in GAME mode (not arrows, not Space/A):',
