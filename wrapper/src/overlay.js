@@ -1,7 +1,7 @@
 // Orca Stealth Wrapper - overlay 1:1 with Orca grid
 // Modes:
 //   EDIT -> Orca receives keyboard normally
-//   GAME -> WASD control the player, Orca only receives Space for the clock
+//   GAME -> ARROWS control the player, Orca only receives Space for the clock
 //
 // Player: yellow triangle oriented in the direction of the last movement.
 // Guards: array of guards, rectangular patrol, cone-shaped FOV (9 cells).
@@ -358,10 +358,18 @@
   // 'edit' | 'game'
   let mode = 'edit';
 
+  // Global game over flag
+  // When true, the world simulation is frozen and input is ignored in GAME mode
+  let isGameOver = false;
+
   let overlayDiv = null;
   let guardsContainer = null;
   let fovContainer = null;
   let bulletsContainer = null;
+
+  // Big centered GAME OVER overlay
+  let gameOverDiv = null;
+
 
   // Player
   let playerDiv = null;
@@ -691,9 +699,35 @@
     hud.style.opacity = '0.8';
     overlayDiv.appendChild(hud);
 
+    // GAME OVER overlay centered on screen
+    gameOverDiv = document.createElement('div');
+    gameOverDiv.id = 'orca-stealth-gameover';
+    gameOverDiv.style.position = 'absolute';
+    gameOverDiv.style.left = '0';
+    gameOverDiv.style.top = '0';
+    gameOverDiv.style.width = '100%';
+    gameOverDiv.style.height = '100%';
+    gameOverDiv.style.display = 'none'; // shown only when isGameOver = true
+    gameOverDiv.style.alignItems = 'center';
+    gameOverDiv.style.justifyContent = 'center';
+    gameOverDiv.style.pointerEvents = 'none';
+    gameOverDiv.style.fontFamily = 'monospace';
+    gameOverDiv.style.fontSize = '48px';
+    gameOverDiv.style.fontWeight = 'bold';
+    gameOverDiv.style.color = '#ff3333';
+    gameOverDiv.style.textShadow = '0 0 12px rgba(0,0,0,0.9)';
+    gameOverDiv.style.background = 'transparent';
+
+    const gameOverLabel = document.createElement('div');
+    gameOverLabel.textContent = 'GAME OVER';
+    gameOverDiv.appendChild(gameOverLabel);
+
+    overlayDiv.appendChild(gameOverDiv);
+
     document.body.appendChild(overlayDiv);
 
     updateModeVisual();
+
     updatePlayerDirectionVisual();
     initPatchMarkersDom();
 
@@ -723,54 +757,87 @@
   }
 
   function updateModeVisual() {
-  if (!overlayDiv) return;
-  const hud = document.getElementById('orca-stealth-hud');
+    if (!overlayDiv) return;
+    const hud = document.getElementById('orca-stealth-hud');
 
-  const inAlert = (globalAlertLevel > 0) || anySectorTracking();
+    // GAME OVER overrides normal Edit/Game visuals
+    if (isGameOver) {
+      overlayDiv.style.background = 'rgba(0, 0, 0, 0.85)';
 
-  if (mode === 'edit') {
-    overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
-    if (hud) {
-      hud.textContent =
-        '[MODE: EDIT] HP ' +
-        playerHP +
-        '/' +
-        playerHPMax +
-        '  AMMO ' +
-        playerAmmo +
-        '/' +
-        playerAmmoMax;
-      hud.style.color = '#ffffff';
-    }
-  } else {
-
-    const alertText = inAlert ? 'ALERT' : 'STEALTH';
-    if (inAlert) {
-      overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
-    } else {
-      overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
-    }
       if (hud) {
-      hud.textContent =
-        '[MODE: GAME] HP ' +
-        playerHP +
-        '/' +
-        playerHPMax +
-        '  AMMO ' +
-        playerAmmo +
-        '/' +
-        playerAmmoMax +
-        '  [' +
-        alertText +
-        ']  (F1: toggle, Arrows: move, S: shoot, Space: Orca clock)';
-      hud.style.color = '#ffffff';
+        hud.textContent =
+          'GAME OVER  HP ' +
+          playerHP +
+          '/' +
+          playerHPMax +
+          '  AMMO ' +
+          playerAmmo +
+          '/' +
+          playerAmmoMax +
+          '  (F1: back to EDIT / tweak ORCA)';
+        hud.style.color = '#ff4444';
+      }
+
+      if (gameOverDiv) {
+        gameOverDiv.style.display = 'flex';
+      }
+
+      // Re-position HUD after any change
+      updateHudLayout();
+      return;
     }
 
+    // Hide GAME OVER overlay in normal play/edit
+    if (gameOverDiv) {
+      gameOverDiv.style.display = 'none';
+    }
+
+    const inAlert = (globalAlertLevel > 0) || anySectorTracking();
+
+    if (mode === 'edit') {
+      overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
+      if (hud) {
+        hud.textContent =
+          '[MODE: EDIT] HP ' +
+          playerHP +
+          '/' +
+          playerHPMax +
+          '  AMMO ' +
+          playerAmmo +
+          '/' +
+          playerAmmoMax;
+        hud.style.color = '#ffffff';
+      }
+    } else {
+
+      const alertText = inAlert ? 'ALERT' : 'STEALTH';
+      if (inAlert) {
+        overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
+      } else {
+        overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
+      }
+      if (hud) {
+        hud.textContent =
+          '[MODE: GAME] HP ' +
+          playerHP +
+          '/' +
+          playerHPMax +
+          '  AMMO ' +
+          playerAmmo +
+          '/' +
+          playerAmmoMax +
+          '  [' +
+          alertText +
+          ']  (F1: toggle, Arrows: move, S: shoot, Space: Orca clock)';
+        hud.style.color = '#ffffff';
+      }
+
+    }
+
+    // Re-position HUD after any change
+    updateHudLayout();
   }
 
-// Re-position HUD after any change
-  updateHudLayout();
-}
 
 // Position HUD in the bottom band of Orca, slightly to the right
 // of the built-in Orca status text.
@@ -4145,13 +4212,41 @@ function updateHudLayout() {
     updateGuardSpriteAppearance(guard);
   }
 
+  // Trigger GAME OVER: stop simulation and show overlay
+  function triggerGameOver() {
+    if (isGameOver) return;
+    isGameOver = true;
+
+    // Stop guards timer so world stops advancing
+    if (guardTimer) {
+      clearInterval(guardTimer);
+      guardTimer = null;
+    }
+
+    if (gameOverDiv) {
+      gameOverDiv.style.display = 'flex';
+    }
+
+    // Refresh HUD/background for game over state
+    updateModeVisual();
+
+    console.log('[overlay] GAME OVER triggered (player HP <= 0)');
+  }
+
+
   function applyPlayerHit(source) {
+    // Ignore extra hits once we are already in game over
+    if (isGameOver) {
+      return;
+    }
+
     if (playerHitCooldown > 0) {
       return;
     }
 
     playerHP--;
     if (playerHP < 0) playerHP = 0;
+
     const srcId = source && source.id ? source.id : 'unknown';
     console.log(
       '[overlay] PLAYER HIT by',
@@ -4165,20 +4260,21 @@ function updateHudLayout() {
     // Small cooldown to avoid taking damage every single tick
     playerHitCooldown = 4; // ~1s of invulnerability at 250ms per tick
 
-    // Update HUD
+    // If HP is now zero or below, trigger GAME OVER
+    if (playerHP <= 0) {
+      triggerGameOver();
+      return;
+    }
+
+    // Normal damage feedback
     updateModeVisual();
 
-    // Flash red
+    // Flash red briefly
     if (overlayDiv) {
       overlayDiv.style.background = 'rgba(255, 0, 0, 0.35)';
       setTimeout(() => {
         updateModeVisual();
       }, 150);
-    }
-
-    if (playerHP <= 0) {
-      console.log('[overlay] PLAYER DEAD (restart logic not implemented yet)');
-      // TODO: reset level / respawn
     }
   }
 
@@ -4222,7 +4318,10 @@ function updateHudLayout() {
   function stepAllGuards() {
     if (mode !== 'game') return;
 
-  // Advance global world tick
+    // If game is over, world simulation is frozen
+    if (isGameOver) return;
+
+    // Advance global world tick
     worldTick++;
 
     // Hard safety: make sure guards are never stuck inside walls.
@@ -4260,11 +4359,17 @@ function updateHudLayout() {
     updatePickupsBlink();
   }
 
+
   // --------------------------------------------------
   // Player movement
   // --------------------------------------------------
 
   function tryMovePlayer(dCol, dRow, newDir) {
+    // Do not move if game is over
+    if (isGameOver) {
+      return;
+    }
+
     prevPlayerCol = playerCol;
     prevPlayerRow = playerRow;
 
@@ -4301,16 +4406,15 @@ function updateHudLayout() {
     checkGuardPlayerCollisions();
     checkPickupCollisions();
 
-
-
     log('player moved to', playerCol, playerRow, 'dir=', playerDir);
   }
+
 
   // --------------------------------------------------
   // Keyboard input
   // --------------------------------------------------
 
-    function onKeyDown(ev) {
+  function onKeyDown(ev) {
     const key = ev.key;
 
     // Toggle mode (F1)
@@ -4326,6 +4430,13 @@ function updateHudLayout() {
       return;
     }
 
+    // GAME mode and already game over: block input (except F1 handled above)
+    if (mode === 'game' && isGameOver) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      return;
+    }
+
     // GAME mode
     if (key === ' ') {
       // Space goes to Orca (clock)
@@ -4335,7 +4446,7 @@ function updateHudLayout() {
       return;
     }
 
-    // Block everything else, except arrows and A
+    // Block everything else, except arrows and A / shoot keys
     ev.preventDefault();
     ev.stopPropagation();
 
@@ -4364,8 +4475,6 @@ function updateHudLayout() {
       return;
     }
   }
-
-
 
   // --------------------------------------------------
   // Init

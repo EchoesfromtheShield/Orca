@@ -667,7 +667,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   // - dungeon  -> guards per room (per patch) default 3
   //              pattern: 2 outside patch, 1 inside patch
   // - arena    -> guards per sector (N/S/W/E) default 3
-  const DEFAULT_DUNGEON_GUARDS_PER_ROOM   = 3;
+  const DEFAULT_DUNGEON_GUARDS_PER_ROOM   = 2;
   const DEFAULT_ARENA_GUARDS_PER_SECTOR   = 3;
 
   // GUARDS_PER_PATCH meaning:
@@ -909,6 +909,230 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
           return;
         }
 
+        spawnCells.forEach((cell, i) => {
+          const gid = `room_${patchIndex}_${i}`;
+          guards.push({
+            id: gid,
+            patrolType: 'rect',
+            startCol: cell.col,
+            startRow: cell.row,
+            rect: { minCol, maxCol, minRow, maxRow },
+            fovProfile: 'A',
+            behavior: 'chaser'
+          });
+        });
+      });
+
+      console.log(
+        '[patch_to_level] Dungeon guards generated:',
+        guards.length,
+        '(per room =',
+        dungeonGuardsPerRoom,
+        ')'
+      );
+    }
+  }
+
+  // --------------------------------------------------------------------
+  // DUNGEON: spawn per room (per patch), default 3 guards per room.
+  //
+  // Rules:
+  // - patrol rect is the room interior (when available), not just patch+margin;
+  // - guards spawn on '.' floor tiles only;
+  // - pattern per room:
+  //      * 2 guards prefer OUTSIDE the patch (room walkable area),
+  //      * 1 guard prefers INSIDE the patch (walkable area inside the frame),
+  //      * any extra guards (from GUARDS_PER_PATCH > 3) prefer OUTSIDE.
+  // - If there are not enough cells in the preferred zone, we gracefully
+  //   fall back to the other zone.
+  // --------------------------------------------------------------------
+  if (layoutType === 'dungeon') {
+    if (commentBlocksGlobal.length === 0) {
+      console.warn('[patch_to_level] Dungeon layout but no patches; falling back to legacy guards.');
+    } else {
+      const defaultMargin = 2;
+      const shrinkMargin = 1;
+
+      // Filter cells strictly OUTSIDE the commented patch rectangle.
+      function filterCellsOutsidePatch(cells, patch) {
+        if (!cells || !cells.length || !patch) return cells;
+
+        const patchMinCol = patch.x;
+        const patchMaxCol = patch.x + patch.w - 1;
+        const patchMinRow = patch.y;
+        const patchMaxRow = patch.y + patch.h - 1;
+
+        return cells.filter((c) =>
+          c.col < patchMinCol ||
+          c.col > patchMaxCol ||
+          c.row < patchMinRow ||
+          c.row > patchMaxRow
+        );
+      }
+
+      // Filter cells strictly INSIDE the commented patch rectangle.
+      function filterCellsInsidePatch(cells, patch) {
+        if (!cells || !cells.length || !patch) return [];
+
+        const patchMinCol = patch.x;
+        const patchMaxCol = patch.x + patch.w - 1;
+        const patchMinRow = patch.y;
+        const patchMaxRow = patch.y + patch.h - 1;
+
+        return cells.filter((c) =>
+          c.col >= patchMinCol &&
+          c.col <= patchMaxCol &&
+          c.row >= patchMinRow &&
+          c.row <= patchMaxRow
+        );
+      }
+
+      commentBlocksGlobal.forEach((b, patchIndex) => {
+        // 1) Base patrol rectangle:
+        //    - prefer the room interior we exported from buildDungeonLayout;
+        //    - fall back to patch rect + small margin.
+        let baseMinCol, baseMaxCol, baseMinRow, baseMaxRow;
+
+        if (
+          typeof b.roomMinCol === 'number' &&
+          typeof b.roomMaxCol === 'number' &&
+          typeof b.roomMinRow === 'number' &&
+          typeof b.roomMaxRow === 'number'
+        ) {
+          baseMinCol = b.roomMinCol;
+          baseMaxCol = b.roomMaxCol;
+          baseMinRow = b.roomMinRow;
+          baseMaxRow = b.roomMaxRow;
+        } else {
+          baseMinCol = Math.max(0, b.x - defaultMargin);
+          baseMaxCol = Math.min(ROOM_W - 1, b.x + b.w - 1 + defaultMargin);
+          baseMinRow = Math.max(0, b.y - defaultMargin);
+          baseMaxRow = Math.min(ROOM_H - 1, b.y + b.h - 1 + defaultMargin);
+        }
+
+        // Collect all walkable cells ('.') in the base rect.
+        let allWalkable = collectWalkableCells(
+          baseMinCol,
+          baseMaxCol,
+          baseMinRow,
+          baseMaxRow
+        );
+
+        if (allWalkable.length === 0) {
+          console.warn(
+            '[patch_to_level] WARNING (dungeon): no walkable cells around patch',
+            b.id || patchIndex,
+            '— guards will be skipped for this room.'
+          );
+          return;
+        }
+
+        // 2) Try to shrink the patrol rectangle by 1 cell on each side,
+        //    so guards are less likely to get stuck hugging the walls.
+        let minCol = baseMinCol;
+        let maxCol = baseMaxCol;
+        let minRow = baseMinRow;
+        let maxRow = baseMaxRow;
+
+        if (
+          baseMaxCol - baseMinCol >= 2 * shrinkMargin + 1 &&
+          baseMaxRow - baseMinRow >= 2 * shrinkMargin + 1
+        ) {
+          const tightMinCol = baseMinCol + shrinkMargin;
+          const tightMaxCol = baseMaxCol - shrinkMargin;
+          const tightMinRow = baseMinRow + shrinkMargin;
+          const tightMaxRow = baseMaxRow - shrinkMargin;
+
+          const tightCells = collectWalkableCells(
+            tightMinCol,
+            tightMaxCol,
+            tightMinRow,
+            tightMaxRow
+          );
+
+          // Use the tighter rect only if it still has valid floor cells.
+          if (tightCells.length > 0) {
+            minCol = tightMinCol;
+            maxCol = tightMaxCol;
+            minRow = tightMinRow;
+            maxRow = tightMaxRow;
+            allWalkable = tightCells;
+          }
+        }
+
+        // Split walkable cells into OUTSIDE and INSIDE patch zones.
+        const outsideCells = filterCellsOutsidePatch(allWalkable, b);
+        const insideCells  = filterCellsInsidePatch(allWalkable, b);
+
+        if (outsideCells.length === 0 && insideCells.length === 0) {
+          console.warn(
+            '[patch_to_level] WARNING (dungeon): no valid walkable cells in room',
+            b.id || patchIndex,
+            '— guards will be skipped for this room.'
+          );
+          return;
+        }
+
+        const totalGuards = dungeonGuardsPerRoom;
+        if (totalGuards <= 0) {
+          return;
+        }
+
+        // Desired zone pattern per room:
+        //  - 1st guard  -> outside
+        //  - 2nd guard  -> outside
+        //  - 3rd guard  -> inside
+        //  - 4th+ guard -> outside
+        const desiredZones = [];
+        if (totalGuards >= 1) desiredZones.push('outside');
+        if (totalGuards >= 2) desiredZones.push('outside');
+        if (totalGuards >= 3) desiredZones.push('inside');
+        for (let i = 3; i < totalGuards; i++) {
+          desiredZones.push('outside');
+        }
+
+        // Precompute randomized pools for each zone.
+        // We use pickGuardSpawnsInArea with max count to:
+        //  - randomize order,
+        //  - avoid multiple guards sharing same row/column where possible.
+        const outsidePool = (outsideCells.length > 0)
+          ? pickGuardSpawnsInArea(outsideCells, outsideCells.length)
+          : [];
+        const insidePool = (insideCells.length > 0)
+          ? pickGuardSpawnsInArea(insideCells, insideCells.length)
+          : [];
+
+        const spawnCells = [];
+
+        // Assign guards according to desiredZones, with graceful fallback:
+        // if preferred zone has no cells left, try the other zone.
+        desiredZones.forEach((zone) => {
+          if (zone === 'inside') {
+            if (insidePool.length > 0) {
+              spawnCells.push(insidePool.shift());
+            } else if (outsidePool.length > 0) {
+              spawnCells.push(outsidePool.shift());
+            }
+          } else {
+            // zone == 'outside'
+            if (outsidePool.length > 0) {
+              spawnCells.push(outsidePool.shift());
+            } else if (insidePool.length > 0) {
+              spawnCells.push(insidePool.shift());
+            }
+          }
+        });
+
+        if (spawnCells.length === 0) {
+          console.warn(
+            '[patch_to_level] WARNING (dungeon): could not place guards for room',
+            b.id || patchIndex,
+            '— no valid spawn cells.'
+          );
+          return;
+        }
+
+        // Finally create guards with a single patrol rect = whole room interior.
         spawnCells.forEach((cell, i) => {
           const gid = `room_${patchIndex}_${i}`;
           guards.push({
