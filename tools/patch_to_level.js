@@ -120,14 +120,21 @@ const ROOM_GAP_COLS   = parseInt(process.env.ROOM_GAP_COLS, 10) || 4;
 // Default: 2..4 celle per lato, ma puoi alzare con
 //   ROOM_MARGIN_X_MAX / ROOM_MARGIN_Y_MAX
 const ROOM_MARGIN_X_MIN = parseInt(process.env.ROOM_MARGIN_X_MIN, 10) || ROOM_MARGIN_X;
-const ROOM_MARGIN_X_MAX = parseInt(process.env.ROOM_MARGIN_X_MAX, 10) || (ROOM_MARGIN_X + 2);
+const ROOM_MARGIN_X_MAX = parseInt(process.env.ROOM_MARGIN_X_MAX, 10) || (ROOM_MARGIN_X + 4);
 const ROOM_MARGIN_Y_MIN = parseInt(process.env.ROOM_MARGIN_Y_MIN, 10) || ROOM_MARGIN_Y;
-const ROOM_MARGIN_Y_MAX = parseInt(process.env.ROOM_MARGIN_Y_MAX, 10) || (ROOM_MARGIN_Y + 2);
+const ROOM_MARGIN_Y_MAX = parseInt(process.env.ROOM_MARGIN_Y_MAX, 10) || (ROOM_MARGIN_Y + 4);
 
 // Dungeon: spessore corridoi (in celle), min/max.
 // Default: 1..4
 const CORRIDOR_WIDTH_MIN = parseInt(process.env.CORRIDOR_WIDTH_MIN, 10) || 1;
-const CORRIDOR_WIDTH_MAX = parseInt(process.env.CORRIDOR_WIDTH_MAX, 10) || 4;
+const CORRIDOR_WIDTH_MAX = parseInt(process.env.CORRIDOR_WIDTH_MAX, 10) || 6;
+
+// Dungeon: target fraction of the map area we allow rooms to occupy
+// (used for adaptive margins / corridor widths).
+// 0.65 means "try to keep total room area around 65% of map area".
+// Can be overridden with env.DUNGEON_TARGET_FILL.
+const DUNGEON_TARGET_FILL = parseFloat(process.env.DUNGEON_TARGET_FILL || '0.65');
+
 
 
 // Sanitize layout
@@ -1489,6 +1496,62 @@ function buildDungeonLayout(fullGrid) {
     };
   });
 
+  // --------------------------------------------------------------
+  // Adaptive tuning of room margins and corridor thickness
+  // --------------------------------------------------------------
+  const totalMapArea = ROOM_W * ROOM_H;
+
+  // Approximate "ideal" area if every room used MAX margins.
+  let idealArea = 0;
+  patchDescs.forEach((p) => {
+    const pw = p.patchWidth;
+    const ph = p.patchHeight;
+
+    const innerW = pw + ROOM_MARGIN_X_MAX * 2;
+    const innerH = ph + ROOM_MARGIN_Y_MAX * 2;
+    const fullW = innerW + 2; // + walls
+    const fullH = innerH + 2;
+
+    idealArea += fullW * fullH;
+  });
+
+  const targetFillFraction = DUNGEON_TARGET_FILL;
+  let areaScale = 1.0;
+
+  // If ideal area exceeds the target fraction of the map,
+  // shrink margins / corridor widths proportionally.
+  if (idealArea > 0 && idealArea > totalMapArea * targetFillFraction) {
+    areaScale = (totalMapArea * targetFillFraction) / idealArea;
+    // Do not shrink below 10% of the configured margin range
+    if (areaScale < 0.1) {
+      areaScale = 0.1;
+    }
+  }
+
+  const marginXRange = Math.max(0, ROOM_MARGIN_X_MAX - ROOM_MARGIN_X_MIN);
+  const marginYRange = Math.max(0, ROOM_MARGIN_Y_MAX - ROOM_MARGIN_Y_MIN);
+
+  const ADAPTIVE_MARGIN_X_MAX =
+    ROOM_MARGIN_X_MIN + Math.round(marginXRange * areaScale);
+  const ADAPTIVE_MARGIN_Y_MAX =
+    ROOM_MARGIN_Y_MIN + Math.round(marginYRange * areaScale);
+
+  const corridorWidthRange = Math.max(0, CORRIDOR_WIDTH_MAX - CORRIDOR_WIDTH_MIN);
+  const ADAPTIVE_CORRIDOR_WIDTH_MAX =
+    CORRIDOR_WIDTH_MIN + Math.round(corridorWidthRange * areaScale);
+
+  console.log(
+    '[patch_to_level] Dungeon adaptive scale:',
+    'patchCount =', patchDescs.length,
+    'idealArea =', idealArea,
+    'mapArea =', totalMapArea,
+    'areaScale =', areaScale.toFixed(3),
+    'marginXMaxUsed =', ADAPTIVE_MARGIN_X_MAX,
+    'marginYMaxUsed =', ADAPTIVE_MARGIN_Y_MAX,
+    'corridorWidthMaxUsed =', ADAPTIVE_CORRIDOR_WIDTH_MAX
+  );
+
+
   // Final grid: initially full of walls
   const finalGrid = [];
   for (let y = 0; y < ROOM_H; y++) {
@@ -1505,9 +1568,10 @@ function buildDungeonLayout(fullGrid) {
     const pw = p.patchWidth;
     const ph = p.patchHeight;
 
-    // Random margins around patch
-    const marginX = randInt(ROOM_MARGIN_X_MIN, ROOM_MARGIN_X_MAX);
-    const marginY = randInt(ROOM_MARGIN_Y_MIN, ROOM_MARGIN_Y_MAX);
+    // Random margins around patch (adaptive max)
+    const marginX = randInt(ROOM_MARGIN_X_MIN, ADAPTIVE_MARGIN_X_MAX);
+    const marginY = randInt(ROOM_MARGIN_Y_MIN, ADAPTIVE_MARGIN_Y_MAX);
+
 
     const innerW = pw + marginX * 2;
     const innerH = ph + marginY * 2;
@@ -1631,8 +1695,9 @@ function buildDungeonLayout(fullGrid) {
     const x2 = r2.centerX;
     const y2 = r2.centerY;
 
-    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, CORRIDOR_WIDTH_MAX);
-    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, CORRIDOR_WIDTH_MAX);
+    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, ADAPTIVE_CORRIDOR_WIDTH_MAX);
+    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, ADAPTIVE_CORRIDOR_WIDTH_MAX);
+
 
     // Horizontal segment
     carveHorizontalCorridor(finalGrid, y1, x1, x2, corridorWidthH);

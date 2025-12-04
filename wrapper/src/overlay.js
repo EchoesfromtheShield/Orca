@@ -80,6 +80,18 @@
   // Alert / memory (how long sectors remember player absolute position after losing sight)
   const ALERT_MEMORY_TICKS          = 12; // ~3s at 250ms
 
+  // "Observing" behaviour: guard stops and rotates FOV to cover 360°
+  const OBSERVE_MIN_INTERVAL_TICKS     = 32;  // after ~8s of patrol we start considering observing
+  const OBSERVE_FORCED_INTERVAL_TICKS  = 96;  // after ~24s we force at least one observing
+  const OBSERVE_DURATION_TICKS         = 8;   // observing phase length (~2s)
+
+  // "Patrol deviation": guard leaves the rectangle for a short excursion and then comes back
+  const PATROL_DEV_MIN_INTERVAL_TICKS     = 40;   // ~10s before we start considering a deviation
+  const PATROL_DEV_FORCED_INTERVAL_TICKS  = 120;  // ~30s -> guaranteed deviation
+  const PATROL_DEV_MAX_RADIUS_CELLS       = 4;    // how deep inside the rect the guard can go
+  const PATROL_DEV_OUT_STEPS_MAX          = 4;    // max steps going away from the perimeter
+  const PATROL_DEV_BACK_STEPS_MAX         = 4;    // max steps to return to the perimeter
+
  // Guard FOV mode di base:
   //  - "wobble": guards sweep their view left/right (testa che oscilla)
   //  - "fixed":  FOV sempre centrato nella direzione di movimento
@@ -354,6 +366,9 @@
   let guards = [];
   let guardTimer = null;
   let globalAlertLevel = 0; // 0 = no guard sees the player, 1 = at least one guard sees him
+  // Monotonic world tick counter (used by patrol extra behaviours)
+  let worldTick = 0;
+
 
   // Track if we already ran the spawn-adjustment pass for the current levelConfig
   let guardSpawnsInitialized = false;
@@ -843,6 +858,30 @@ function updateHudLayout() {
         lastPositions: [],
         stuckCounter: 0,
 
+        // Patrol behaviour (direction and extra patterns)
+        // true  = patrol rectangle clockwise
+        // false = patrol rectangle counterclockwise
+        patrolClockwise:
+          (typeof cfg.patrolClockwise === 'boolean')
+            ? cfg.patrolClockwise
+            : (Math.random() < 0.5),
+        lastPatrolTick: -1,
+
+        // Observing behaviour (guard stops and rotates on the spot)
+        observingTicksLeft: 0,
+        ticksSinceLastObserve: 0,
+        lastObserveCol: null,
+        lastObserveRow: null,
+
+        // Rectangle deviation behaviour (short excursion inside the same room)
+        deviationActive: false,
+        deviationPhase: null,          // "out" | "return"
+        deviationOutStepsLeft: 0,
+        deviationBackStepsLeft: 0,
+        ticksSinceLastDeviation: 0,
+        lastDeviationCol: null,
+        lastDeviationRow: null,
+
         // Stun / combat
         neutralized: false,
         stunTicks: 0,
@@ -852,6 +891,7 @@ function updateHudLayout() {
         maxHP: GUARD_MAX_HP,
         hp: GUARD_MAX_HP,
         dead: false
+
       };
 
       guards.push(guard);
@@ -2803,6 +2843,240 @@ function updateHudLayout() {
   }
 
   // --------------------------------------------------
+  // Patrol extra behaviours: observing & rectangle deviation
+  // --------------------------------------------------
+
+  // Observing: guard stays still and rotates FOV to cover 360°
+  function stepGuardObserving(guard) {
+    if (!guard || guard.observingTicksLeft == null || guard.observingTicksLeft <= 0) {
+      return;
+    }
+
+    const total = OBSERVE_DURATION_TICKS;
+    const remaining = guard.observingTicksLeft;
+    const elapsed = total - remaining;
+
+    // 4 cardinal slices: up, right, down, left
+    const slices = 4;
+    const sliceLen = Math.max(1, Math.floor(total / slices));
+    const sliceIndex = Math.min(slices - 1, Math.floor(elapsed / sliceLen));
+
+    if (sliceIndex === 0) {
+      guard.dirX = 0; guard.dirY = -1; // up
+    } else if (sliceIndex === 1) {
+      guard.dirX = 1; guard.dirY = 0;  // right
+    } else if (sliceIndex === 2) {
+      guard.dirX = 0; guard.dirY = 1;  // down
+    } else {
+      guard.dirX = -1; guard.dirY = 0; // left
+    }
+
+    guard.observingTicksLeft--;
+    clampGuard(guard);
+    updateGuardPosition(guard);
+  }
+
+  // Decide if a guard should enter observing state this tick
+  function maybeStartObserving(guard) {
+    if (!guard) return false;
+    if (guard.state !== 'patrol') return false;
+
+    // Already in observing phase
+    if (guard.observingTicksLeft && guard.observingTicksLeft > 0) {
+      return false;
+    }
+
+    // Do not start observing while any alert / tracking is active
+    if (globalAlertLevel > 0 || anySectorTracking()) {
+      return false;
+    }
+
+    guard.ticksSinceLastObserve = (guard.ticksSinceLastObserve || 0) + 1;
+
+    const t = guard.ticksSinceLastObserve;
+    if (t < OBSERVE_MIN_INTERVAL_TICKS) {
+      return false;
+    }
+
+    const force = t >= OBSERVE_FORCED_INTERVAL_TICKS;
+
+    if (!force) {
+      // Pseudo-random: small chance per tick once we are beyond the minimum interval
+      const chance = 0.12; // 12%
+      if (Math.random() >= chance) {
+        return false;
+      }
+    }
+
+    // Avoid always starting from the exact same patrol cell (unless forced)
+    if (!force &&
+        guard.lastObserveCol != null &&
+        guard.lastObserveRow != null &&
+        guard.col === guard.lastObserveCol &&
+        guard.row === guard.lastObserveRow) {
+      return false;
+    }
+
+    guard.observingTicksLeft = OBSERVE_DURATION_TICKS;
+    guard.ticksSinceLastObserve = 0;
+    guard.lastObserveCol = guard.col;
+    guard.lastObserveRow = guard.row;
+    guard.lookPhase = 0; // reset wobble phase so FOV is nicely centered
+
+    return true;
+  }
+
+  // Distance from a cell to the patrol rectangle border (0 = on border)
+  function distanceToPatrolRectBorder(guard, col, row) {
+    const dLeft   = col - guard.minCol;
+    const dRight  = guard.maxCol - col;
+    const dTop    = row - guard.minRow;
+    const dBottom = guard.maxRow - row;
+    return Math.min(dLeft, dRight, dTop, dBottom);
+  }
+
+  // Single step for patrol deviation, either going "out" (inside the rect)
+  // or "return" (back to the perimeter).
+  function tryDeviationStep(guard, phase) {
+    const dirs = [
+      { dx:  1, dy:  0 },
+      { dx: -1, dy:  0 },
+      { dx:  0, dy:  1 },
+      { dx:  0, dy: -1 }
+    ];
+
+    const currentDist = distanceToPatrolRectBorder(guard, guard.col, guard.row);
+    const candidates = [];
+
+    for (let i = 0; i < dirs.length; i++) {
+      const d = dirs[i];
+      const nc = guard.col + d.dx;
+      const nr = guard.row + d.dy;
+
+      if (!withinGuardRect(guard, nc, nr)) continue;
+      if (!isWalkable(nc, nr)) continue;
+      if (isCellOccupiedByOtherGuard(nc, nr, guard)) continue;
+
+      const dist = distanceToPatrolRectBorder(guard, nc, nr);
+
+      if (phase === 'out') {
+        // Prefer steps that go deeper inside the rect (dist > currentDist)
+        if (dist <= currentDist) continue;
+        if (dist > PATROL_DEV_MAX_RADIUS_CELLS) continue;
+        candidates.push({ col: nc, row: nr, dx: d.dx, dy: d.dy });
+      } else {
+        // Return phase: prefer steps that move closer to the border (dist < currentDist)
+        if (dist >= currentDist) continue;
+        candidates.push({ col: nc, row: nr, dx: d.dx, dy: d.dy });
+      }
+    }
+
+    if (candidates.length === 0) {
+      return false;
+    }
+
+    // Random pick among best candidates
+    const choice = candidates[Math.floor(Math.random() * candidates.length)];
+    guard.col = choice.col;
+    guard.row = choice.row;
+    guard.dirX = choice.dx;
+    guard.dirY = choice.dy;
+    clampGuard(guard);
+    updateGuardPosition(guard);
+    updateGuardLookDirection(guard);
+    return true;
+  }
+
+  // Decide if we start a deviation this tick
+  function maybeStartPatrolDeviation(guard) {
+    if (!guard) return false;
+    if (guard.state !== 'patrol') return false;
+
+    // Only if the guard is actually inside its patrol rect
+    if (!withinGuardRect(guard, guard.col, guard.row)) {
+      return false;
+    }
+
+    // Do not deviate while alert is active
+    if (globalAlertLevel > 0 || anySectorTracking()) {
+      guard.deviationActive = false;
+      return false;
+    }
+
+    // Already in a deviation
+    if (guard.deviationActive) {
+      return false;
+    }
+
+    guard.ticksSinceLastDeviation = (guard.ticksSinceLastDeviation || 0) + 1;
+
+    const t = guard.ticksSinceLastDeviation;
+    if (t < PATROL_DEV_MIN_INTERVAL_TICKS) {
+      return false;
+    }
+
+    const force = t >= PATROL_DEV_FORCED_INTERVAL_TICKS;
+
+    if (!force) {
+      const chance = 0.10; // 10% per tick after minimum interval
+      if (Math.random() >= chance) {
+        return false;
+      }
+    }
+
+    // Initialise deviation state
+    guard.deviationActive = true;
+    guard.deviationPhase = 'out';
+    guard.deviationOutStepsLeft = PATROL_DEV_OUT_STEPS_MAX;
+    guard.deviationBackStepsLeft = PATROL_DEV_BACK_STEPS_MAX;
+    guard.ticksSinceLastDeviation = 0;
+    guard.lastDeviationCol = guard.col;
+    guard.lastDeviationRow = guard.row;
+
+    return true;
+  }
+
+  // One tick of deviation behaviour (either going out or returning)
+  function stepGuardPatrolDeviation(guard) {
+    if (!guard.deviationActive) return;
+
+    const dist = distanceToPatrolRectBorder(guard, guard.col, guard.row);
+
+    if (guard.deviationPhase === 'out') {
+      if (guard.deviationOutStepsLeft <= 0 || dist >= PATROL_DEV_MAX_RADIUS_CELLS) {
+        guard.deviationPhase = 'return';
+      } else {
+        const moved = tryDeviationStep(guard, 'out');
+        if (moved) {
+          guard.deviationOutStepsLeft--;
+          return;
+        }
+        // Could not move -> switch to return
+        guard.deviationPhase = 'return';
+      }
+    }
+
+    if (guard.deviationPhase === 'return') {
+      if (dist <= 0 || guard.deviationBackStepsLeft <= 0) {
+        // Back on border or out of budget: stop deviating
+        guard.deviationActive = false;
+        guard.deviationPhase = null;
+        return;
+      }
+
+      const moved = tryDeviationStep(guard, 'return');
+      if (moved) {
+        guard.deviationBackStepsLeft--;
+        return;
+      }
+
+      // If we cannot move, just stop deviating and go back to normal patrol
+      guard.deviationActive = false;
+      guard.deviationPhase = null;
+    }
+  }
+
+  // --------------------------------------------------
   // Rectangular patrol
   // --------------------------------------------------
 
@@ -2818,22 +3092,80 @@ function updateHudLayout() {
   function rotateGuardDirClockwise(guard) {
     const dx = guard.dirX;
     const dy = guard.dirY;
-    // (1,0) -> (0,1) -> (-1,0) -> (0,-1) -> ...
-    if (dx === 1 && dy === 0) {
-      guard.dirX = 0; guard.dirY = 1;
-    } else if (dx === 0 && dy === 1) {
-      guard.dirX = -1; guard.dirY = 0;
-    } else if (dx === -1 && dy === 0) {
-      guard.dirX = 0; guard.dirY = -1;
-    } else if (dx === 0 && dy === -1) {
-      guard.dirX = 1; guard.dirY = 0;
+
+    // Default: clockwise = true if not explicitly set to false
+    const clockwise = (guard.patrolClockwise !== false);
+
+    if (clockwise) {
+      // Clockwise around the rectangle: E -> S -> W -> N -> E
+      if (dx === 1 && dy === 0) {
+        guard.dirX = 0; guard.dirY = 1;   // E -> S
+      } else if (dx === 0 && dy === 1) {
+        guard.dirX = -1; guard.dirY = 0;  // S -> W
+      } else if (dx === -1 && dy === 0) {
+        guard.dirX = 0; guard.dirY = -1;  // W -> N
+      } else if (dx === 0 && dy === -1) {
+        guard.dirX = 1; guard.dirY = 0;   // N -> E
+      } else {
+        guard.dirX = 1;
+        guard.dirY = 0;
+      }
     } else {
-      guard.dirX = 1;
-      guard.dirY = 0;
+      // Counterclockwise: E -> N -> W -> S -> E
+      if (dx === 1 && dy === 0) {
+        guard.dirX = 0; guard.dirY = -1;  // E -> N
+      } else if (dx === 0 && dy === -1) {
+        guard.dirX = -1; guard.dirY = 0;  // N -> W
+      } else if (dx === -1 && dy === 0) {
+        guard.dirX = 0; guard.dirY = 1;   // W -> S
+      } else if (dx === 0 && dy === 1) {
+        guard.dirX = 1; guard.dirY = 0;   // S -> E
+      } else {
+        guard.dirX = 1;
+        guard.dirY = 0;
+      }
     }
   }
 
+
   function stepGuardPatrol(guard) {
+    // If observing is in progress, guard stays still and rotates FOV
+    if (guard.observingTicksLeft && guard.observingTicksLeft > 0) {
+      stepGuardObserving(guard);
+      return;
+    }
+
+    // Per-tick scheduling for extra patrol behaviours (only once per world tick)
+    const firstCallThisTick = (guard.lastPatrolTick !== worldTick);
+    if (firstCallThisTick) {
+      guard.lastPatrolTick = worldTick;
+
+      if (guard.state === 'patrol' && globalAlertLevel === 0 && !anySectorTracking()) {
+        // 1) Try to enter observing
+        if (maybeStartObserving(guard)) {
+          stepGuardObserving(guard);
+          return;
+        }
+
+        // 2) Try to start a rectangle deviation
+        if (!guard.deviationActive && maybeStartPatrolDeviation(guard)) {
+          // Perform the first deviation step immediately
+          stepGuardPatrolDeviation(guard);
+          return;
+        }
+      }
+    }
+
+    // If we are in deviation mode, follow deviation instead of the rectangle perimeter
+    if (guard.deviationActive) {
+      stepGuardPatrolDeviation(guard);
+      return;
+    }
+
+    // --------------------------------------------------
+    // Normal rectangular patrol (original behaviour)
+    // --------------------------------------------------
+
     // If guard is outside its patrol rect, move back towards it
     if (!withinGuardRect(guard, guard.col, guard.row)) {
       let targetCol = guard.col;
@@ -2851,12 +3183,26 @@ function updateHudLayout() {
       let nextCol = guard.col;
       let nextRow = guard.row;
 
-      if (stepX !== 0 && isWalkable(guard.col + Math.sign(stepX), guard.row) &&
-          !isCellOccupiedByOtherGuard(guard.col + Math.sign(stepX), guard.row, guard)) {
+      if (
+        stepX !== 0 &&
+        isWalkable(guard.col + Math.sign(stepX), guard.row) &&
+        !isCellOccupiedByOtherGuard(
+          guard.col + Math.sign(stepX),
+          guard.row,
+          guard
+        )
+      ) {
         nextCol = guard.col + Math.sign(stepX);
         nextRow = guard.row;
-      } else if (stepY !== 0 && isWalkable(guard.col, guard.row + Math.sign(stepY)) &&
-                 !isCellOccupiedByOtherGuard(guard.col, guard.row + Math.sign(stepY), guard)) {
+      } else if (
+        stepY !== 0 &&
+        isWalkable(guard.col, guard.row + Math.sign(stepY)) &&
+        !isCellOccupiedByOtherGuard(
+          guard.col,
+          guard.row + Math.sign(stepY),
+          guard
+        )
+      ) {
         nextCol = guard.col;
         nextRow = guard.row + Math.sign(stepY);
       }
@@ -2873,7 +3219,7 @@ function updateHudLayout() {
     let nextCol = guard.col + guard.dirX;
     let nextRow = guard.row + guard.dirY;
 
-    // If it leaves its rectangle, rotate and retry
+    // If it leaves its rectangle, rotate (cw or ccw) and retry
     if (!withinGuardRect(guard, nextCol, nextRow)) {
       rotateGuardDirClockwise(guard);
       nextCol = guard.col + guard.dirX;
@@ -2887,15 +3233,19 @@ function updateHudLayout() {
     }
 
     // If it hits Orca code or another guard, try to rotate to go around it
-    if (!isWalkable(nextCol, nextRow) ||
-        isCellOccupiedByOtherGuard(nextCol, nextRow, guard)) {
+    if (
+      !isWalkable(nextCol, nextRow) ||
+      isCellOccupiedByOtherGuard(nextCol, nextRow, guard)
+    ) {
       rotateGuardDirClockwise(guard);
       nextCol = guard.col + guard.dirX;
       nextRow = guard.row + guard.dirY;
 
-      if (!withinGuardRect(guard, nextCol, nextRow) ||
-          !isWalkable(nextCol, nextRow) ||
-          isCellOccupiedByOtherGuard(nextCol, nextRow, guard)) {
+      if (
+        !withinGuardRect(guard, nextCol, nextRow) ||
+        !isWalkable(nextCol, nextRow) ||
+        isCellOccupiedByOtherGuard(nextCol, nextRow, guard)
+      ) {
         updateGuardLookDirection(guard);
         updateGuardPosition(guard);
         return;
@@ -2909,6 +3259,7 @@ function updateHudLayout() {
     updateGuardLookDirection(guard);
     updateGuardPosition(guard);
   }
+
 
   // --------------------------------------------------
   // Preferred alert targets (cardinal "slots" around player)
@@ -3216,6 +3567,9 @@ function updateHudLayout() {
 
     // STUNNED state
     if (guard.state === 'stunned') {
+      // Cancel patrol extra behaviours while stunned
+      guard.deviationActive = false;
+      guard.observingTicksLeft = 0;
 
       if (guard.stunTicks > 0) {
         guard.stunTicks--;
@@ -3233,6 +3587,10 @@ function updateHudLayout() {
 
     // ALERT_CHASER state: faster movement (multiple steps per tick)
     if (guard.state === 'alert_chaser') {
+      // Any special patrol behaviour is cancelled while chasing
+      guard.deviationActive = false;
+      guard.observingTicksLeft = 0;
+
       for (let i = 0; i < ALERT_STEPS_PER_TICK; i++) {
         stepGuardAlert(guard);
         if (guard.state !== 'alert_chaser') {
@@ -3245,17 +3603,22 @@ function updateHudLayout() {
 
     // RETURN_TO_PATROL: go back "home" using BFS, then resume patrol
     if (guard.state === 'return_to_patrol') {
+      // Stop any patrol-side behaviour while returning
+      guard.deviationActive = false;
+      guard.observingTicksLeft = 0;
+
       stepGuardReturnToPatrol(guard);
       registerGuardMovementHistory(guard);
       return;
     }
 
-    // Default: PATROL
+    // Default: PATROL (including observing & deviation sub-behaviours)
     for (let i = 0; i < PATROL_STEPS_PER_TICK; i++) {
       stepGuardPatrol(guard);
     }
     registerGuardMovementHistory(guard);
   }
+
   
   // Update guard sprite appearance based on HP / dead state
   function updateGuardSpriteAppearance(guard) {
@@ -3472,6 +3835,9 @@ function updateHudLayout() {
 
   function stepAllGuards() {
     if (mode !== 'game') return;
+
+  // Advance global world tick
+    worldTick++;
 
     // Hard safety: make sure guards are never stuck inside walls.
     // If a guard starts in a non-walkable cell (e.g. dungeon generator edge cases),
