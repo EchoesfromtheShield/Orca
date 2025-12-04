@@ -664,18 +664,26 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   const gridW = hasGrid ? levelGrid[0].length : 0;
 
   // Defaults:
-  // - dungeon  -> guards per room (per patch) default 2
+  // - dungeon  -> guards per room (per patch) default 3
+  //              pattern: 2 outside patch, 1 inside patch
   // - arena    -> guards per sector (N/S/W/E) default 3
-  const DEFAULT_DUNGEON_GUARDS_PER_ROOM   = 2;
+  const DEFAULT_DUNGEON_GUARDS_PER_ROOM   = 3;
   const DEFAULT_ARENA_GUARDS_PER_SECTOR   = 3;
 
-  // GUARDS_PER_PATCH is reused:
-  // - in dungeon: "guards per room"
-  // - in arena:   "guards per sector"
+  // GUARDS_PER_PATCH meaning:
+  // - in dungeon: "total guards per room" (if > 0), with the pattern:
+  //       first 2 guards try to spawn OUTSIDE the patch,
+  //       third guard tries to spawn INSIDE the patch,
+  //       additional guards (4th, 5th, ...) spawn OUTSIDE.
+  //   If GUARDS_PER_PATCH == 0 we use DEFAULT_DUNGEON_GUARDS_PER_ROOM (=3).
+  //
+  // - in arena: "guards per sector" (if > 0), otherwise default 3.
   const dungeonGuardsPerRoom =
     (GUARDS_PER_PATCH > 0) ? GUARDS_PER_PATCH : DEFAULT_DUNGEON_GUARDS_PER_ROOM;
+
   const arenaGuardsPerSector =
     (GUARDS_PER_PATCH > 0) ? GUARDS_PER_PATCH : DEFAULT_ARENA_GUARDS_PER_SECTOR;
+
 
   // Helper: collect all walkable ('.') cells inside a rectangle.
   function collectWalkableCells(minCol, maxCol, minRow, maxRow) {

@@ -61,7 +61,6 @@
   // Pickup blink tuning (ammo & medikit)
   const PICKUP_BLINK_DURATION_SEC = 0.35; // faster blink; tune as you like
 
-
   // Player ranged weapon
   const PLAYER_BULLET_RANGE_CELLS   = 7;  // max distance (in cells) for player bullets
   const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
@@ -78,7 +77,7 @@
 
 
   // Alert / memory (how long sectors remember player absolute position after losing sight)
-  const ALERT_MEMORY_TICKS          = 12; // ~3s at 250ms
+  const ALERT_MEMORY_TICKS          = 8; // ~2s at 250ms
 
   // "Observing" behaviour: guard stops and rotates FOV to cover 360°
   const OBSERVE_MIN_INTERVAL_TICKS     = 32;  // after ~8s of patrol we start considering observing
@@ -91,6 +90,10 @@
   const PATROL_DEV_MAX_RADIUS_CELLS       = 4;    // how deep inside the rect the guard can go
   const PATROL_DEV_OUT_STEPS_MAX          = 4;    // max steps going away from the perimeter
   const PATROL_DEV_BACK_STEPS_MAX         = 4;    // max steps to return to the perimeter
+
+// Anti-stuck: after ~5 seconds of being stuck or oscillating,
+// a guard will try hard to reset its position inside the patrol rect.
+  const GUARD_TRY_HARD_STUCK_TICKS = 20; // 20 ticks * 250ms ≈ 5s
 
  // Guard FOV mode di base:
   //  - "wobble": guards sweep their view left/right (testa che oscilla)
@@ -268,7 +271,7 @@
       GUARD_FOV_WOBBLE_ENABLED = true;
     }
 
-    console.log(
+      console.log(
       '[overlay] Level config updated from external config:',
       merged,
       'layoutType =',
@@ -277,7 +280,25 @@
       GUARD_FOV_WOBBLE_ENABLED ? 'ON' : 'OFF'
     );
 
+    // Reset room alerts and sector alerts for the new level
+    for (const k in roomAlerts) {
+      if (Object.prototype.hasOwnProperty.call(roomAlerts, k)) {
+        delete roomAlerts[k];
+      }
+    }
+    sectorAlerts.NW.state = 'idle';
+    sectorAlerts.NE.state = 'idle';
+    sectorAlerts.SW.state = 'idle';
+    sectorAlerts.SE.state = 'idle';
+    sectorAlerts.NW.timer = sectorAlerts.NE.timer =
+      sectorAlerts.SW.timer = sectorAlerts.SE.timer = 0;
+    sectorAlerts.NW.targetCol = sectorAlerts.NE.targetCol =
+      sectorAlerts.SW.targetCol = sectorAlerts.SE.targetCol = null;
+    sectorAlerts.NW.targetRow = sectorAlerts.NE.targetRow =
+      sectorAlerts.SW.targetRow = sectorAlerts.SE.targetRow = null;
+
     // --- PICKUPS FIX ---
+
 
     // Remove any pickups that were spawned before (random defaults, etc.)
     clearAllPickups();
@@ -406,6 +427,31 @@
     SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
     SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0 }
   };
+
+  // Room-based alert states (used only in dungeon layout).
+  // Key format: "minCol,maxCol,minRow,maxRow"
+  const roomAlerts = {};
+
+  // Layout helpers
+  function getLayoutType() {
+    return (levelConfig && levelConfig.layoutType) ? levelConfig.layoutType : 'arena';
+  }
+
+  function isDungeonLayout() {
+    return getLayoutType() === 'dungeon';
+  }
+
+  // Compute a stable "room key" for a guard based on its patrol rectangle
+  function getGuardRoomKey(guard) {
+    if (!guard) return null;
+    return (
+      guard.minCol + ',' +
+      guard.maxCol + ',' +
+      guard.minRow + ',' +
+      guard.maxRow
+    );
+  }
+
 
   // --------------------------------------------------
   // Patch zones / liberation (4-corners test, data-driven)
@@ -656,6 +702,18 @@
   }
 
   function anySectorTracking() {
+    // In dungeon layout, we use room-based alerts instead of quadrants.
+    if (isDungeonLayout()) {
+      for (const key in roomAlerts) {
+        const ra = roomAlerts[key];
+        if (ra && ra.state === 'tracking') {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Arena layout: keep the old sector logic.
     return (
       sectorAlerts.NW.state === 'tracking' ||
       sectorAlerts.NE.state === 'tracking' ||
@@ -2697,7 +2755,16 @@ function updateHudLayout() {
     );
   }
 
-    function updateAllFovAndAlert(manageMemory) {
+  function updateAllFovAndAlert(manageMemory) {
+    const layoutType = getLayoutType();
+
+    // Dungeon layout: use room-based alert logic
+    if (layoutType === 'dungeon') {
+      updateAllFovAndAlertDungeon(!!manageMemory);
+      return;
+    }
+
+    // Arena layout: original sector-based logic
     manageMemory = !!manageMemory;
 
     let anySeen = false;
@@ -2734,22 +2801,21 @@ function updateHudLayout() {
     });
 
     if (manageMemory) {
-      // Aggiorna gli stati di settore con memoria a 3s
+      // Update sector states with 3s memory
       ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
         const sa = sectorAlerts[name];
 
         if (sectorSaw[name]) {
-          // Qualcuna vede il player ORA in questo settore
+          // At least one guard in this sector sees the player now
           sa.state = 'tracking';
           sa.targetCol = playerCol;
           sa.targetRow = playerRow;
           sa.timer = ALERT_MEMORY_TICKS;
         } else if (sa.state === 'tracking') {
-          // Nessuno lo vede adesso, ma il settore era in tracking
+          // Sector was tracking, but no one sees the player this tick
           if (sa.timer > 0) {
             sa.timer--;
             if (sa.timer > 0) {
-              // Memoria: per tutta la durata, conosciamo ancora la posizione assoluta
               sa.targetCol = playerCol;
               sa.targetRow = playerRow;
             } else {
@@ -2765,7 +2831,7 @@ function updateHudLayout() {
         }
       });
 
-      // Alert globale: attivo se qualcuno vede OR se almeno un settore è in tracking (memoria)
+      // Global alert: on if any guard sees OR at least one sector is tracking
       const trackingNow =
         sectorAlerts.NW.state === 'tracking' ||
         sectorAlerts.NE.state === 'tracking' ||
@@ -2774,20 +2840,16 @@ function updateHudLayout() {
 
       globalAlertLevel = (anySeen || trackingNow) ? 1 : 0;
 
-      // Allinea stati delle guardie al loro settore
+      // Align guard states with their sector
       guards.forEach((g) => {
         if (g.state === 'stunned' || g.state === 'dead') return;
-
 
         const s = getSector(g.col, g.row);
         const sa = sectorAlerts[s];
 
         if (sa.state === 'tracking') {
-          // Sector currently tracking: guard is in full alert / chasing mode
           g.state = 'alert_chaser';
         } else {
-          // Sector is idle: if guard was in alert and no longer sees the player,
-          // switch to "return_to_patrol" so it can go back to its home cell via BFS.
           if (g.state === 'alert_chaser' && !g.seenPlayer) {
             g.state = 'return_to_patrol';
             g.path = null;
@@ -2797,13 +2859,135 @@ function updateHudLayout() {
         }
       });
 
+      updateModeVisual();
+    }
+
+    // FOV always redrawn
+    renderGuardFov();
+  }
+
+  // Dungeon: room-based alert logic.
+  function updateAllFovAndAlertDungeon(manageMemory) {
+    manageMemory = !!manageMemory;
+
+    let anySeen = false;
+    const roomsSaw = {}; // roomKey -> true
+
+    guards.forEach((guard) => {
+      if (guard.state === 'stunned' || guard.state === 'dead') {
+        guard.fovCells = [];
+        guard.wasSeeingPlayer = guard.seenPlayer;
+        guard.seenPlayer = false;
+        return;
+      }
+
+      guard.fovCells = computeGuardFovCellsForGuard(guard);
+      const prevSeen = guard.seenPlayer;
+      const nextSeen = guard.fovCells.some(
+        (c) => c.col === playerCol && c.row === playerRow
+      );
+
+      guard.wasSeeingPlayer = prevSeen;
+      guard.seenPlayer = nextSeen;
+
+      if (nextSeen) {
+        anySeen = true;
+        guard.lastSeenPlayerCol = playerCol;
+        guard.lastSeenPlayerRow = playerRow;
+
+        const roomKey = getGuardRoomKey(guard);
+        if (roomKey) {
+          roomsSaw[roomKey] = true;
+        }
+      }
+
+      if (!prevSeen && nextSeen) {
+        handleGuardSpotsPlayer(guard);
+      }
+    });
+
+    if (manageMemory) {
+      // Ensure entries for rooms that saw the player
+      for (const key in roomsSaw) {
+        if (!roomAlerts[key]) {
+          roomAlerts[key] = {
+            state: 'idle',
+            targetCol: null,
+            targetRow: null,
+            timer: 0
+          };
+        }
+      }
+
+      // Update alert/memory state per room
+      for (const key in roomAlerts) {
+        const ra = roomAlerts[key];
+        if (!ra) continue;
+
+        if (roomsSaw[key]) {
+          // At least one guard in this room sees the player
+          ra.state = 'tracking';
+          ra.targetCol = playerCol;
+          ra.targetRow = playerRow;
+          ra.timer = ALERT_MEMORY_TICKS;
+        } else if (ra.state === 'tracking') {
+          // Room was tracking: decay memory
+          if (ra.timer > 0) {
+            ra.timer--;
+            if (ra.timer <= 0) {
+              ra.state = 'idle';
+              ra.targetCol = null;
+              ra.targetRow = null;
+              ra.timer = 0;
+            }
+          } else {
+            ra.state = 'idle';
+            ra.targetCol = null;
+            ra.targetRow = null;
+            ra.timer = 0;
+          }
+        }
+      }
+
+      // Global alert: on if any room is tracking or any guard sees the player
+      let trackingNow = false;
+      for (const key in roomAlerts) {
+        const ra = roomAlerts[key];
+        if (ra && ra.state === 'tracking') {
+          trackingNow = true;
+          break;
+        }
+      }
+
+      globalAlertLevel = (anySeen || trackingNow) ? 1 : 0;
+
+      // Align guard FSM with their room's alert state
+      guards.forEach((g) => {
+        if (g.state === 'stunned' || g.state === 'dead') return;
+
+        const roomKey = getGuardRoomKey(g);
+        const ra = roomAlerts[roomKey];
+
+        if (ra && ra.state === 'tracking') {
+          // Only guards whose room is in alert become (or stay) chasers
+          g.state = 'alert_chaser';
+        } else {
+          // Room is idle: if guard was in alert and no longer sees player, send it home
+          if (g.state === 'alert_chaser' && !g.seenPlayer) {
+            g.state = 'return_to_patrol';
+            g.path = null;
+            g.pathTargetCol = null;
+            g.pathTargetRow = null;
+          }
+        }
+      });
 
       updateModeVisual();
     }
 
-    // FOV sempre ridisegnati (forme e colori)
     renderGuardFov();
   }
+
 
 
   // --------------------------------------------------
@@ -3273,10 +3457,40 @@ function updateHudLayout() {
     });
   }
   
-    // --------------------------------------------------
+  // --------------------------------------------------
   // Assegnazione slot cardinali per l'accerchiamento
   // --------------------------------------------------
   function assignSectorCardinals() {
+    const dirs = ['N', 'E', 'S', 'W'];
+    const layoutType = getLayoutType();
+
+    // Dungeon: group guards by patrol room (rect) instead of global sectors
+    if (layoutType === 'dungeon') {
+      const rooms = {};
+
+      guards.forEach((g) => {
+        if (g.state === 'stunned' || g.state === 'dead') {
+          g.preferredCardinal = null;
+          return;
+        }
+
+        const key = getGuardRoomKey(g) || 'default';
+        if (!rooms[key]) rooms[key] = [];
+        rooms[key].push(g);
+      });
+
+      for (const key in rooms) {
+        const list = rooms[key];
+        for (let i = 0; i < list.length; i++) {
+          const g = list[i];
+          g.preferredCardinal = dirs[i % dirs.length];
+        }
+      }
+
+      return;
+    }
+
+    // Arena: original per-sector cardinal assignment
     const sectors = { NW: [], NE: [], SW: [], SE: [] };
 
     guards.forEach((g) => {
@@ -3290,8 +3504,6 @@ function updateHudLayout() {
       sectors[s].push(g);
     });
 
-    const dirs = ['N', 'E', 'S', 'W'];
-
     ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
       const list = sectors[name] || [];
       for (let i = 0; i < list.length; i++) {
@@ -3301,21 +3513,73 @@ function updateHudLayout() {
     });
   }
 
-    function computePreferredAlertTarget(guard) {
+
+  function computePreferredAlertTarget(guard) {
+    const layoutType = getLayoutType();
+
+    // Dungeon: if the guard is in alert, always try to orbit around the player
+    // using its assigned cardinal slot; room-based alert is handled elsewhere.
+    if (layoutType === 'dungeon') {
+      const px = playerCol;
+      const py = playerRow;
+
+      const slotDir = guard.preferredCardinal || 'N';
+      const maxR = 6;
+
+      for (let r = 2; r <= maxR; r++) {
+        let cx = px;
+        let cy = py;
+
+        if (slotDir === 'N') {
+          cy = py - r;
+        } else if (slotDir === 'S') {
+          cy = py + r;
+        } else if (slotDir === 'W') {
+          cx = px - r;
+        } else {
+          // 'E' or fallback
+          cx = px + r;
+        }
+
+        if (cx < 0 || cy < 0 || cx >= gridCols || cy >= gridRows) continue;
+        if (!isWalkable(cx, cy)) continue;
+        if (cx === px && cy === py) continue;
+
+        return { col: cx, row: cy };
+      }
+
+      // Fallback: small ring around the player
+      for (let r = 1; r <= maxR; r++) {
+        const candidates = [
+          { col: px + r, row: py },
+          { col: px - r, row: py },
+          { col: px, row: py + r },
+          { col: px, row: py - r }
+        ];
+        for (let i = 0; i < candidates.length; i++) {
+          const c = candidates[i];
+          if (c.col < 0 || c.row < 0 || c.col >= gridCols || c.row >= gridRows) continue;
+          if (!isWalkable(c.col, c.row)) continue;
+          if (c.col === px && c.row === py) continue;
+          return c;
+        }
+      }
+
+      return { col: px, row: py };
+    }
+
+    // Arena: original sector-based behaviour
     const sectorName = getSector(guard.col, guard.row);
     const sa = sectorAlerts[sectorName];
     if (!sa || sa.state !== 'tracking') {
-      // Nessun alert attivo per il settore: resta dove sei
+      // No active alert for this sector: stay where you are
       return { col: guard.col, row: guard.row };
     }
 
-    // Posizione assoluta del player mentre il settore è in tracking
     const px = playerCol;
     const py = playerRow;
 
-    // Slot cardinale assegnato in assignSectorCardinals()
     const slotDir = guard.preferredCardinal || 'N';
-
     const maxR = 6;
     for (let r = 2; r <= maxR; r++) {
       let cx = px;
@@ -3328,18 +3592,17 @@ function updateHudLayout() {
       } else if (slotDir === 'W') {
         cx = px - r;
       } else {
-        // 'E' o fallback
+        // 'E' or fallback
         cx = px + r;
       }
 
       if (cx < 0 || cy < 0 || cx >= gridCols || cy >= gridRows) continue;
       if (!isWalkable(cx, cy)) continue;
-      if (cx === px && cy === py) continue; // non puntare la cella del player
+      if (cx === px && cy === py) continue;
 
       return { col: cx, row: cy };
     }
 
-    // Fallback: piccolo anello attorno al player
     for (let r = 1; r <= maxR; r++) {
       const candidates = [
         { col: px + r, row: py },
@@ -3356,9 +3619,9 @@ function updateHudLayout() {
       }
     }
 
-    // Ultima risorsa: vai proprio verso il player
     return { col: px, row: py };
   }
+
 
 
   // --------------------------------------------------
@@ -3368,17 +3631,22 @@ function updateHudLayout() {
   function stepGuardAlert(guard) {
     if (guard.state === 'stunned') return;
 
-    const sectorName = getSector(guard.col, guard.row);
-    const sa = sectorAlerts[sectorName];
+    const layoutType = getLayoutType();
 
-    if (!sa || sa.state !== 'tracking') {
-      // Sector not in alert: back to patrol
-      guard.state = 'patrol';
-      guard.path = null;
-      guard.pathTargetCol = null;
-      guard.pathTargetRow = null;
-      updateGuardPosition(guard);
-      return;
+    // Arena: keep sector gate; Dungeon: FSM is driven by roomAlerts, so skip it.
+    if (layoutType !== 'dungeon') {
+      const sectorName = getSector(guard.col, guard.row);
+      const sa = sectorAlerts[sectorName];
+
+      if (!sa || sa.state !== 'tracking') {
+        // Sector not in alert: back to patrol
+        guard.state = 'patrol';
+        guard.path = null;
+        guard.pathTargetCol = null;
+        guard.pathTargetRow = null;
+        updateGuardPosition(guard);
+        return;
+      }
     }
 
     // If this guard currently sees the real player, stop rushing closer:
@@ -3387,7 +3655,7 @@ function updateHudLayout() {
     if (guard.seenPlayer) {
       const tx = playerCol;
       const ty = playerRow;
-
+     
       aimGuardAtTarget(guard, tx, ty);
 
       // Already have line-of-shot -> stand and shoot from here
@@ -3501,14 +3769,27 @@ function updateHudLayout() {
     }
   }
 
-    function registerGuardMovementHistory(guard) {
-    // Initialize storage
+  function registerGuardMovementHistory(guard) {
     if (!guard.lastPositions) {
       guard.lastPositions = [];
     }
 
-    // Append current position (we also want duplicates to detect "standing still")
-    guard.lastPositions.push({ col: guard.col, row: guard.row });
+    const currentPos = { col: guard.col, row: guard.row };
+
+    // Track how many consecutive ticks we stayed on the same cell
+    if (guard.lastPositions.length > 0) {
+      const last = guard.lastPositions[guard.lastPositions.length - 1];
+      if (last.col === currentPos.col && last.row === currentPos.row) {
+        guard.stillTicks = (guard.stillTicks || 0) + 1;
+      } else {
+        guard.stillTicks = 0;
+      }
+    } else {
+      guard.stillTicks = 0;
+    }
+
+    // Store a short history to detect A-B-A-B oscillation
+    guard.lastPositions.push(currentPos);
     if (guard.lastPositions.length > 4) {
       guard.lastPositions.shift();
     }
@@ -3543,20 +3824,125 @@ function updateHudLayout() {
       guard.stuckCounter = 0;
     }
 
-    if (guard.stuckCounter >= 2) {
-      // Guard considered stuck: reset path
-      guard.path = null;
-      guard.pathTargetCol = null;
-      guard.pathTargetRow = null;
+    // We only want to apply the heavy "try hard" reset in dungeon layout,
+    // and only when the guard is in a calm state (not actively chasing).
+    const layoutType = getLayoutType();
+    const isDungeon = (layoutType === 'dungeon');
 
-      // Only shuffle preferred cardinal if this guard is actually chasing
-      if (guard.state === 'alert_chaser') {
-        const dirs = ['N', 'E', 'S', 'W'];
-        guard.preferredCardinal = dirs[Math.floor(Math.random() * dirs.length)];
-      }
+    const isCalmState =
+      guard.state === 'patrol' ||
+      guard.state === 'return_to_patrol';
 
+    const notEngaged =
+      !guard.seenPlayer &&
+      guard.shootCooldown === 0 &&
+      guard.observingTicksLeft <= 0;
+
+    const shouldTryHard =
+      isDungeon &&
+      isCalmState &&
+      notEngaged &&
+      (
+        (guard.stillTicks && guard.stillTicks >= GUARD_TRY_HARD_STUCK_TICKS) ||
+        (guard.stuckCounter && guard.stuckCounter >= 2)
+      );
+
+    if (shouldTryHard) {
+      forceGuardTryHard(guard);
+      // Counters are reset inside forceGuardTryHard, but we clear anyway for safety
       guard.stuckCounter = 0;
+      guard.stillTicks = 0;
+      guard.lastPositions = [];
     }
+  }
+
+
+    // Force a guard that is stuck for too long to "try hard":
+  // teleport back to a safe walkable cell inside its patrol rect.
+  function forceGuardTryHard(guard) {
+    if (!guard) return;
+
+    // Do not touch dead or stunned guards
+    if (guard.state === 'dead' || guard.state === 'stunned') {
+      return;
+    }
+
+    // If the guard is actually seeing the player while chasing, do not reset
+    if (guard.state === 'alert_chaser' && guard.seenPlayer) {
+      return;
+    }
+
+    // Determine the rectangle where we are allowed to place the guard
+    let minCol = 0;
+    let maxCol = gridCols - 1;
+    let minRow = 0;
+    let maxRow = gridRows - 1;
+
+    if (guard.patrolType === 'rect') {
+      minCol = guard.minCol;
+      maxCol = guard.maxCol;
+      minRow = guard.minRow;
+      maxRow = guard.maxRow;
+    }
+
+    // Prefer cells slightly away from the walls (margin=1), fallback to full rect
+    let candidates = buildWalkableCandidatesInRect(
+      minCol,
+      maxCol,
+      minRow,
+      maxRow,
+      1
+    );
+    if (!candidates || candidates.length === 0) {
+      candidates = buildWalkableCandidatesInRect(
+        minCol,
+        maxCol,
+        minRow,
+        maxRow,
+        0
+      );
+    }
+    if (!candidates || candidates.length === 0) {
+      return; // nothing usable, give up
+    }
+
+    // Random choice among valid cells
+    shuffleArray(candidates);
+    const chosen = candidates[0];
+
+    guard.col = chosen.col;
+    guard.row = chosen.row;
+
+    // Reset navigation / behaviours so they can start fresh
+    guard.path = null;
+    guard.pathTargetCol = null;
+    guard.pathTargetRow = null;
+    guard.deviationActive = false;
+    guard.observingTicksLeft = 0;
+
+    // Calm state after reset (unless the FSM decides otherwise later)
+    if (
+      guard.state !== 'alert_chaser' &&
+      guard.state !== 'return_to_patrol'
+    ) {
+      guard.state = 'patrol';
+    }
+
+    guard.lastPositions = [];
+    guard.stuckCounter = 0;
+    guard.stillTicks = 0;
+
+    clampGuard(guard);
+    updateGuardPosition(guard);
+    updateGuardLookDirection(guard);
+
+    console.log(
+      '[overlay] GUARD',
+      guard.id,
+      'try-hard reset to',
+      guard.col,
+      guard.row
+    );
   }
 
   function stepGuard(guard) {
