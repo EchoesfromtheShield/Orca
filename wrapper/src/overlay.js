@@ -58,11 +58,20 @@
   const BULLET_STEPS_PER_TICK       = 4;  // cells per tick
   const GUARD_FIRE_COOLDOWN_TICKS   = 2;  // ticks between shots (~1s at 250ms)
 
+  // Pickup blink tuning (ammo & medikit)
+  const PICKUP_BLINK_DURATION_SEC = 0.35; // faster blink; tune as you like
+
+
   // Player ranged weapon
   const PLAYER_BULLET_RANGE_CELLS   = 7;  // max distance (in cells) for player bullets
   const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
 
-  const PLAYER_SHOOT_KEYS          = ['s', 'S']; // keys that fire the player weapon
+  // Pickup spawn handles (random pickups on walkable ground)
+  const INITIAL_MEDIKIT_PICKUPS     = 2;  // number of medikit pickups to spawn
+  const INITIAL_AMMO_PICKUPS        = 3;  // number of ammo pickups to spawn
+
+  // Player shoot keys
+  const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
 
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
@@ -153,7 +162,9 @@
         }
       }
     ],
-    playerSpawn: null
+    playerSpawn: null,
+        // NEW: default pickups (empty, everything will come from JSON)
+    pickups: []
   };
 
 
@@ -164,6 +175,7 @@
   //   fovProfiles: { ... },
   //   liberationTriggers: [...]
   // }
+
   function mergeLevelConfig(baseCfg, externalCfg) {
     if (!externalCfg || typeof externalCfg !== 'object') {
       return baseCfg;
@@ -186,10 +198,16 @@
 
       playerSpawn: externalCfg.playerSpawn || baseCfg.playerSpawn || null,
 
+      // NEW: pickups (ammo / medikit) described in JSON
+      pickups: Array.isArray(externalCfg.pickups)
+        ? externalCfg.pickups
+        : (baseCfg.pickups || []),
+
       // New: carry high-level layout type from JSON
       layoutType: externalCfg.layoutType || baseCfg.layoutType || 'arena'
     };
   }
+
 
   // Mutable current level config (starts from defaults, can be updated later).
   let levelConfig = mergeLevelConfig(
@@ -206,15 +224,16 @@
   // Put generated-level.json next to index.html / overlay.js, or change the path.
   const LEVEL_JSON_URL = 'generated-level.json';
 
-      function applyExternalLevelConfig(externalCfg) {
+  function applyExternalLevelConfig(externalCfg) {
     const merged = mergeLevelConfig(defaultLevelConfig, externalCfg);
     levelConfig = merged;
+
     liberationTriggers = Array.isArray(merged.liberationTriggers)
       ? merged.liberationTriggers
       : [];
+
     // Force a new spawn-adjustment pass for this level
     guardSpawnsInitialized = false;
-
 
     // If the level config provides an explicit player spawn, use it.
     if (
@@ -246,11 +265,26 @@
       GUARD_FOV_WOBBLE_ENABLED ? 'ON' : 'OFF'
     );
 
+    // --- PICKUPS FIX ---
+
+    // Remove any pickups that were spawned before (random defaults, etc.)
+    clearAllPickups();
+
+    // Mark pickups as already handled for this level:
+    // syncGeometry() will NOT call spawnInitialPickupsRandom().
+    pickupsInitialized = true;
+
     // Rebuild guards and patch markers according to the new config.
     initGuardsFromConfig();
     initPatchMarkersDom();
+
+    // Spawn pickups from JSON-driven config (levelConfig.pickups).
+    spawnPickupsFromConfig();
+
+    // Re-sync geometry (positions, FOV, snapping pickups to walkable, etc.)
     syncGeometry();
   }
+
 
   function loadExternalLevelConfig() {
     // 1) If something already wrote window.orcaStealthLevelConfig (via <script>),
@@ -316,7 +350,7 @@
   let playerAmmo = PLAYER_INITIAL_AMMO;
 
 
-    // Guards
+  // Guards
   let guards = [];
   let guardTimer = null;
   let globalAlertLevel = 0; // 0 = no guard sees the player, 1 = at least one guard sees him
@@ -328,9 +362,17 @@
   // Bullets
   let bullets = [];
 
+
+  // Pickups (ammo / medikit)
+  let pickupsContainer = null;
+  let pickups = [];
+  let pickupsInitialized = false;
+  let pickupsBlinkTick = 0;
+
   // Grid / geometry
-  let gridCols = 80;
+  let gridCols = 120;
   let gridRows = 40;
+
 
   let cellW = 0;
   let cellH = 0;
@@ -475,6 +517,27 @@
     overlayDiv.style.zIndex = '9999';
     overlayDiv.style.background = 'rgba(0, 128, 128, 0.06)';
 
+    // Global CSS for pickup blinking (ammo & medikit)
+    let existingStyle = document.getElementById('orca-stealth-style');
+    if (!existingStyle) {
+      existingStyle = document.createElement('style');
+      existingStyle.id = 'orca-stealth-style';
+      existingStyle.type = 'text/css';
+      existingStyle.textContent = `
+@keyframes orcaPickupBlink {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.15; }
+  100% { opacity: 1; }
+}
+.orca-stealth-pickup {
+  animation-name: orcaPickupBlink;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+      `;
+      document.head.appendChild(existingStyle);
+    }
+
     // FOV container (under guards and player)
     fovContainer = document.createElement('div');
     fovContainer.id = 'orca-stealth-fov';
@@ -507,6 +570,17 @@
     bulletsContainer.style.height = '100%';
     bulletsContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(bulletsContainer);
+
+    // Pickups container (above bullets, below patch markers/player)
+    pickupsContainer = document.createElement('div');
+    pickupsContainer.id = 'orca-stealth-pickups';
+    pickupsContainer.style.position = 'absolute';
+    pickupsContainer.style.left = '0';
+    pickupsContainer.style.top = '0';
+    pickupsContainer.style.width = '100%';
+    pickupsContainer.style.height = '100%';
+    pickupsContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(pickupsContainer);
 
     // Patch liberation markers (above bullets, below player)
     patchMarkersContainer = document.createElement('div');
@@ -621,7 +695,7 @@
 
   }
 
-  // Re-position HUD after any change
+// Re-position HUD after any change
   updateHudLayout();
 }
 
@@ -654,7 +728,7 @@ function updateHudLayout() {
     console.log('[overlay] Mode changed to', mode.toUpperCase());
   }
 
-    // --------------------------------------------------
+  // --------------------------------------------------
   // Guards initialization from levelConfig
   // --------------------------------------------------
   function initGuardsFromConfig() {
@@ -914,7 +988,7 @@ function updateHudLayout() {
     });
   }
 
-    // --------------------------------------------------
+  // --------------------------------------------------
   // Spawn adjustment per layout (arena vs dungeon)
   // --------------------------------------------------
 
@@ -1080,7 +1154,7 @@ function updateHudLayout() {
     });
   }
 
-    // ARENA: shrink patrol rects away from map borders based on FOV width,
+  // ARENA: shrink patrol rects away from map borders based on FOV width,
   // then reassign spawn positions per sector (NW/NE/SW/SE) on walkable cells,
   // avoiding same row / same column per sector.
   function adjustArenaGuardSpawns() {
@@ -1264,14 +1338,17 @@ function updateHudLayout() {
     // Make sure player and guards do not start inside walls.
     ensurePlayerOnWalkableCell();
     ensureGuardsOnWalkableCells();
+    ensurePickupsOnWalkableCells();
 
     updatePlayerPosition();
     updatePlayerDirectionVisual();
     guards.forEach(updateGuardPosition);
     updateAllBulletsPosition();
+    updateAllPickupsPosition();
     updatePatchMarkersPosition();
 
-        // only FOV, no alert memory
+
+    // only FOV, no alert memory
     updateAllFovAndAlert(false);
 
     // Re-position HUD according to new canvas size / grid
@@ -1281,6 +1358,11 @@ function updateHudLayout() {
     if (!guardSpawnsInitialized) {
       adjustGuardSpawnsByLayout();
       guardSpawnsInitialized = true;
+    }
+
+    // Initial random pickups: run once per levelConfig / overlay
+    if (!pickupsInitialized) {
+      spawnInitialPickupsRandom();
     }
 
     log('Geometry synced:', {
@@ -1357,6 +1439,16 @@ function updateHudLayout() {
       if (g.state === 'dead') continue;
       if (g.col === col && g.row === row) {
         return g;
+      }
+    }
+    return null;
+  }
+
+  function findPickupAtCell(col, row) {
+    for (let i = 0; i < pickups.length; i++) {
+      const p = pickups[i];
+      if (p.col === col && p.row === row && !p.collected) {
+        return p;
       }
     }
     return null;
@@ -1558,6 +1650,238 @@ function updateHudLayout() {
 
   function updateAllBulletsPosition() {
     bullets.forEach(updateBulletPosition);
+  }
+
+  function updatePickupPosition(pickup) {
+    if (!pickup.el) return;
+    const x = pickup.col * cellW;
+    const y = pickup.row * cellH;
+    pickup.el.style.width = cellW + 'px';
+    pickup.el.style.height = cellH + 'px';
+    pickup.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
+
+  function updateAllPickupsPosition() {
+    pickups.forEach(updatePickupPosition);
+  }
+
+  // Create a pickup DOM element at (col,row)
+  function createPickup(type, col, row) {
+    if (!pickupsContainer) return null;
+
+    const cell = document.createElement('div');
+    cell.className = 'orca-stealth-pickup';
+    cell.style.position = 'absolute';
+    cell.style.pointerEvents = 'none';
+
+    // Inner element for shape
+    const inner = document.createElement('div');
+    inner.style.position = 'absolute';
+    inner.style.left = '25%';
+    inner.style.top = '25%';
+    inner.style.width = '50%';
+    inner.style.height = '50%';
+    inner.style.pointerEvents = 'none';
+
+    if (type === 'ammo') {
+      // Yellow bullet-like dot
+      inner.style.borderRadius = '50%';
+      inner.style.background = '#ffcc00';
+    } else if (type === 'medikit') {
+      // Green cross made of two bars
+      inner.style.background = 'transparent';
+
+      const barV = document.createElement('div');
+      barV.style.position = 'absolute';
+      barV.style.left = '42%';
+      barV.style.top = '5%';
+      barV.style.width = '16%';
+      barV.style.height = '90%';
+      barV.style.background = '#00ff55';
+
+      const barH = document.createElement('div');
+      barH.style.position = 'absolute';
+      barH.style.left = '5%';
+      barH.style.top = '42%';
+      barH.style.width = '90%';
+      barH.style.height = '16%';
+      barH.style.background = '#00ff55';
+
+      inner.appendChild(barV);
+      inner.appendChild(barH);
+    }
+
+    cell.appendChild(inner);
+    pickupsContainer.appendChild(cell);
+
+    // Async blinking for this pickup instance
+    applyPickupBlink(cell);
+
+    const pickup = {
+      type,
+      col,
+      row,
+      el: cell,
+      inner,
+      collected: false
+    };
+
+    pickups.push(pickup);
+    updatePickupPosition(pickup);
+
+    return pickup;
+  }
+
+    // Remove all existing pickups from DOM and array
+  function clearAllPickups() {
+    if (pickupsContainer) {
+      while (pickupsContainer.firstChild) {
+        pickupsContainer.removeChild(pickupsContainer.firstChild);
+      }
+    }
+    pickups = [];
+  }
+
+  // Force pickups to spawn only on walkable cells; if needed, snap to nearest walkable.
+  function ensurePickupsOnWalkableCells() {
+    pickups.forEach((p) => {
+      if (p.col == null || p.row == null) return;
+
+      if (isWalkable(p.col, p.row)) {
+        // Already good
+        updatePickupPosition(p);
+        return;
+      }
+
+      const res = findNearestWalkableCell(p.col, p.row);
+      if (res) {
+        p.col = res.col;
+        p.row = res.row;
+        updatePickupPosition(p);
+      } else {
+        // No valid cell found: remove pickup from the map
+        p.collected = true;
+        if (p.el && p.el.parentNode) {
+          p.el.parentNode.removeChild(p.el);
+        }
+      }
+    });
+  }
+
+  // Spawn pickups from data-driven levelConfig.pickups
+  function spawnPickupsFromConfig() {
+    clearAllPickups();
+
+    const defs = (levelConfig && Array.isArray(levelConfig.pickups))
+      ? levelConfig.pickups
+      : [];
+
+    defs.forEach((def) => {
+      if (!def) return;
+      const type = def.type === 'medikit' ? 'medikit' : 'ammo';
+      let col = typeof def.col === 'number' ? def.col : null;
+      let row = typeof def.row === 'number' ? def.row : null;
+      if (col == null || row == null) return;
+
+      // If the cell is not walkable (e.g. wall or Orca code),
+      // snap to nearest walkable cell.
+      if (!isWalkable(col, row)) {
+        const res = findNearestWalkableCell(col, row);
+        if (!res) {
+          return; // give up on this pickup
+        }
+        col = res.col;
+        row = res.row;
+      }
+
+      createPickup(type, col, row);
+    });
+
+    // Extra safety
+    ensurePickupsOnWalkableCells();
+  }
+
+    function isCellFreeForPickup(col, row) {
+    // Must be walkable
+    if (!isWalkable(col, row)) return false;
+
+    // Do not overlap player
+    if (col === playerCol && row === playerRow) return false;
+
+    // Do not overlap guards (any state)
+    const g = findGuardAtCell(col, row);
+    if (g) return false;
+
+    // Do not overlap another pickup
+    if (findPickupAtCell(col, row)) return false;
+
+    return true;
+  }
+
+  function spawnInitialPickupsRandom() {
+    if (pickupsInitialized) return;
+    pickupsInitialized = true;
+
+    if (!pickupsContainer) return;
+
+    // Helper: place N pickups of given type
+    function placePickups(type, count) {
+      const maxAttempts = 2000;
+      let placed = 0;
+      let attempts = 0;
+
+      while (placed < count && attempts < maxAttempts) {
+        attempts++;
+        const col = Math.floor(Math.random() * gridCols);
+        const row = Math.floor(Math.random() * gridRows);
+
+        if (!isCellFreeForPickup(col, row)) continue;
+
+        createPickup(type, col, row);
+        placed++;
+      }
+
+      if (placed < count) {
+        console.log(
+          '[overlay] Only placed',
+          placed,
+          'of',
+          count,
+          'pickups for type',
+          type
+        );
+      }
+    }
+
+    placePickups('medikit', INITIAL_MEDIKIT_PICKUPS);
+    placePickups('ammo', INITIAL_AMMO_PICKUPS);
+
+    console.log(
+      '[overlay] Initial pickups spawned:',
+      INITIAL_MEDIKIT_PICKUPS,
+      'medikits,',
+      INITIAL_AMMO_PICKUPS,
+      'ammo.'
+    );
+  }
+
+  function applyPickupBlink(el) {
+    // Each pickup has its own phase so blinking is asynchronous
+    const dur = PICKUP_BLINK_DURATION_SEC;
+    el.style.animationDuration = dur + 's';
+    el.style.animationDelay = (Math.random() * dur).toFixed(3) + 's';
+  }
+
+  function updatePickupsBlink() {
+    pickupsBlinkTick++;
+    // Toggle every few ticks (approx ~1s at 250ms)
+    const phaseOn = (pickupsBlinkTick % 8) < 1;
+    const opacity = phaseOn ? 1.0 : 0.35;
+
+    pickups.forEach((p) => {
+      if (!p.el || p.collected) return;
+      p.el.style.opacity = opacity;
+    });
   }
 
   function hasLineOfShot(guard, targetCol, targetRow) {
@@ -1854,19 +2178,26 @@ function updateHudLayout() {
           return;
         }
 
+        // Cell container for the marker (one per Orca cell)
         const el = document.createElement('div');
         el.className = 'orca-stealth-patch-marker';
         el.style.position = 'absolute';
         el.style.boxSizing = 'border-box';
-        el.style.display = 'flex';
-        el.style.alignItems = 'center';
-        el.style.justifyContent = 'center';
-        el.style.fontFamily = 'monospace';
-        el.style.fontSize = '12px';
-        el.style.fontWeight = 'bold';
-        el.style.color = '#df0a0aff'; // red
-        el.textContent = 'X';
+        el.style.pointerEvents = 'none';
 
+        // Inner square: initial state = solid white square
+        const inner = document.createElement('div');
+        inner.className = 'orca-stealth-patch-marker-inner';
+        inner.style.position = 'absolute';
+        inner.style.left = '25%';
+        inner.style.top = '25%';
+        inner.style.width = '50%';
+        inner.style.height = '50%';
+        inner.style.boxSizing = 'border-box';
+        inner.style.background = '#ffffff';   // filled white
+        inner.style.border = 'none';          // no border in idle state
+
+        el.appendChild(inner);
         patchMarkersContainer.appendChild(el);
 
         patchMarkers.push({
@@ -1876,13 +2207,15 @@ function updateHudLayout() {
           col,
           row,
           active: false,
-          el
+          el,
+          inner   // keep a reference to the inner square for style changes
         });
       });
     });
 
     updatePatchMarkersPosition();
   }
+
 
   function updatePatchMarkersPosition() {
     if (!patchMarkers || patchMarkers.length === 0) return;
@@ -1917,10 +2250,13 @@ function updateHudLayout() {
       if (!isAdjacentToMarker(m)) continue;
 
       m.active = true;
-      if (m.el) {
-        m.el.textContent = 'O';
-        m.el.style.color = '#55ff55'; // green
+
+      // Switch visual from filled white square to hollow white square
+      if (m.inner) {
+        m.inner.style.background = 'transparent'; // no fill
+        m.inner.style.border = '2px solid #ffffff'; // white outline
       }
+
 
       activatedMarker = m;
       console.log(
@@ -2992,6 +3328,52 @@ function updateHudLayout() {
     }
   }
 
+  function applyPickupEffect(pickup) {
+    if (!pickup) return;
+
+    if (pickup.type === 'medikit') {
+      if (playerHP < playerHPMax) {
+        playerHP++;
+        if (playerHP > playerHPMax) playerHP = playerHPMax;
+        console.log(
+          '[overlay] PLAYER picked MEDIKIT. HP:',
+          playerHP,
+          '/',
+          playerHPMax
+        );
+        updateModeVisual();
+      } else {
+        console.log(
+          '[overlay] PLAYER picked MEDIKIT but HP already full.'
+        );
+      }
+    } else if (pickup.type === 'ammo') {
+      playerAmmo += 2;
+      if (playerAmmo > playerAmmoMax) playerAmmo = playerAmmoMax;
+      console.log(
+        '[overlay] PLAYER picked AMMO. Ammo:',
+        playerAmmo,
+        '/',
+        playerAmmoMax
+      );
+      updateModeVisual();
+    }
+  }
+
+  function checkPickupCollisions() {
+    for (let i = 0; i < pickups.length; i++) {
+      const p = pickups[i];
+      if (p.collected) continue;
+      if (p.col === playerCol && p.row === playerRow) {
+        p.collected = true;
+        if (p.el && p.el.parentNode) {
+          p.el.parentNode.removeChild(p.el);
+        }
+        applyPickupEffect(p);
+      }
+    }
+  }
+
   function neutralizeGuard(guard) {
     if (guard.state === 'stunned') return;
     guard.state = 'stunned';
@@ -3117,9 +3499,10 @@ function updateHudLayout() {
 
     // 6) Collisioni corpo a corpo (stealth / danno)
     checkGuardPlayerCollisions();
+
+    // 7) Blink pickups
+    updatePickupsBlink();
   }
-
-
 
   // --------------------------------------------------
   // Player movement
@@ -3154,12 +3537,14 @@ function updateHudLayout() {
     playerRow = targetRow;
     playerDir = newDir;
 
-        clampPlayer();
+    clampPlayer();
     updatePlayerPosition();
     updatePlayerDirectionVisual();
     // update only FOV, alert and guard reactions will be done in the main tick
     updateAllFovAndAlert(false);
     checkGuardPlayerCollisions();
+    checkPickupCollisions();
+
 
 
     log('player moved to', playerCol, playerRow, 'dir=', playerDir);

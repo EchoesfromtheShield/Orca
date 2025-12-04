@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//   node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar]
+//   node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -87,6 +87,22 @@ const WALL_CHAR_RAW = (wallCharCli && wallCharCli.length > 0)
   ? wallCharCli
   : (wallCharEnv && wallCharEnv.length > 0 ? wallCharEnv : 'y');
 const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
+
+// Pickups: ammo / medikit counts (can be overridden via CLI or env)
+//   argv[8] -> AMMO_PICKUPS
+//   argv[9] -> MEDIKIT_PICKUPS
+//   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS
+const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
+const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
+
+// Default: 3 ammo, 1 medikit if not specified
+const AMMO_PICKUP_COUNT = ammoArg != null
+  ? Math.max(0, parseInt(ammoArg, 10) || 0)
+  : 3;
+
+const MEDIKIT_PICKUP_COUNT = medArg != null
+  ? Math.max(0, parseInt(medArg, 10) || 0)
+  : 1;
 
 // Room size can be overridden via environment variables, e.g.
 //   ROOM_W=100 ROOM_H=40 node ...
@@ -615,6 +631,12 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
 // playerSpawn: optional { col, row } suggested spawn for the player.
 // levelGrid: 2D grid (array of rows) of the final ORCA level.
 // layout: string, "arena" | "rooms_line" | "dungeon".
+// ----- JSON config generation -----------------------------------------
+//
+// commentBlocksGlobal: array of { id, x, y, w, h } in ROOM coordinates.
+// playerSpawn: optional { col, row } suggested spawn for the player.
+// levelGrid: 2D grid (array of rows) of the final ORCA level.
+// layout: string, "arena" | "rooms_line" | "dungeon".
 function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   const fovProfiles = {
     A: {
@@ -624,9 +646,15 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   };
 
   const guards = [];
+  const pickups = []; // NEW: ammo / medikit pickups
 
   // Decide high-level layout type used by overlay.js
   const layoutType = (layout === 'dungeon') ? 'dungeon' : 'arena';
+
+  // Grid info helper
+  const hasGrid = Array.isArray(levelGrid) && levelGrid.length > 0;
+  const gridH = hasGrid ? levelGrid.length : 0;
+  const gridW = hasGrid ? levelGrid[0].length : 0;
 
   // Defaults:
   // - dungeon  -> guards per room (per patch) default 2
@@ -645,22 +673,43 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   // Helper: collect all walkable ('.') cells inside a rectangle.
   function collectWalkableCells(minCol, maxCol, minRow, maxRow) {
     const cells = [];
-    if (!levelGrid || levelGrid.length === 0) {
+    if (!hasGrid) {
       return cells;
     }
-    const h = levelGrid.length;
-    const w = levelGrid[0].length;
 
     for (let row = minRow; row <= maxRow; row++) {
-      if (row < 0 || row >= h) continue;
+      if (row < 0 || row >= gridH) continue;
       for (let col = minCol; col <= maxCol; col++) {
-        if (col < 0 || col >= w) continue;
+        if (col < 0 || col >= gridW) continue;
         if (levelGrid[row][col] === '.') {
           cells.push({ col, row });
         }
       }
     }
     return cells;
+  }
+
+  // Simple helper: pick up to "count" random distinct cells from a list.
+  function pickRandomCells(candidates, count) {
+    const result = [];
+    if (!candidates || candidates.length === 0 || count <= 0) {
+      return result;
+    }
+
+    // Fisher–Yates shuffle on a local copy
+    const pool = candidates.slice();
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = pool[i];
+      pool[i] = pool[j];
+      pool[j] = tmp;
+    }
+
+    const n = Math.min(count, pool.length);
+    for (let i = 0; i < n; i++) {
+      result.push(pool[i]);
+    }
+    return result;
   }
 
   // Helper: choose up to "count" cells with the constraint
@@ -721,10 +770,10 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     return result;
   }
 
-    // --------------------------------------------------------------------
+  // --------------------------------------------------------------------
   // DUNGEON: spawn per room (per patch), default 2 guards per room.
   //
-  // New rules:
+  // Rules:
   // - patrol rect is the room interior (when available), not just patch+margin;
   // - guards never spawn *inside* the commented patch block;
   // - we try to slightly shrink the patrol rect so they don't hug walls;
@@ -882,11 +931,11 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
   // Default 3 guards per quadrant, never in "single-file" row/column if possible.
   // --------------------------------------------------------------------
   if (layoutType === 'arena') {
-    if (!levelGrid || levelGrid.length === 0) {
+    if (!hasGrid) {
       console.warn('[patch_to_level] Arena layout but empty levelGrid; no guards generated.');
     } else {
-      const h = levelGrid.length;
-      const w = levelGrid[0].length;
+      const h = gridH;
+      const w = gridW;
 
       // Same split logic used by overlay.js for sectorAlerts / getSector().
       const midRow = Math.floor(h / 2);
@@ -1041,12 +1090,54 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     };
   });
 
+  // --------------------------------------------------------------------
+  // PICKUPS: random ammo / medikit on walkable '.' cells in the whole map
+  // --------------------------------------------------------------------
+  if (hasGrid) {
+    const allWalkable = collectWalkableCells(0, gridW - 1, 0, gridH - 1);
+
+    if (allWalkable.length === 0) {
+      console.warn('[patch_to_level] No walkable cells, pickups will be empty.');
+    } else {
+      // First pick ammo cells
+      const ammoCells = pickRandomCells(allWalkable, AMMO_PICKUP_COUNT);
+
+      // Remove ammo cells from the pool when picking medikits
+      const usedKeys = new Set(
+        ammoCells.map((c) => `${c.col},${c.row}`)
+      );
+
+      const remaining = allWalkable.filter(
+        (c) => !usedKeys.has(`${c.col},${c.row}`)
+      );
+
+      const medCells = pickRandomCells(remaining, MEDIKIT_PICKUP_COUNT);
+
+      ammoCells.forEach((pos) => {
+        pickups.push({
+          type: 'ammo',
+          col: pos.col,
+          row: pos.row
+        });
+      });
+
+      medCells.forEach((pos) => {
+        pickups.push({
+          type: 'medikit',
+          col: pos.col,
+          row: pos.row
+        });
+      });
+    }
+  }
+
   return {
     guards,
     fovProfiles,
     liberationTriggers,
     playerSpawn: playerSpawn || null,
-    layoutType
+    layoutType,
+    pickups
   };
 }
 
@@ -1627,7 +1718,7 @@ try {
     playerSpawn = spawnResult.playerSpawn;
   }
 
-    // Converto l'ORCA finale in griglia per sapere dove sono i muri/floor.
+  // Converto l'ORCA finale in griglia per sapere dove sono i muri/floor.
   const levelGridInfo = stringToGrid(orcaGrid);
   const levelGrid = levelGridInfo.grid;
 
@@ -1659,6 +1750,24 @@ try {
       'row =', playerSpawn.row
     );
   }
+    const totalPickups = Array.isArray(jsonConfig.pickups) ? jsonConfig.pickups.length : 0;
+  const ammoCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'ammo').length
+    : 0;
+  const medCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'medikit').length
+    : 0;
+
+  console.log(
+    '  Pickups requested: ammo =', AMMO_PICKUP_COUNT,
+    ', medikit =', MEDIKIT_PICKUP_COUNT
+  );
+  console.log(
+    '  Pickups generated:',
+    totalPickups,
+    '(ammo =', ammoCount,
+    ', medikit =', medCount, ')'
+  );
 
 } catch (err) {
   console.error('[patch_to_level] Error:', err.message);
