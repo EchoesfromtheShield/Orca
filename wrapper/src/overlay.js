@@ -62,7 +62,7 @@
   const PICKUP_BLINK_DURATION_SEC = 0.35; // faster blink; tune as you like
 
   // Player ranged weapon
-  const PLAYER_BULLET_RANGE_CELLS   = 7;  // max distance (in cells) for player bullets
+  const PLAYER_BULLET_RANGE_CELLS   = 9;  // max distance (in cells) for player bullets
   const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
 
   // Pickup spawn handles (random pickups on walkable ground)
@@ -77,7 +77,7 @@
 
 
   // Alert / memory (how long sectors remember player absolute position after losing sight)
-  const ALERT_MEMORY_TICKS          = 8; // ~2s at 250ms
+  const ALERT_MEMORY_TICKS          = 6; // ~1.5s at 250ms
 
   // "Observing" behaviour: guard stops and rotates FOV to cover 360°
   const OBSERVE_MIN_INTERVAL_TICKS     = 32;  // after ~8s of patrol we start considering observing
@@ -382,7 +382,7 @@
   let playerDir = 'up';
 
   // Player HP
-  let playerHPMax = 3;
+  let playerHPMax = 5;
   let playerHP = playerHPMax;
   let playerHitCooldown = 0; // invulnerability ticks after being hit
 
