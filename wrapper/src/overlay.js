@@ -1679,8 +1679,8 @@ function updateHudLayout() {
     inner.style.position = 'absolute';
     inner.style.left = '25%';
     inner.style.top = '25%';
-    inner.style.width = '50%';
-    inner.style.height = '50%';
+    inner.style.width = '30%';
+    inner.style.height = '30%';
     inner.style.pointerEvents = 'none';
 
     if (type === 'ammo') {
@@ -1693,18 +1693,22 @@ function updateHudLayout() {
 
       const barV = document.createElement('div');
       barV.style.position = 'absolute';
-      barV.style.left = '42%';
-      barV.style.top = '5%';
-      barV.style.width = '16%';
-      barV.style.height = '90%';
+      barV.style.left = '50%';
+      barV.style.top = '50%';
+      // vertical bar: thin width, full height
+      barV.style.width = '35%';
+      barV.style.height = '100%';
+      barV.style.transform = 'translate(-50%, -50%)';
       barV.style.background = '#00ff55';
 
       const barH = document.createElement('div');
       barH.style.position = 'absolute';
-      barH.style.left = '5%';
-      barH.style.top = '42%';
-      barH.style.width = '90%';
-      barH.style.height = '16%';
+      barH.style.left = '50%';
+      barH.style.top = '50%';
+      // horizontal bar: full width, thin height
+      barH.style.width = '100%';
+      barH.style.height = '35%';
+      barH.style.transform = 'translate(-50%, -50%)';
       barH.style.background = '#00ff55';
 
       inner.appendChild(barV);
