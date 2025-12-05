@@ -79,6 +79,12 @@
   // Alert / memory (how long sectors remember player absolute position after losing sight)
   const ALERT_MEMORY_TICKS          = 6; // ~1.5s at 250ms
 
+  // Alert target behaviour:
+  //  - 'realtime': during memory, sectors/rooms track the live player position
+  //  - 'last_seen': during memory, they chase the last seen position only
+  const ALERT_TARGET_MODE           = 'last_seen'; // <- switch to 'realtime' to test
+
+
   // "Observing" behaviour: guard stops and rotates FOV to cover 360°
   const OBSERVE_MIN_INTERVAL_TICKS     = 32;  // after ~8s of patrol we start considering observing
   const OBSERVE_FORCED_INTERVAL_TICKS  = 96;  // after ~24s we force at least one observing
@@ -286,16 +292,32 @@
         delete roomAlerts[k];
       }
     }
-    sectorAlerts.NW.state = 'idle';
+
+   sectorAlerts.NW.state = 'idle';
     sectorAlerts.NE.state = 'idle';
     sectorAlerts.SW.state = 'idle';
     sectorAlerts.SE.state = 'idle';
-    sectorAlerts.NW.timer = sectorAlerts.NE.timer =
-      sectorAlerts.SW.timer = sectorAlerts.SE.timer = 0;
-    sectorAlerts.NW.targetCol = sectorAlerts.NE.targetCol =
-      sectorAlerts.SW.targetCol = sectorAlerts.SE.targetCol = null;
-    sectorAlerts.NW.targetRow = sectorAlerts.NE.targetRow =
-      sectorAlerts.SW.targetRow = sectorAlerts.SE.targetRow = null;
+
+    sectorAlerts.NW.timer =
+      sectorAlerts.NE.timer =
+      sectorAlerts.SW.timer =
+      sectorAlerts.SE.timer = 0;
+
+    sectorAlerts.NW.targetCol =
+      sectorAlerts.NE.targetCol =
+      sectorAlerts.SW.targetCol =
+      sectorAlerts.SE.targetCol = null;
+
+    sectorAlerts.NW.targetRow =
+      sectorAlerts.NE.targetRow =
+      sectorAlerts.SW.targetRow =
+      sectorAlerts.SE.targetRow = null;
+
+    sectorAlerts.NW.seeingNow =
+      sectorAlerts.NE.seeingNow =
+      sectorAlerts.SW.seeingNow =
+      sectorAlerts.SE.seeingNow = false;
+
 
     // --- PICKUPS FIX ---
 
@@ -427,14 +449,16 @@
 
   // Sector alert states:
   //   state: "idle" | "tracking"
-  //   targetCol/Row: last known player position (for debug / possible future use)
+  //   targetCol/Row: last known player position (for memory)
   //   timer: memory countdown
+  //   seeingNow: true if at least one guard in this sector sees the player this tick
   const sectorAlerts = {
-    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
-    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
-    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0 },
-    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0 }
+    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
+    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
+    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
+    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false }
   };
+
 
   // Room-based alert states (used only in dungeon layout).
   // Key format: "minCol,maxCol,minRow,maxRow"
@@ -2831,7 +2855,7 @@ function updateHudLayout() {
       return;
     }
 
-    // Arena layout: original sector-based logic
+    // Arena layout: sector-based logic
     manageMemory = !!manageMemory;
 
     let anySeen = false;
@@ -2867,10 +2891,18 @@ function updateHudLayout() {
       }
     });
 
+    // Update "seeingNow" flag per sector (used by targeting logic)
+    ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+      const sa = sectorAlerts[name];
+      if (!sa) return;
+      sa.seeingNow = !!sectorSaw[name];
+    });
+
     if (manageMemory) {
       // Update sector states with 3s memory
       ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
         const sa = sectorAlerts[name];
+        if (!sa) return;
 
         if (sectorSaw[name]) {
           // At least one guard in this sector sees the player now
@@ -2882,9 +2914,15 @@ function updateHudLayout() {
           // Sector was tracking, but no one sees the player this tick
           if (sa.timer > 0) {
             sa.timer--;
+
             if (sa.timer > 0) {
-              sa.targetCol = playerCol;
-              sa.targetRow = playerRow;
+              // Behaviour depends on ALERT_TARGET_MODE:
+              //  - 'realtime'  -> keep following the live player position
+              //  - 'last_seen' -> keep the last stored target (no update here)
+              if (ALERT_TARGET_MODE === 'realtime') {
+                sa.targetCol = playerCol;
+                sa.targetRow = playerRow;
+              }
             } else {
               sa.state = 'idle';
               sa.targetCol = null;
@@ -2914,7 +2952,7 @@ function updateHudLayout() {
         const s = getSector(g.col, g.row);
         const sa = sectorAlerts[s];
 
-        if (sa.state === 'tracking') {
+        if (sa && sa.state === 'tracking') {
           g.state = 'alert_chaser';
         } else {
           if (g.state === 'alert_chaser' && !g.seenPlayer) {
@@ -2933,7 +2971,7 @@ function updateHudLayout() {
     renderGuardFov();
   }
 
-  // Dungeon: room-based alert logic.
+    // Dungeon: room-based alert logic.
   function updateAllFovAndAlertDungeon(manageMemory) {
     manageMemory = !!manageMemory;
 
@@ -2981,7 +3019,8 @@ function updateHudLayout() {
             state: 'idle',
             targetCol: null,
             targetRow: null,
-            timer: 0
+            timer: 0,
+            seeingNow: false
           };
         }
       }
@@ -2990,6 +3029,9 @@ function updateHudLayout() {
       for (const key in roomAlerts) {
         const ra = roomAlerts[key];
         if (!ra) continue;
+
+        // Who is currently seeing the player in this room?
+        ra.seeingNow = !!roomsSaw[key];
 
         if (roomsSaw[key]) {
           // At least one guard in this room sees the player
@@ -3054,8 +3096,6 @@ function updateHudLayout() {
 
     renderGuardFov();
   }
-
-
 
   // --------------------------------------------------
   // Guard look direction oscillation & aiming
@@ -3580,15 +3620,31 @@ function updateHudLayout() {
     });
   }
 
-
-  function computePreferredAlertTarget(guard) {
+    function computePreferredAlertTarget(guard) {
     const layoutType = getLayoutType();
 
-    // Dungeon: if the guard is in alert, always try to orbit around the player
-    // using its assigned cardinal slot; room-based alert is handled elsewhere.
+    // Dungeon: room-based behaviour + optional last_seen targeting
     if (layoutType === 'dungeon') {
-      const px = playerCol;
-      const py = playerRow;
+      const roomKey = getGuardRoomKey(guard);
+      const ra = roomAlerts[roomKey];
+
+      // Base target: live player position
+      let px = playerCol;
+      let py = playerRow;
+
+      // In 'last_seen' mode, when no one in the room is currently seeing the player
+      // but the room is still tracking, chase the last seen position instead.
+      if (
+        ALERT_TARGET_MODE === 'last_seen' &&
+        ra &&
+        ra.state === 'tracking' &&
+        ra.seeingNow !== true &&
+        typeof ra.targetCol === 'number' &&
+        typeof ra.targetRow === 'number'
+      ) {
+        px = ra.targetCol;
+        py = ra.targetRow;
+      }
 
       const slotDir = guard.preferredCardinal || 'N';
       const maxR = 6;
@@ -3615,13 +3671,13 @@ function updateHudLayout() {
         return { col: cx, row: cy };
       }
 
-      // Fallback: small ring around the player
+      // Fallback: small ring around target position
       for (let r = 1; r <= maxR; r++) {
         const candidates = [
           { col: px + r, row: py },
           { col: px - r, row: py },
-          { col: px, row: py + r },
-          { col: px, row: py - r }
+          { col: px,     row: py + r },
+          { col: px,     row: py - r }
         ];
         for (let i = 0; i < candidates.length; i++) {
           const c = candidates[i];
@@ -3635,7 +3691,7 @@ function updateHudLayout() {
       return { col: px, row: py };
     }
 
-    // Arena: original sector-based behaviour
+    // Arena: sector-based behaviour + optional last_seen targeting
     const sectorName = getSector(guard.col, guard.row);
     const sa = sectorAlerts[sectorName];
     if (!sa || sa.state !== 'tracking') {
@@ -3643,8 +3699,21 @@ function updateHudLayout() {
       return { col: guard.col, row: guard.row };
     }
 
-    const px = playerCol;
-    const py = playerRow;
+    // Base target: live player position
+    let px = playerCol;
+    let py = playerRow;
+
+    // In 'last_seen' mode, if this sector is in memory (tracking but no one sees now),
+    // use the stored last seen position instead (if available).
+    if (
+      ALERT_TARGET_MODE === 'last_seen' &&
+      sa.seeingNow !== true &&
+      typeof sa.targetCol === 'number' &&
+      typeof sa.targetRow === 'number'
+    ) {
+      px = sa.targetCol;
+      py = sa.targetRow;
+    }
 
     const slotDir = guard.preferredCardinal || 'N';
     const maxR = 6;
@@ -3674,8 +3743,8 @@ function updateHudLayout() {
       const candidates = [
         { col: px + r, row: py },
         { col: px - r, row: py },
-        { col: px, row: py + r },
-        { col: px, row: py - r }
+        { col: px,     row: py + r },
+        { col: px,     row: py - r }
       ];
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
@@ -3688,8 +3757,6 @@ function updateHudLayout() {
 
     return { col: px, row: py };
   }
-
-
 
   // --------------------------------------------------
   // Alert / chasing behavior (uses BFS towards preferred target)
