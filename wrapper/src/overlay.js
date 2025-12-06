@@ -3270,6 +3270,16 @@ function createPlacedBait(col, row) {
       return;
     }
 
+    // --- Ritual: DESTROY TARGET ---
+    // Non sblocca con l'azione sui marker: serve eliminare il bersaglio.
+    if (ritual === 'destroyTarget') {
+      console.log(
+        '[overlay] Destroy-target ritual: action on marker ignored for trigger',
+        trigger.id || triggerIndex
+      );
+      return;
+    }
+
     // --- Ritual: GET THE KEY ---
     if (ritual === 'getKey') {
       if (!st || !st.keyOwned) {
