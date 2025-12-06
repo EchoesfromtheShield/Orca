@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups]
+//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -66,9 +66,10 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp]');
   process.exit(1);
 }
+
 
 const inputPath   = process.argv[2];
 const outOrcaPath = process.argv[3];
@@ -110,6 +111,35 @@ const BAIT_PICKUP_COUNT = baitArg != null
   ? Math.max(0, parseInt(baitArg, 10) || 0)
   : 3;
 
+// Ritual: optional identifier for this level/ritual
+// Can be provided via CLI (11th arg) or env.RITUAL_ID
+const ritualIdArg = process.argv[11] || process.env.RITUAL_ID;
+const RITUAL_ID = ritualIdArg && ritualIdArg.trim().length > 0
+  ? ritualIdArg.trim()
+  : null;
+
+function normalizeRitualType(raw) {
+  const v = (raw || '').toString().trim().toLowerCase();
+  if (v === 'getkey' || v === 'get_key' || v === 'key') return 'getKey';
+  if (v === 'destroytarget' || v === 'destroy_target' || v === 'destroy') return 'destroyTarget';
+  return 'fourCorners';
+}
+
+// Rituale di unlock per tutte le patch generate
+const ritualTypeArg = process.argv[12] || process.env.RITUAL_TYPE;
+const RITUAL_TYPE = normalizeRitualType(ritualTypeArg || 'fourCorners');
+
+// Per getKey: corner (0..3) con lucchetto "K"
+const keyCornerArg = process.argv[13] || process.env.KEY_CORNER_INDEX;
+const KEY_CORNER_INDEX = keyCornerArg != null
+  ? Math.max(0, parseInt(keyCornerArg, 10) || 0)
+  : 0;
+
+// Per destroyTarget: HP del bersaglio
+const destroyHpArg = process.argv[14] || process.env.DESTROY_TARGET_HP;
+const DESTROY_TARGET_HP = destroyHpArg != null
+  ? Math.max(1, parseInt(destroyHpArg, 10) || 4)
+  : 4;
 
 // Room size can be overridden via environment variables, e.g.
 //   ROOM_W=100 ROOM_H=40 node ...
@@ -650,7 +680,7 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
 // playerSpawn: optional { col, row } suggested spawn for the player.
 // levelGrid: 2D grid (array of rows) of the final ORCA level.
 // layout: string, "arena" | "rooms_line" | "dungeon".
-function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
+function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ritualId) {
   const fovProfiles = {
     A: {
       depth: 9,
@@ -1308,7 +1338,9 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     );
   }
 
-  // Liberation triggers: one per commented patch (frame), same as before.
+  // Liberation triggers: one per commented patch (frame)
+  const ritualType = RITUAL_TYPE || 'fourCorners';
+
   const liberationTriggers = commentBlocksGlobal.map((b, idx) => {
     const x = b.x;
     const y = b.y;
@@ -1322,9 +1354,10 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
       { col: x + w - 1, row: y + h - 1 }
     ];
 
-    return {
+    const trigger = {
       id: b.id || `patch_${idx}`,
-      type: 'fourCorners',
+      type: ritualType,
+      ritual: ritualType,
       corners,
       targetBlock: {
         x,
@@ -1333,9 +1366,25 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
         h
       }
     };
+
+    if (ritualType === 'getKey') {
+      const maxCornerIdx = Math.max(0, corners.length - 1);
+      const clamped = Math.min(maxCornerIdx, KEY_CORNER_INDEX);
+      trigger.keyCornerIndex = clamped;
+    } else if (ritualType === 'destroyTarget') {
+      const centerCol = x + Math.floor((w - 1) / 2);
+      const centerRow = y + Math.floor((h - 1) / 2);
+      trigger.destroyTarget = {
+        col: centerCol,
+        row: centerRow,
+        hp: DESTROY_TARGET_HP
+      };
+    }
+
+    return trigger;
   });
 
-    // --------------------------------------------------------------------
+  // --------------------------------------------------------------------
   // PICKUPS: random ammo / medikit / bait on walkable '.' cells
   // --------------------------------------------------------------------
   if (hasGrid) {
@@ -1398,15 +1447,33 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     }
   }
 
-  return {
+  // Level goal = how many liberation blocks must be completed.
+  // In this version we simply set it to the number of liberationTriggers.
+  const levelGoal = liberationTriggers.length;
+
+  const result = {
     guards,
     fovProfiles,
     liberationTriggers,
     playerSpawn: playerSpawn || null,
     layoutType,
-    pickups
+    pickups,
+    levelGoal
   };
+
+  // Optional ritual metadata, used by overlay.js to know
+  // which ritual this generated level belongs to and
+  // how many liberations are required to complete it.
+  if (ritualId) {
+    result.ritual = {
+      id: ritualId,
+      goal: levelGoal
+    };
+  }
+
+  return result;
 }
+
 
 // ----- Layout: arena --------------------------------------------------
 //
@@ -2047,7 +2114,8 @@ try {
   const levelGridInfo = stringToGrid(orcaGrid);
   const levelGrid = levelGridInfo.grid;
 
-    const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout);
+  const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, RITUAL_ID);
+
 
   // layoutType is already set inside createLevelJson, but we keep this
   // for clarity and to override if needed.
@@ -2075,6 +2143,11 @@ try {
       'row =', playerSpawn.row
     );
   }
+    if (RITUAL_ID) {
+    console.log('  Ritual ID:', RITUAL_ID);
+  } else {
+    console.log('  Ritual ID: (none)');
+  }
   const totalPickups = Array.isArray(jsonConfig.pickups) ? jsonConfig.pickups.length : 0;
   const ammoCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'ammo').length
@@ -2098,6 +2171,12 @@ try {
     ', medikit =', medCount,
     ', bait =', baitCount, ')'
   );
+  console.log('  Ritual unlock type:', RITUAL_TYPE);
+  if (RITUAL_TYPE === 'getKey') {
+    console.log('  Key lock corner index:', KEY_CORNER_INDEX);
+  } else if (RITUAL_TYPE === 'destroyTarget') {
+    console.log('  Destroy-target HP:', DESTROY_TARGET_HP);
+  }
 
 } catch (err) {
   console.error('[patch_to_level] Error:', err.message);

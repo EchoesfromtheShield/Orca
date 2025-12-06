@@ -242,10 +242,178 @@
     window.orcaStealthLevelConfig || null
   );
 
-  // Mutable liberation triggers derived from current config.
+   // Mutable liberation triggers derived from current config.
   let liberationTriggers = Array.isArray(levelConfig.liberationTriggers)
     ? levelConfig.liberationTriggers
     : [];
+
+  // --------------------------------------------------
+  // Liberation triggers helpers (center cell, key carriers)
+  // --------------------------------------------------
+
+  // Centro approssimato della patch, usato per associare stanza/settore
+  function getTriggerCenterCell(trigger) {
+    if (!trigger) return null;
+
+    if (
+      trigger.targetBlock &&
+      typeof trigger.targetBlock.x === 'number' &&
+      typeof trigger.targetBlock.y === 'number' &&
+      typeof trigger.targetBlock.w === 'number' &&
+      typeof trigger.targetBlock.h === 'number'
+    ) {
+      const x = trigger.targetBlock.x;
+      const y = trigger.targetBlock.y;
+      const w = trigger.targetBlock.w;
+      const h = trigger.targetBlock.h;
+      return {
+        col: x + Math.floor(w / 2),
+        row: y + Math.floor(h / 2)
+      };
+    }
+
+    const corners = Array.isArray(trigger.corners) ? trigger.corners : [];
+    if (!corners.length) return null;
+
+    let minCol = Infinity;
+    let maxCol = -Infinity;
+    let minRow = Infinity;
+    let maxRow = -Infinity;
+
+    corners.forEach((c) => {
+      if (typeof c.col === 'number') {
+        if (c.col < minCol) minCol = c.col;
+        if (c.col > maxCol) maxCol = c.col;
+      }
+      if (typeof c.row === 'number') {
+        if (c.row < minRow) minRow = c.row;
+        if (c.row > maxRow) maxRow = c.row;
+      }
+    });
+
+    if (!isFinite(minCol) || !isFinite(minRow)) return null;
+
+    return {
+      col: minCol + Math.floor((maxCol - minCol) / 2),
+      row: minRow + Math.floor((maxRow - minRow) / 2)
+    };
+  }
+
+  // Assegna una guardia "key carrier" per ogni ritual getKey.
+  // DUNGEON: guardia la cui patrol rect contiene il centro della patch.
+  // ARENA: guardia nello stesso settore del centro patch.
+  function assignKeyCarriersIfNeeded() {
+    if (!liberationTriggers || !liberationTriggers.length) return;
+    if (!guards || !guards.length) return;
+
+    const layoutType = getLayoutType();
+
+    liberationTriggers.forEach((trigger, triggerIndex) => {
+      const st = triggerRuntimeState[triggerIndex];
+      if (!st || st.ritual !== 'getKey') return;
+
+      // Già assegnata per questo trigger
+      if (st.keyCarrierGuardId) return;
+
+      const center = getTriggerCenterCell(trigger);
+      if (!center) return;
+
+      const candidates = [];
+
+      if (layoutType === 'dungeon') {
+        guards.forEach((g) => {
+          if (g.state === 'dead') return;
+          if (withinGuardRect(g, center.col, center.row)) {
+            candidates.push(g);
+          }
+        });
+      } else {
+        const triggerSector = getSector(center.col, center.row);
+        guards.forEach((g) => {
+          if (g.state === 'dead') return;
+          const s = getSector(g.col, g.row);
+          if (s === triggerSector) {
+            candidates.push(g);
+          }
+        });
+      }
+
+      if (!candidates.length) {
+        console.warn(
+          '[overlay] No eligible guards found for getKey trigger',
+          trigger.id || triggerIndex
+        );
+        return;
+      }
+
+      const chosen =
+        candidates[Math.floor(Math.random() * candidates.length)];
+
+      st.keyCarrierGuardId = chosen.id || ('guard_' + triggerIndex);
+      chosen.keyForTriggerIndex = triggerIndex;
+
+      console.log(
+        '[overlay] Guard',
+        chosen.id,
+        'selected as KEY carrier for trigger',
+        trigger.id || triggerIndex
+      );
+    });
+  }
+
+
+  // NEW: runtime state per singolo liberation trigger
+  // ritual: "fourCorners" | "destroyTarget" | "getKey"
+  // lockCornerIndex: indice nel vettore corners[] per il lucchetto "K" (solo getKey)
+  // destroyTarget: riferimento all'oggetto bersaglio (solo destroyTarget)
+  let triggerRuntimeState = [];
+
+  // Ritorna il tipo di ritual associato a un trigger.
+  // Atteso dal JSON:
+  //   - { type: "fourCorners", ... }
+  //   - { type: "destroyTarget", destroyTarget: { col, row, hp }, ... }
+  //   - { type: "getKey", keyCornerIndex: 0, ... }
+  function getTriggerRitualType(trigger) {
+    if (!trigger) return 'fourCorners';
+    if (trigger.ritual) return trigger.ritual;
+    if (trigger.type === 'destroyTarget') return 'destroyTarget';
+    if (trigger.type === 'getKey') return 'getKey';
+    return 'fourCorners';
+  }
+
+  function rebuildTriggerRuntimeState() {
+    triggerRuntimeState = [];
+    if (!liberationTriggers || liberationTriggers.length === 0) return;
+
+    liberationTriggers.forEach((trigger, index) => {
+      const ritual = getTriggerRitualType(trigger);
+      const st = {
+        ritual,
+        completed: false,
+        keyOwned: false,
+        keyDropped: false,
+        keyCarrierGuardId: null,
+        lockCornerIndex: null,
+        destroyTarget: null
+      };
+
+      // Per getKey: quale corner di corners[] è il lucchetto con la "K"
+      if (ritual === 'getKey') {
+        if (typeof trigger.keyCornerIndex === 'number') {
+          st.lockCornerIndex = trigger.keyCornerIndex;
+        } else {
+          // fallback: primo corner
+          st.lockCornerIndex = 0;
+        }
+      }
+
+      triggerRuntimeState[index] = st;
+    });
+  }
+
+  // Bootstrap iniziale (defaultLevelConfig)
+  rebuildTriggerRuntimeState();
+
 
   // Optional URL for auto-loading an external JSON level description.
   // Put generated-level.json next to index.html / overlay.js, or change the path.
@@ -259,8 +427,12 @@
       ? merged.liberationTriggers
       : [];
 
+    // NEW: ricostruisci lo stato runtime dei ritual (fourCorners / getKey / destroyTarget)
+    rebuildTriggerRuntimeState();
+
     // Force a new spawn-adjustment pass for this level
     guardSpawnsInitialized = false;
+
 
     // If the level config provides an explicit player spawn, use it.
     if (
@@ -464,6 +636,10 @@
   let baitsContainer = null;
   let baits = [];
   let nextBaitId = 1;
+
+  // NEW: destroy-targets associated with liberation triggers
+  // Each entry: { triggerIndex, col, row, hp, maxHP, el, outer, inner, dot, alive }
+  let destroyTargets = [];
 
 
   // Grid / geometry
@@ -1170,9 +1346,15 @@ function updateHudLayout() {
     return client.orca.glyphAt(col, row);
   }
 
-    function isWalkable(col, row) {
+  function isWalkable(col, row) {
     const g = getOrcaGlyph(col, row);
-    const walkable = (g === '.');
+    let walkable = (g === '.');
+
+    // NEW: celle con destroy-target vivo NON sono walkable
+    if (walkable && findDestroyTargetAtCell(col, row)) {
+      walkable = false;
+    }
+
     if (DEBUG) {
       console.log(
         '[overlay] isWalkable?',
@@ -1188,6 +1370,7 @@ function updateHudLayout() {
     }
     return walkable;
   }
+
 
   // --------------------------------------------------
   // Spawn helpers: keep entities off walls
@@ -1618,7 +1801,7 @@ function updateHudLayout() {
     midCol = Math.floor(gridCols / 2);
     midRow = Math.floor(gridRows / 2);
 
-        if (playerCol >= gridCols) playerCol = gridCols - 1;
+    if (playerCol >= gridCols) playerCol = gridCols - 1;
     if (playerRow >= gridRows) playerRow = gridRows - 1;
     if (playerCol < 0) playerCol = 0;
     if (playerRow < 0) playerRow = 0;
@@ -1637,8 +1820,7 @@ function updateHudLayout() {
     updateAllPickupsPosition();
     updateAllBaitsPosition();
     updatePatchMarkersPosition();
-
-
+    updateAllDestroyTargetsPosition();
 
     // only FOV, no alert memory
     updateAllFovAndAlert(false);
@@ -1651,6 +1833,9 @@ function updateHudLayout() {
       adjustGuardSpawnsByLayout();
       guardSpawnsInitialized = true;
     }
+
+    // NEW: dopo che le guardie hanno la posizione definitiva, assegna i key carrier
+    assignKeyCarriersIfNeeded();
 
     // Initial random pickups: run once per levelConfig / overlay
     if (!pickupsInitialized) {
@@ -1666,6 +1851,7 @@ function updateHudLayout() {
       cellH
     });
   }
+
 
   function updatePlayerPosition() {
     if (!playerDiv) return;
@@ -2005,8 +2191,8 @@ function updateHudLayout() {
   }
 
 
-   // Create a pickup DOM element at (col,row)
-  function createPickup(type, col, row) {
+  // Create a pickup DOM element at (col,row)
+  function createPickup(type, col, row, extra) {
     if (!pickupsContainer) return null;
 
     const cell = document.createElement('div');
@@ -2061,8 +2247,28 @@ function updateHudLayout() {
       inner.style.background = 'yellow';
       // Upright equilateral triangle (apex up, base down)
       inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
-    }
+    } else if (type === 'key') {
+      // NEW: blinking white "K" (no background)
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.transform = 'translate(-50%, -50%)';
+      inner.style.background = 'transparent';
 
+      const label = document.createElement('div');
+      label.textContent = 'K';
+      label.style.position = 'absolute';
+      label.style.left = '50%';
+      label.style.top = '50%';
+      label.style.transform = 'translate(-50%, -50%)';
+      label.style.fontFamily = 'monospace';
+      label.style.fontSize = '80%';
+      label.style.fontWeight = 'bold';
+      label.style.color = '#ffffff';
+
+      inner.appendChild(label);
+    }
 
     cell.appendChild(inner);
     pickupsContainer.appendChild(cell);
@@ -2076,7 +2282,11 @@ function updateHudLayout() {
       row,
       el: cell,
       inner,
-      collected: false
+      collected: false,
+      keyTriggerIndex:
+        extra && typeof extra.keyTriggerIndex === 'number'
+          ? extra.keyTriggerIndex
+          : null
     };
 
     pickups.push(pickup);
@@ -2084,6 +2294,7 @@ function updateHudLayout() {
 
     return pickup;
   }
+
 
     // Remove all existing pickups from DOM and array
   function clearAllPickups() {
@@ -2385,10 +2596,12 @@ function updateHudLayout() {
       return;
     }
 
-    // Cannot shoot directly into non-walkable cell
-    if (!isWalkable(startCol, startRow)) {
+    // Cannot shoot directly into non-walkable cell,
+    // EXCEPT if it's a destroy-target cell (we want to hit it).
+    if (!isWalkable(startCol, startRow) && !findDestroyTargetAtCell(startCol, startRow)) {
       return;
     }
+
 
     const bulletEl = document.createElement('div');
     bulletEl.className = 'orca-stealth-bullet';
@@ -2428,116 +2641,129 @@ function updateHudLayout() {
   }
 
   function stepBullets() {
-  if (!bulletsContainer || bullets.length === 0) return;
+    if (!bulletsContainer || bullets.length === 0) return;
 
-  const survivors = [];
+    const survivors = [];
 
-  for (let i = 0; i < bullets.length; i++) {
-    const b = bullets[i];
-    if (!b.alive || !b.el) {
-      if (b.el && b.el.parentNode) {
-        b.el.parentNode.removeChild(b.el);
-      }
-      continue;
-    }
-
-    let alive = true;
-
-    // Each bullet can advance up to BULLET_STEPS_PER_TICK cells per world tick
-    for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
-      const nextCol = b.col + b.dx;
-      const nextRow = b.row + b.dy;
-
-      // Out of bounds
-      if (
-        nextCol < 0 ||
-        nextRow < 0 ||
-        nextCol >= gridCols ||
-        nextRow >= gridRows
-      ) {
-        if (b.el.parentNode) {
+    for (let i = 0; i < bullets.length; i++) {
+      const b = bullets[i];
+      if (!b.alive || !b.el) {
+        if (b.el && b.el.parentNode) {
           b.el.parentNode.removeChild(b.el);
         }
-        alive = false;
-        break;
+        continue;
       }
 
-      // --- NEW: bullet hits a bait (both guard and player bullets) ---
-      // If you want *only* guard bullets to damage bait, change the condition to:
-      // if (b.ownerType === 'guard') { ... }
-      const hitBait = findPlacedBaitAtCell(nextCol, nextRow);
-      if (hitBait) {
-        applyBaitHit(hitBait); // reduces HP and eventually killBait() + clearBaitAlertsForBait()
+      let alive = true;
 
-        if (b.el.parentNode) {
-          b.el.parentNode.removeChild(b.el);
-        }
-        alive = false;
-        break;
-      }
-      // ----------------------------------------------------------------
+      // Each bullet can advance up to BULLET_STEPS_PER_TICK cells per world tick
+      for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
+        const nextCol = b.col + b.dx;
+        const nextRow = b.row + b.dy;
 
-      // Player hit (only for guard bullets)
-      if (
-        b.ownerType === 'guard' &&
-        nextCol === playerCol &&
-        nextRow === playerRow
-      ) {
-        applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
-        if (b.el.parentNode) {
-          b.el.parentNode.removeChild(b.el);
-        }
-        alive = false;
-        break;
-      }
-
-      // Guard hit (only for player bullets)
-      if (b.ownerType === 'player') {
-        const hitGuard = findGuardAtCell(nextCol, nextRow);
-        if (hitGuard) {
-          applyGuardHit(hitGuard, b);
+        // Out of bounds
+        if (
+          nextCol < 0 ||
+          nextRow < 0 ||
+          nextCol >= gridCols ||
+          nextRow >= gridRows
+        ) {
           if (b.el.parentNode) {
             b.el.parentNode.removeChild(b.el);
           }
           alive = false;
           break;
         }
-      }
 
-      // Wall / Orca code hit
-      if (!isWalkable(nextCol, nextRow)) {
-        if (b.el.parentNode) {
-          b.el.parentNode.removeChild(b.el);
-        }
-        alive = false;
-        break;
-      }
+        // --- bullet hits a bait (both guard and player bullets) ---
+        const hitBait = findPlacedBaitAtCell(nextCol, nextRow);
+        if (hitBait) {
+          applyBaitHit(hitBait); // reduces HP and eventually killBait() + clearBaitAlertsForBait()
 
-      // Move bullet forward
-      b.col = nextCol;
-      b.row = nextRow;
-
-      // Range handling for bullets that have it
-      if (typeof b.rangeLeft === 'number') {
-        b.rangeLeft--;
-        if (b.rangeLeft <= 0) {
           if (b.el.parentNode) {
             b.el.parentNode.removeChild(b.el);
           }
           alive = false;
           break;
         }
+
+        // --- NEW: player bullets can damage destroy-targets ---
+        if (b.ownerType === 'player') {
+          const hitTarget = findDestroyTargetAtCell(nextCol, nextRow);
+          if (hitTarget) {
+            applyDestroyTargetHit(hitTarget);
+
+            if (b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+            alive = false;
+            break;
+          }
+        }
+        // ----------------------------------------------------------
+
+        // Player hit (only for guard bullets)
+        if (
+          b.ownerType === 'guard' &&
+          nextCol === playerCol &&
+          nextRow === playerRow
+        ) {
+          applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
+
+        // Guard hit (only for player bullets)
+        if (b.ownerType === 'player') {
+          const hitGuard = findGuardAtCell(nextCol, nextRow);
+          if (hitGuard) {
+            applyGuardHit(hitGuard, b);
+            if (b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+            alive = false;
+            break;
+          }
+        }
+
+        // Wall / Orca code hit
+        if (!isWalkable(nextCol, nextRow)) {
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
+
+        // Move bullet forward
+        b.col = nextCol;
+        b.row = nextRow;
+
+        // Range handling for bullets that have it
+        if (typeof b.rangeLeft === 'number') {
+          b.rangeLeft--;
+          if (b.rangeLeft <= 0) {
+            if (b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+            alive = false;
+            break;
+          }
+        }
+      }
+
+      if (alive) {
+        updateBulletPosition(b);
+        survivors.push(b);
       }
     }
 
-    if (alive) {
-      updateBulletPosition(b);
-      survivors.push(b);
-    }
+    bullets = survivors;
   }
 
-  bullets = survivors;
-}
 
 // --------------------------------------------------
 // Baits (placed decoys)
@@ -2714,24 +2940,177 @@ function createPlacedBait(col, row) {
   // --------------------------------------------------
   // Patch liberation markers + ORCA injection
   // --------------------------------------------------
+  // NEW: create a "destroy the target" object for a trigger
+  function createDestroyTargetForTrigger(triggerIndex, col, row, maxHP) {
+    if (!patchMarkersContainer) return null;
+
+    const cell = document.createElement('div');
+    cell.className = 'orca-stealth-destroy-target';
+    cell.style.position = 'absolute';
+    cell.style.boxSizing = 'border-box';
+    cell.style.pointerEvents = 'none';
+
+    // Outer circle
+    const outer = document.createElement('div');
+    outer.style.position = 'absolute';
+    outer.style.left = '50%';
+    outer.style.top = '50%';
+    outer.style.width = '72%';
+    outer.style.height = '72%';
+    outer.style.transform = 'translate(-50%, -50%)';
+    outer.style.borderRadius = '50%';
+    outer.style.border = '2px solid #ffffff';
+    outer.style.boxSizing = 'border-box';
+
+    // Inner circle
+    const inner = document.createElement('div');
+    inner.style.position = 'absolute';
+    inner.style.left = '50%';
+    inner.style.top = '50%';
+    inner.style.width = '46%';
+    inner.style.height = '46%';
+    inner.style.transform = 'translate(-50%, -50%)';
+    inner.style.borderRadius = '50%';
+    inner.style.border = '2px solid #ffffff';
+    inner.style.boxSizing = 'border-box';
+
+    // Central dot
+    const dot = document.createElement('div');
+    dot.style.position = 'absolute';
+    dot.style.left = '50%';
+    dot.style.top = '50%';
+    dot.style.width = '18%';
+    dot.style.height = '18%';
+    dot.style.transform = 'translate(-50%, -50%)';
+    dot.style.borderRadius = '50%';
+    dot.style.background = '#ffffff';
+
+    inner.appendChild(dot);
+    outer.appendChild(inner);
+    cell.appendChild(outer);
+    patchMarkersContainer.appendChild(cell);
+
+    const target = {
+      triggerIndex,
+      col,
+      row,
+      hp: maxHP,
+      maxHP,
+      el: cell,
+      outer,
+      inner,
+      dot,
+      alive: true
+    };
+
+    destroyTargets.push(target);
+
+    const st = triggerRuntimeState[triggerIndex];
+    if (st) {
+      st.destroyTarget = target;
+    }
+
+    updateDestroyTargetPosition(target);
+
+    console.log(
+      '[overlay] Destroy-target created for trigger',
+      liberationTriggers[triggerIndex] &&
+        (liberationTriggers[triggerIndex].id || triggerIndex),
+      'at',
+      col,
+      row,
+      'HP=',
+      maxHP
+    );
+
+    return target;
+  }
+
+  function updateDestroyTargetPosition(target) {
+    if (!target || !target.el) return;
+    const x = target.col * cellW;
+    const y = target.row * cellH;
+    target.el.style.width = cellW + 'px';
+    target.el.style.height = cellH + 'px';
+    target.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
+
+  function updateAllDestroyTargetsPosition() {
+    destroyTargets.forEach(updateDestroyTargetPosition);
+  }
+
+  function findDestroyTargetAtCell(col, row) {
+    for (let i = 0; i < destroyTargets.length; i++) {
+      const t = destroyTargets[i];
+      if (!t || !t.alive) continue;
+      if (t.col === col && t.row === row) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  function applyDestroyTargetHit(target) {
+    if (!target || !target.alive) return;
+
+    target.hp--;
+
+    // Small visual feedback on hit
+    if (target.outer) {
+      target.outer.style.borderColor = '#ffdd55';
+      setTimeout(() => {
+        if (!target.alive) return;
+        target.outer.style.borderColor = '#ffffff';
+      }, 120);
+    }
+
+    if (target.hp <= 0) {
+      killDestroyTarget(target);
+    }
+  }
+
+  function killDestroyTarget(target) {
+    if (!target || !target.alive) return;
+    target.alive = false;
+
+    if (target.el && target.el.parentNode) {
+      target.el.parentNode.removeChild(target.el);
+    }
+
+    console.log(
+      '[overlay] Destroy-target destroyed for trigger index',
+      target.triggerIndex
+    );
+
+    completeLiberationTrigger(target.triggerIndex);
+  }
 
   function initPatchMarkersDom() {
     if (!patchMarkersContainer) return;
 
-    // Clear previous markers if any
+    // Clear previous markers/targets
     patchMarkersContainer.innerHTML = '';
     patchMarkers = [];
+    destroyTargets = [];
 
     if (!liberationTriggers || liberationTriggers.length === 0) {
       return;
     }
 
     liberationTriggers.forEach((trigger, triggerIndex) => {
-      if (!trigger || trigger.type !== 'fourCorners') {
-        return;
-      }
+      if (!trigger) return;
+
+      const st = triggerRuntimeState[triggerIndex];
+      const ritual = (st && st.ritual) || getTriggerRitualType(trigger);
 
       const corners = Array.isArray(trigger.corners) ? trigger.corners : [];
+      let lockCornerIndex = null;
+      if (ritual === 'getKey' && st) {
+        lockCornerIndex = st.lockCornerIndex != null ? st.lockCornerIndex : 0;
+      }
+
+      // --- Corners (visivi) per tutti i ritual ---
+
       corners.forEach((corner, cornerIndex) => {
         const col = corner.col;
         const row = corner.row;
@@ -2740,14 +3119,12 @@ function createPlacedBait(col, row) {
           return;
         }
 
-        // Cell container for the marker (one per Orca cell)
         const el = document.createElement('div');
         el.className = 'orca-stealth-patch-marker';
         el.style.position = 'absolute';
         el.style.boxSizing = 'border-box';
         el.style.pointerEvents = 'none';
 
-        // Inner square: initial state = solid white square
         const inner = document.createElement('div');
         inner.className = 'orca-stealth-patch-marker-inner';
         inner.style.position = 'absolute';
@@ -2756,8 +3133,31 @@ function createPlacedBait(col, row) {
         inner.style.width = '50%';
         inner.style.height = '50%';
         inner.style.boxSizing = 'border-box';
-        inner.style.background = '#ffffff';   // filled white
-        inner.style.border = 'none';          // no border in idle state
+
+        const isKeyLock =
+          ritual === 'getKey' && lockCornerIndex === cornerIndex;
+
+        if (isKeyLock) {
+          // Lucchetto: quadrato bianco con "K" nera
+          inner.style.background = '#ffffff';
+          inner.style.border = 'none';
+
+          const label = document.createElement('div');
+          label.textContent = 'K';
+          label.style.position = 'absolute';
+          label.style.left = '50%';
+          label.style.top = '50%';
+          label.style.transform = 'translate(-50%, -50%)';
+          label.style.fontFamily = 'monospace';
+          label.style.fontSize = '65%';
+          label.style.fontWeight = 'bold';
+          label.style.color = '#000000';
+          inner.appendChild(label);
+        } else {
+          // Corner normale: quadratino bianco pieno
+          inner.style.background = '#ffffff';
+          inner.style.border = 'none';
+        }
 
         el.appendChild(inner);
         patchMarkersContainer.appendChild(el);
@@ -2770,13 +3170,40 @@ function createPlacedBait(col, row) {
           row,
           active: false,
           el,
-          inner   // keep a reference to the inner square for style changes
+          inner,
+          ritualType: ritual,
+          isKeyLock
         });
       });
+
+      // --- Destroy-target ritual: crea il bersaglio circolare ---
+
+      if (ritual === 'destroyTarget') {
+        const cfg = trigger.destroyTarget || {};
+        let tCol = null;
+        let tRow = null;
+        let hp = 4;
+
+        if (typeof cfg.col === 'number') tCol = cfg.col;
+        if (typeof cfg.row === 'number') tRow = cfg.row;
+        if (typeof cfg.hp === 'number' && cfg.hp > 0) hp = cfg.hp;
+
+        if (tCol != null && tRow != null) {
+          createDestroyTargetForTrigger(triggerIndex, tCol, tRow, hp);
+        } else {
+          console.warn(
+            '[overlay] destroyTarget trigger',
+            trigger.id || triggerIndex,
+            'is missing destroyTarget.col/row'
+          );
+        }
+      }
     });
 
     updatePatchMarkersPosition();
+    updateAllDestroyTargetsPosition();
   }
+
 
 
   function updatePatchMarkersPosition() {
@@ -2800,47 +3227,96 @@ function createPlacedBait(col, row) {
     return (dx + dy === 1) || (dx === 0 && dy === 0);
   }
 
-    function tryActivateNearbyMarker() {
+  function tryActivateNearbyMarker() {
     if (!patchMarkers || patchMarkers.length === 0) return;
 
-    let activatedMarker = null;
+    // 1) Se c'è un key-lock vicino, lo preferiamo (getKey)
+    let candidate = null;
 
-    // Activate at most one marker per key press
     for (let i = 0; i < patchMarkers.length; i++) {
       const m = patchMarkers[i];
-      if (m.active) continue;
       if (!isAdjacentToMarker(m)) continue;
 
-      m.active = true;
+      const st = triggerRuntimeState[m.triggerIndex];
+      const ritual = st ? st.ritual : m.ritualType || getTriggerRitualType(liberationTriggers[m.triggerIndex]);
 
-      // Switch visual from filled white square to hollow white square
-      if (m.inner) {
-        m.inner.style.background = 'transparent'; // no fill
-        m.inner.style.border = '2px solid #ffffff'; // white outline
+      if (ritual === 'getKey' && m.isKeyLock) {
+        candidate = m;
+        break;
+      }
+    }
+
+    // 2) Altrimenti, qualunque marker vicino (fourCorners classico)
+    if (!candidate) {
+      for (let i = 0; i < patchMarkers.length; i++) {
+        const m = patchMarkers[i];
+        if (!isAdjacentToMarker(m)) continue;
+        candidate = m;
+        break;
+      }
+    }
+
+    if (!candidate) return;
+
+    const triggerIndex = candidate.triggerIndex;
+    const trigger = liberationTriggers[triggerIndex];
+    if (!trigger) return;
+
+    const st = triggerRuntimeState[triggerIndex];
+    const ritual = st ? st.ritual : getTriggerRitualType(trigger);
+
+    if (st && st.completed) {
+      // Già sbloccata
+      return;
+    }
+
+    // --- Ritual: GET THE KEY ---
+    if (ritual === 'getKey') {
+      if (!st || !st.keyOwned) {
+        console.log(
+          '[overlay] Player tried to unlock patch',
+          trigger.id || triggerIndex,
+          'but has no key yet.'
+        );
+        return;
       }
 
+      // Visual: lucchetto diventa outline, "K" bianca
+      if (candidate.inner) {
+        candidate.inner.style.background = 'transparent';
+        candidate.inner.style.border = '2px solid #ffffff';
 
-      activatedMarker = m;
-      console.log(
-        '[overlay] Patch marker',
-        m.triggerId + ':' + m.cornerIndex,
-        'activated.'
-      );
-      break;
-    }
+        const label = candidate.inner.querySelector('div');
+        if (label) {
+          label.style.color = '#ffffff';
+        }
+      }
 
-    if (!activatedMarker) {
+      st.keyOwned = false;
+      st.keyDropped = true;
+      completeLiberationTrigger(triggerIndex);
       return;
     }
 
-    const triggerIndex = activatedMarker.triggerIndex;
-    const trigger = liberationTriggers[triggerIndex];
-    if (!trigger) {
+    // --- Ritual: FOUR CORNERS (default) ---
+    if (candidate.active) {
       return;
     }
 
-    // Check if all markers of this trigger are now active.
-    // This is per-trigger: completing one ritual does not affect the others.
+    candidate.active = true;
+
+    // Switch visual from filled white square to hollow white square
+    if (candidate.inner) {
+      candidate.inner.style.background = 'transparent'; // no fill
+      candidate.inner.style.border = '2px solid #ffffff'; // white outline
+    }
+
+    console.log(
+      '[overlay] Patch marker',
+      candidate.triggerId + ':' + candidate.cornerIndex,
+      'activated.'
+    );
+
     const markersForTrigger = patchMarkers.filter(
       (m) => m.triggerIndex === triggerIndex
     );
@@ -2849,10 +3325,9 @@ function createPlacedBait(col, row) {
       markersForTrigger.every((m) => m.active);
 
     if (allActiveForTrigger) {
-      liberatePatchInOrca(trigger);
+      completeLiberationTrigger(triggerIndex);
     }
   }
-
 
   function liberatePatchInOrca(trigger) {
     const client = window.orcaClient;
@@ -2908,6 +3383,70 @@ function createPlacedBait(col, row) {
     );
 
   }
+
+  // NEW: wrapper che marca un trigger come completato e pulisce i suoi elementi
+  function completeLiberationTrigger(triggerIndex) {
+    if (
+      !liberationTriggers ||
+      triggerIndex == null ||
+      triggerIndex < 0 ||
+      triggerIndex >= liberationTriggers.length
+    ) {
+      return;
+    }
+
+    const trigger = liberationTriggers[triggerIndex];
+    if (!trigger) return;
+
+    const st = triggerRuntimeState[triggerIndex];
+    if (st && st.completed) {
+      return;
+    }
+
+    // Scrivi la patch in ORCA
+    liberatePatchInOrca(trigger);
+
+    if (st) {
+      st.completed = true;
+      st.keyOwned = false;
+    }
+
+    // Rimuovi eventuali destroy-target associati
+    if (destroyTargets && destroyTargets.length) {
+      destroyTargets.forEach((t) => {
+        if (!t) return;
+        if (t.triggerIndex === triggerIndex) {
+          t.alive = false;
+          if (t.el && t.el.parentNode) {
+            t.el.parentNode.removeChild(t.el);
+          }
+        }
+      });
+    }
+
+    // Trasforma tutti i marker di questa patch in quadrati hollow
+    patchMarkers.forEach((m) => {
+      if (m.triggerIndex !== triggerIndex) return;
+      m.active = true;
+      if (!m.inner) return;
+
+      m.inner.style.background = 'transparent';
+      m.inner.style.border = '2px solid #ffffff';
+
+      if (m.isKeyLock) {
+        const label = m.inner.querySelector('div');
+        if (label) {
+          label.style.color = '#ffffff';
+        }
+      }
+    });
+
+    console.log(
+      '[overlay] Liberation trigger completed:',
+      trigger.id || ('index ' + triggerIndex)
+    );
+  }
+
 
   function shootingTickForGuard(guard) {
     if (mode !== 'game') return;
@@ -4767,7 +5306,11 @@ function stepGuardAlert(guard) {
 
     updateGuardSpriteAppearance(guard);
     console.log('[overlay] GUARD KILLED by player:', guard.id);
+
+    // NEW: gestisci eventuale drop della KEY
+    handleGuardDeathDrops(guard);
   }
+
 
   function applyGuardHit(guard, sourceBullet) {
     if (!guard || guard.state === 'dead') return;
@@ -4786,8 +5329,117 @@ function stepGuardAlert(guard) {
     }
   }
 
+    // NEW: handle key-drop on guard death (for getKey ritual)
+  function handleGuardDeathDrops(guard) {
+    if (!guard) return;
+
+    const trigIndex =
+      typeof guard.keyForTriggerIndex === 'number'
+        ? guard.keyForTriggerIndex
+        : null;
+
+    if (
+      trigIndex == null ||
+      !triggerRuntimeState[trigIndex] ||
+      triggerRuntimeState[trigIndex].completed ||
+      triggerRuntimeState[trigIndex].keyDropped
+    ) {
+      return;
+    }
+
+    dropKeyForTrigger(guard, trigIndex);
+  }
+
+  function dropKeyForTrigger(guard, triggerIndex) {
+    const state = triggerRuntimeState[triggerIndex];
+    if (!state) return;
+
+    const maxAttempts = 32;
+    let dropCol = guard.col;
+    let dropRow = guard.row;
+
+    // Try neighbouring cells first
+    const offsets = [
+      { dx: 0, dy: -1 },
+      { dx: 1, dy: 0 },
+      { dx: 0, dy: 1 },
+      { dx: -1, dy: 0 },
+      { dx: 1, dy: -1 },
+      { dx: 1, dy: 1 },
+      { dx: -1, dy: 1 },
+      { dx: -1, dy: -1 }
+    ];
+
+    let placed = false;
+    for (let i = 0; i < offsets.length; i++) {
+      const c = guard.col + offsets[i].dx;
+      const r = guard.row + offsets[i].dy;
+      if (c < 0 || r < 0 || c >= gridCols || r >= gridRows) continue;
+      if (!isCellFreeForPickup(c, r)) continue;
+      dropCol = c;
+      dropRow = r;
+      placed = true;
+      break;
+    }
+
+    if (!placed) {
+      // Last resort: stessa cella della guardia (morta = non blocca i pickup)
+      dropCol = guard.col;
+      dropRow = guard.row;
+    }
+
+    const pickup = createPickup('key', dropCol, dropRow, {
+      keyTriggerIndex: triggerIndex
+    });
+
+    if (!pickup) return;
+
+    state.keyDropped = true;
+
+    console.log(
+      '[overlay] KEY dropped for trigger',
+      liberationTriggers[triggerIndex] &&
+        (liberationTriggers[triggerIndex].id || triggerIndex),
+      'by guard',
+      guard.id,
+      'at',
+      dropCol,
+      dropRow
+    );
+  }
+
+
   function applyPickupEffect(pickup) {
     if (!pickup) return false; // false = not consumed
+
+    // NEW: KEY pickup (per ritual getKey)
+    if (pickup.type === 'key') {
+      const idx =
+        typeof pickup.keyTriggerIndex === 'number'
+          ? pickup.keyTriggerIndex
+          : null;
+
+      if (
+        idx != null &&
+        liberationTriggers &&
+        liberationTriggers[idx]
+      ) {
+        const st = triggerRuntimeState[idx];
+        if (st) {
+          st.keyOwned = true;
+        }
+        console.log(
+          '[overlay] PLAYER picked KEY for trigger',
+          liberationTriggers[idx].id || idx
+        );
+      } else {
+        console.log('[overlay] PLAYER picked generic KEY (no trigger bound).');
+      }
+
+      // La key viene sempre consumata quando raccolta
+      updateModeVisual();
+      return true;
+    }
 
     if (pickup.type === 'medikit') {
       if (playerHP < playerHPMax) {
@@ -4803,42 +5455,43 @@ function stepGuardAlert(guard) {
         return true; // consumed
       } else {
         console.log(
-          '[overlay] PLAYER stepped on MEDIKIT but HP already full. Pickup stays on map.'
+          '[overlay] PLAYER picked MEDIKIT but is already at full HP.'
         );
-        return false;
+        return false; // not consumed
       }
     } else if (pickup.type === 'ammo') {
       if (playerAmmo < playerAmmoMax) {
-        playerAmmo += 2;
+        playerAmmo++;
         if (playerAmmo > playerAmmoMax) playerAmmo = playerAmmoMax;
         console.log(
-          '[overlay] PLAYER picked AMMO. Ammo:',
+          '[overlay] PLAYER picked AMMO. AMMO:',
           playerAmmo,
           '/',
           playerAmmoMax
         );
         updateModeVisual();
-        return true; // consumed
+        return true;
       } else {
         console.log(
-          '[overlay] PLAYER stepped on AMMO but ammo already full. Pickup stays on map.'
+          '[overlay] PLAYER picked AMMO but is already at max ammo.'
         );
         return false;
       }
     } else if (pickup.type === 'bait') {
       if (playerBaits < PLAYER_BAIT_MAX) {
         playerBaits++;
+        if (playerBaits > PLAYER_BAIT_MAX) playerBaits = PLAYER_BAIT_MAX;
         console.log(
-          '[overlay] PLAYER picked BAIT. Baits:',
+          '[overlay] PLAYER picked BAIT. BAIT:',
           playerBaits,
           '/',
           PLAYER_BAIT_MAX
         );
         updateModeVisual();
-        return true; // consumed
+        return true;
       } else {
         console.log(
-          '[overlay] PLAYER stepped on BAIT but inventory is full. Pickup stays on map.'
+          '[overlay] PLAYER picked BAIT but is already at max bait.'
         );
         return false;
       }
@@ -4846,6 +5499,7 @@ function stepGuardAlert(guard) {
 
     return false;
   }
+
 
   function checkPickupCollisions() {
     for (let i = 0; i < pickups.length; i++) {
