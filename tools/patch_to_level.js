@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//   node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups]
+//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -66,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups]');
   process.exit(1);
 }
 
@@ -88,14 +88,16 @@ const WALL_CHAR_RAW = (wallCharCli && wallCharCli.length > 0)
   : (wallCharEnv && wallCharEnv.length > 0 ? wallCharEnv : 'y');
 const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
 
-// Pickups: ammo / medikit counts (can be overridden via CLI or env)
-//   argv[8] -> AMMO_PICKUPS
-//   argv[9] -> MEDIKIT_PICKUPS
-//   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS
+// Pickups: ammo / medikit / bait counts (can be overridden via CLI or env)
+//   argv[8]  -> AMMO_PICKUPS
+//   argv[9]  -> MEDIKIT_PICKUPS
+//   argv[10] -> BAIT_PICKUPS
+//   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
+const baitArg = process.argv[10] || process.env.BAIT_PICKUPS;
 
-// Default: 3 ammo, 1 medikit if not specified
+// Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
   ? Math.max(0, parseInt(ammoArg, 10) || 0)
   : 3;
@@ -103,6 +105,11 @@ const AMMO_PICKUP_COUNT = ammoArg != null
 const MEDIKIT_PICKUP_COUNT = medArg != null
   ? Math.max(0, parseInt(medArg, 10) || 0)
   : 1;
+
+const BAIT_PICKUP_COUNT = baitArg != null
+  ? Math.max(0, parseInt(baitArg, 10) || 0)
+  : 3;
+
 
 // Room size can be overridden via environment variables, e.g.
 //   ROOM_W=100 ROOM_H=40 node ...
@@ -134,7 +141,6 @@ const CORRIDOR_WIDTH_MAX = parseInt(process.env.CORRIDOR_WIDTH_MAX, 10) || 6;
 // 0.65 means "try to keep total room area around 65% of map area".
 // Can be overridden with env.DUNGEON_TARGET_FILL.
 const DUNGEON_TARGET_FILL = parseFloat(process.env.DUNGEON_TARGET_FILL || '0.65');
-
 
 
 // Sanitize layout
@@ -1329,8 +1335,8 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     };
   });
 
-  // --------------------------------------------------------------------
-  // PICKUPS: random ammo / medikit on walkable '.' cells in the whole map
+    // --------------------------------------------------------------------
+  // PICKUPS: random ammo / medikit / bait on walkable '.' cells
   // --------------------------------------------------------------------
   if (hasGrid) {
     const allWalkable = collectWalkableCells(0, gridW - 1, 0, gridH - 1);
@@ -1338,20 +1344,34 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
     if (allWalkable.length === 0) {
       console.warn('[patch_to_level] No walkable cells, pickups will be empty.');
     } else {
-      // First pick ammo cells
+      // We'll keep track of already-used cells so ammo/med/bait don't overlap.
+      const usedKeys = new Set();
+
+      // 1) Ammo
       const ammoCells = pickRandomCells(allWalkable, AMMO_PICKUP_COUNT);
+      ammoCells.forEach((c) => {
+        usedKeys.add(`${c.col},${c.row}`);
+      });
 
-      // Remove ammo cells from the pool when picking medikits
-      const usedKeys = new Set(
-        ammoCells.map((c) => `${c.col},${c.row}`)
-      );
-
-      const remaining = allWalkable.filter(
+      // 2) Medikits (on cells not used by ammo)
+      const remainingForMed = allWalkable.filter(
         (c) => !usedKeys.has(`${c.col},${c.row}`)
       );
+      const medCells = pickRandomCells(remainingForMed, MEDIKIT_PICKUP_COUNT);
+      medCells.forEach((c) => {
+        usedKeys.add(`${c.col},${c.row}`);
+      });
 
-      const medCells = pickRandomCells(remaining, MEDIKIT_PICKUP_COUNT);
+      // 3) Bait (on cells not used by ammo+medikit)
+      const remainingForBait = allWalkable.filter(
+        (c) => !usedKeys.has(`${c.col},${c.row}`)
+      );
+      const baitCells = pickRandomCells(remainingForBait, BAIT_PICKUP_COUNT);
+      baitCells.forEach((c) => {
+        usedKeys.add(`${c.col},${c.row}`);
+      });
 
+      // Push into pickups array
       ammoCells.forEach((pos) => {
         pickups.push({
           type: 'ammo',
@@ -1363,6 +1383,14 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout) {
       medCells.forEach((pos) => {
         pickups.push({
           type: 'medikit',
+          col: pos.col,
+          row: pos.row
+        });
+      });
+
+      baitCells.forEach((pos) => {
+        pickups.push({
+          type: 'bait',
           col: pos.col,
           row: pos.row
         });
@@ -2047,23 +2075,28 @@ try {
       'row =', playerSpawn.row
     );
   }
-    const totalPickups = Array.isArray(jsonConfig.pickups) ? jsonConfig.pickups.length : 0;
+  const totalPickups = Array.isArray(jsonConfig.pickups) ? jsonConfig.pickups.length : 0;
   const ammoCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'ammo').length
     : 0;
   const medCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'medikit').length
     : 0;
+  const baitCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'bait').length
+    : 0;
 
   console.log(
     '  Pickups requested: ammo =', AMMO_PICKUP_COUNT,
-    ', medikit =', MEDIKIT_PICKUP_COUNT
+    ', medikit =', MEDIKIT_PICKUP_COUNT,
+    ', bait =', BAIT_PICKUP_COUNT
   );
   console.log(
     '  Pickups generated:',
     totalPickups,
     '(ammo =', ammoCount,
-    ', medikit =', medCount, ')'
+    ', medikit =', medCount,
+    ', bait =', baitCount, ')'
   );
 
 } catch (err) {

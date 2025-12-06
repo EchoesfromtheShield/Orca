@@ -68,12 +68,18 @@
   // Pickup spawn handles (random pickups on walkable ground)
   const INITIAL_MEDIKIT_PICKUPS     = 2;  // number of medikit pickups to spawn
   const INITIAL_AMMO_PICKUPS        = 3;  // number of ammo pickups to spawn
+  const INITIAL_BAIT_PICKUPS        = 3;  // NEW: legacy default number of bait pickups
 
   // Player shoot keys
   const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
 
+  // NEW: Bait tuning
+  const BAIT_MAX_HP                 = 4;  // bait hit points (tunable)
+  const PLAYER_BAIT_MAX             = 3;  // max baits that player can carry (tunable)
+
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
+
 
 
   // Alert / memory (how long sectors remember player absolute position after losing sight)
@@ -318,12 +324,25 @@
       sectorAlerts.SW.seeingNow =
       sectorAlerts.SE.seeingNow = false;
 
+    sectorAlerts.NW.source =
+      sectorAlerts.NE.source =
+      sectorAlerts.SW.source =
+      sectorAlerts.SE.source = null;
+
+    sectorAlerts.NW.sourceBaitId =
+      sectorAlerts.NE.sourceBaitId =
+      sectorAlerts.SW.sourceBaitId =
+      sectorAlerts.SE.sourceBaitId = null;
+
+
 
     // --- PICKUPS FIX ---
 
 
     // Remove any pickups that were spawned before (random defaults, etc.)
     clearAllPickups();
+    clearAllBaits();
+
 
     // Mark pickups as already handled for this level:
     // syncGeometry() will NOT call spawnInitialPickupsRandom().
@@ -408,10 +427,16 @@
   let playerHP = playerHPMax;
   let playerHitCooldown = 0; // invulnerability ticks after being hit
 
+  // Player blink (during invulnerability)
+  let playerBlinkVisible = true; // true = visible, false = hidden
+
+
   // Player ammo
   let playerAmmoMax = PLAYER_INITIAL_AMMO;
   let playerAmmo = PLAYER_INITIAL_AMMO;
 
+  // Player baits inventory
+  let playerBaits = 0; // number of baits currently carried
 
   // Guards
   let guards = [];
@@ -429,11 +454,17 @@
   let bullets = [];
 
 
-  // Pickups (ammo / medikit)
+  // Pickups (ammo / medikit / bait pickups)
   let pickupsContainer = null;
   let pickups = [];
   let pickupsInitialized = false;
   let pickupsBlinkTick = 0;
+
+  // Placed baits on the map
+  let baitsContainer = null;
+  let baits = [];
+  let nextBaitId = 1;
+
 
   // Grid / geometry
   let gridCols = 120;
@@ -453,16 +484,23 @@
   //   timer: memory countdown
   //   seeingNow: true if at least one guard in this sector sees the player this tick
   const sectorAlerts = {
-    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
-    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
-    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false },
-    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false }
+    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
+    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
+    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
+    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null }
   };
+
 
 
   // Room-based alert states (used only in dungeon layout).
   // Key format: "minCol,maxCol,minRow,maxRow"
+  // Each entry:
+  //   state: "idle" | "tracking"
+  //   targetCol/Row: last known target position
+  //   source: "player" | "bait" | null
+  //   sourceBaitId: id of bait if source === "bait"
   const roomAlerts = {};
+
 
   // Layout helpers
   function getLayoutType() {
@@ -613,7 +651,7 @@
     // Global CSS for pickup blinking (ammo & medikit)
     let existingStyle = document.getElementById('orca-stealth-style');
     if (!existingStyle) {
-      existingStyle = document.createElement('style');
+            existingStyle = document.createElement('style');
       existingStyle.id = 'orca-stealth-style';
       existingStyle.type = 'text/css';
       existingStyle.textContent = `
@@ -627,9 +665,43 @@
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
+
+@keyframes orcaBaitSpin {
+  0%   { transform: translate(-50%, -50%) rotate(0deg); }
+  100% { transform: translate(-50%, -50%) rotate(360deg); }
+}
+.orca-stealth-bait-spin {
+  animation-name: orcaBaitSpin;
+  animation-duration: 0.8s;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* NEW: aura for placed bait (bigger triangle, opposite rotation + pulse) */
+@keyframes orcaBaitAura {
+  0% {
+    transform: translate(-50%, -50%) scale(0.95) rotate(0deg);
+    opacity: 0;
+  }
+  35% {
+    transform: translate(-50%, -50%) scale(1.05) rotate(-140deg);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(0.95) rotate(-360deg);
+    opacity: 0;
+  }
+}
+.orca-stealth-bait-aura {
+  animation-name: orcaBaitAura;
+  animation-duration: 1.4s;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
       `;
       document.head.appendChild(existingStyle);
     }
+
 
     // FOV container (under guards and player)
     fovContainer = document.createElement('div');
@@ -674,6 +746,18 @@
     pickupsContainer.style.height = '100%';
     pickupsContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(pickupsContainer);
+
+    // Placed baits container (above pickups, below patch markers/player)
+    baitsContainer = document.createElement('div');
+    baitsContainer.id = 'orca-stealth-baits';
+    baitsContainer.style.position = 'absolute';
+    baitsContainer.style.left = '0';
+    baitsContainer.style.top = '0';
+    baitsContainer.style.width = '100%';
+    baitsContainer.style.height = '100%';
+    baitsContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(baitsContainer);
+
 
     // Patch liberation markers (above bullets, below player)
     patchMarkersContainer = document.createElement('div');
@@ -798,6 +882,10 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
+          '  BAIT ' +
+          playerBaits +
+          '/' +
+          PLAYER_BAIT_MAX +
           '  (F1: back to EDIT / tweak ORCA)';
         hud.style.color = '#ff4444';
       }
@@ -829,7 +917,11 @@
           '  AMMO ' +
           playerAmmo +
           '/' +
-          playerAmmoMax;
+          playerAmmoMax +
+          '  BAIT ' +
+          playerBaits +
+          '/' +
+          PLAYER_BAIT_MAX;
         hud.style.color = '#ffffff';
       }
     } else {
@@ -850,9 +942,13 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
+          '  BAIT ' +
+          playerBaits +
+          '/' +
+          PLAYER_BAIT_MAX +
           '  [' +
           alertText +
-          ']  (F1: toggle, Arrows: move, S: shoot, Space: Orca clock)';
+          ']  (F1: toggle, Arrows: move, S: shoot, D: place bait, Space: Orca clock)';
         hud.style.color = '#ffffff';
       }
 
@@ -861,6 +957,7 @@
     // Re-position HUD after any change
     updateHudLayout();
   }
+
 
 
 // Position HUD in the bottom band of Orca, slightly to the right
@@ -991,6 +1088,10 @@ function updateHudLayout() {
         fovCells: [],
         seenPlayer: false,
         wasSeeingPlayer: false,
+        seenBait: false,
+        wasSeeingBait: false,
+        seenBaitId: null,
+
 
         // FSM / alert
         state: 'patrol',
@@ -1534,7 +1635,9 @@ function updateHudLayout() {
     guards.forEach(updateGuardPosition);
     updateAllBulletsPosition();
     updateAllPickupsPosition();
+    updateAllBaitsPosition();
     updatePatchMarkersPosition();
+
 
 
     // only FOV, no alert memory
@@ -1586,6 +1689,21 @@ function updateHudLayout() {
 
     playerInner.style.transform = 'rotate(' + angle + 'deg)';
   }
+
+  function updatePlayerBlink() {
+    if (!playerInner) return;
+
+    if (playerHitCooldown > 0) {
+      // Toggle visibility each tick to create a blink effect
+      playerBlinkVisible = !playerBlinkVisible;
+      playerInner.style.opacity = playerBlinkVisible ? '1.0' : '0.2';
+    } else {
+      // Ensure fully visible when not in invulnerability
+      playerBlinkVisible = true;
+      playerInner.style.opacity = '1.0';
+    }
+  }
+
 
   function clampPlayer() {
     if (playerCol < 0) playerCol = 0;
@@ -1642,6 +1760,25 @@ function updateHudLayout() {
     }
     return null;
   }
+
+  function findPlacedBaitAtCell(col, row) {
+    for (let i = 0; i < baits.length; i++) {
+      const b = baits[i];
+      if (!b.alive) continue;
+      if (b.col === col && b.row === row) {
+        return b;
+      }
+    }
+    return null;
+  }
+
+  function getBaitById(id) {
+    for (let i = 0; i < baits.length; i++) {
+      if (baits[i].id === id) return baits[i];
+    }
+    return null;
+  }
+
 
   // --------------------------------------------------
   // Pathfinding (BFS) for chasers
@@ -1853,8 +1990,22 @@ function updateHudLayout() {
   function updateAllPickupsPosition() {
     pickups.forEach(updatePickupPosition);
   }
+  
+  function updateBaitPosition(bait) {
+    if (!bait.el) return;
+    const x = bait.col * cellW;
+    const y = bait.row * cellH;
+    bait.el.style.width = cellW + 'px';
+    bait.el.style.height = cellH + 'px';
+    bait.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
 
-  // Create a pickup DOM element at (col,row)
+  function updateAllBaitsPosition() {
+    baits.forEach(updateBaitPosition);
+  }
+
+
+   // Create a pickup DOM element at (col,row)
   function createPickup(type, col, row) {
     if (!pickupsContainer) return null;
 
@@ -1884,7 +2035,6 @@ function updateHudLayout() {
       barV.style.position = 'absolute';
       barV.style.left = '50%';
       barV.style.top = '50%';
-      // vertical bar: thin width, full height
       barV.style.width = '35%';
       barV.style.height = '100%';
       barV.style.transform = 'translate(-50%, -50%)';
@@ -1894,7 +2044,6 @@ function updateHudLayout() {
       barH.style.position = 'absolute';
       barH.style.left = '50%';
       barH.style.top = '50%';
-      // horizontal bar: full width, thin height
       barH.style.width = '100%';
       barH.style.height = '35%';
       barH.style.transform = 'translate(-50%, -50%)';
@@ -1902,7 +2051,18 @@ function updateHudLayout() {
 
       inner.appendChild(barV);
       inner.appendChild(barH);
+    } else if (type === 'bait') {
+      // Equilateral yellow triangle (pickup version)
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.transform = 'translate(-50%, -50%)';
+      inner.style.background = 'yellow';
+      // Upright equilateral triangle (apex up, base down)
+      inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
     }
+
 
     cell.appendChild(inner);
     pickupsContainer.appendChild(cell);
@@ -1933,6 +2093,15 @@ function updateHudLayout() {
       }
     }
     pickups = [];
+  }
+
+    function clearAllBaits() {
+    if (baitsContainer) {
+      while (baitsContainer.firstChild) {
+        baitsContainer.removeChild(baitsContainer.firstChild);
+      }
+    }
+    baits = [];
   }
 
   // Force pickups to spawn only on walkable cells; if needed, snap to nearest walkable.
@@ -1971,7 +2140,12 @@ function updateHudLayout() {
 
     defs.forEach((def) => {
       if (!def) return;
-      const type = def.type === 'medikit' ? 'medikit' : 'ammo';
+
+      let type = 'ammo';
+      if (def.type === 'medikit') type = 'medikit';
+      else if (def.type === 'ammo') type = 'ammo';
+      else if (def.type === 'bait') type = 'bait';
+
       let col = typeof def.col === 'number' ? def.col : null;
       let row = typeof def.row === 'number' ? def.row : null;
       if (col == null || row == null) return;
@@ -1994,7 +2168,7 @@ function updateHudLayout() {
     ensurePickupsOnWalkableCells();
   }
 
-    function isCellFreeForPickup(col, row) {
+  function isCellFreeForPickup(col, row) {
     // Must be walkable
     if (!isWalkable(col, row)) return false;
 
@@ -2008,8 +2182,12 @@ function updateHudLayout() {
     // Do not overlap another pickup
     if (findPickupAtCell(col, row)) return false;
 
+    // Do not overlap a placed bait
+    if (findPlacedBaitAtCell(col, row)) return false;
+
     return true;
   }
+
 
   function spawnInitialPickupsRandom() {
     if (pickupsInitialized) return;
@@ -2048,14 +2226,18 @@ function updateHudLayout() {
 
     placePickups('medikit', INITIAL_MEDIKIT_PICKUPS);
     placePickups('ammo', INITIAL_AMMO_PICKUPS);
+    placePickups('bait', INITIAL_BAIT_PICKUPS);
 
     console.log(
       '[overlay] Initial pickups spawned:',
       INITIAL_MEDIKIT_PICKUPS,
       'medikits,',
       INITIAL_AMMO_PICKUPS,
-      'ammo.'
+      'ammo,',
+      INITIAL_BAIT_PICKUPS,
+      'bait.'
     );
+
   }
 
   function applyPickupBlink(el) {
@@ -2246,100 +2428,287 @@ function updateHudLayout() {
   }
 
   function stepBullets() {
-    if (!bulletsContainer || bullets.length === 0) return;
+  if (!bulletsContainer || bullets.length === 0) return;
 
-    const survivors = [];
+  const survivors = [];
 
-    for (let i = 0; i < bullets.length; i++) {
-      const b = bullets[i];
-      if (!b.alive || !b.el) {
-        if (b.el && b.el.parentNode) {
+  for (let i = 0; i < bullets.length; i++) {
+    const b = bullets[i];
+    if (!b.alive || !b.el) {
+      if (b.el && b.el.parentNode) {
+        b.el.parentNode.removeChild(b.el);
+      }
+      continue;
+    }
+
+    let alive = true;
+
+    // Each bullet can advance up to BULLET_STEPS_PER_TICK cells per world tick
+    for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
+      const nextCol = b.col + b.dx;
+      const nextRow = b.row + b.dy;
+
+      // Out of bounds
+      if (
+        nextCol < 0 ||
+        nextRow < 0 ||
+        nextCol >= gridCols ||
+        nextRow >= gridRows
+      ) {
+        if (b.el.parentNode) {
           b.el.parentNode.removeChild(b.el);
         }
-        continue;
+        alive = false;
+        break;
       }
 
-      let alive = true;
+      // --- NEW: bullet hits a bait (both guard and player bullets) ---
+      // If you want *only* guard bullets to damage bait, change the condition to:
+      // if (b.ownerType === 'guard') { ... }
+      const hitBait = findPlacedBaitAtCell(nextCol, nextRow);
+      if (hitBait) {
+        applyBaitHit(hitBait); // reduces HP and eventually killBait() + clearBaitAlertsForBait()
 
-      for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
-        const nextCol = b.col + b.dx;
-        const nextRow = b.row + b.dy;
+        if (b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        alive = false;
+        break;
+      }
+      // ----------------------------------------------------------------
 
-        // Out of bounds
-        if (
-          nextCol < 0 ||
-          nextRow < 0 ||
-          nextCol >= gridCols ||
-          nextRow >= gridRows
-        ) {
+      // Player hit (only for guard bullets)
+      if (
+        b.ownerType === 'guard' &&
+        nextCol === playerCol &&
+        nextRow === playerRow
+      ) {
+        applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
+        if (b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        alive = false;
+        break;
+      }
+
+      // Guard hit (only for player bullets)
+      if (b.ownerType === 'player') {
+        const hitGuard = findGuardAtCell(nextCol, nextRow);
+        if (hitGuard) {
+          applyGuardHit(hitGuard, b);
           if (b.el.parentNode) {
             b.el.parentNode.removeChild(b.el);
           }
           alive = false;
           break;
-        }
-
-        // Player hit (only for guard bullets)
-        if (
-          b.ownerType === 'guard' &&
-          nextCol === playerCol &&
-          nextRow === playerRow
-        ) {
-          applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
-          if (b.el.parentNode) {
-            b.el.parentNode.removeChild(b.el);
-          }
-          alive = false;
-          break;
-        }
-
-        // Guard hit (only for player bullets)
-        if (b.ownerType === 'player') {
-          const hitGuard = findGuardAtCell(nextCol, nextRow);
-          if (hitGuard) {
-            applyGuardHit(hitGuard, b);
-            if (b.el.parentNode) {
-              b.el.parentNode.removeChild(b.el);
-            }
-            alive = false;
-            break;
-          }
-        }
-
-        // Wall / Orca code hit
-        if (!isWalkable(nextCol, nextRow)) {
-          if (b.el.parentNode) {
-            b.el.parentNode.removeChild(b.el);
-          }
-          alive = false;
-          break;
-        }
-
-        // Move bullet forward
-        b.col = nextCol;
-        b.row = nextRow;
-
-        // Range handling for bullets that have it
-        if (typeof b.rangeLeft === 'number') {
-          b.rangeLeft--;
-          if (b.rangeLeft <= 0) {
-            if (b.el.parentNode) {
-              b.el.parentNode.removeChild(b.el);
-            }
-            alive = false;
-            break;
-          }
         }
       }
 
-      if (alive) {
-        updateBulletPosition(b);
-        survivors.push(b);
+      // Wall / Orca code hit
+      if (!isWalkable(nextCol, nextRow)) {
+        if (b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        alive = false;
+        break;
+      }
+
+      // Move bullet forward
+      b.col = nextCol;
+      b.row = nextRow;
+
+      // Range handling for bullets that have it
+      if (typeof b.rangeLeft === 'number') {
+        b.rangeLeft--;
+        if (b.rangeLeft <= 0) {
+          if (b.el.parentNode) {
+            b.el.parentNode.removeChild(b.el);
+          }
+          alive = false;
+          break;
+        }
       }
     }
 
-    bullets = survivors;
+    if (alive) {
+      updateBulletPosition(b);
+      survivors.push(b);
+    }
   }
+
+  bullets = survivors;
+}
+
+// --------------------------------------------------
+// Baits (placed decoys)
+// --------------------------------------------------
+
+function createPlacedBait(col, row) {
+  if (!baitsContainer) return null;
+
+  const cell = document.createElement('div');
+  cell.style.position = 'absolute';
+  cell.style.pointerEvents = 'none';
+
+  // INNER: solid equilateral triangle that spins clockwise
+  const inner = document.createElement('div');
+  inner.className = 'orca-stealth-bait-spin';
+  inner.style.position = 'absolute';
+  inner.style.left = '50%';
+  inner.style.top = '50%';
+
+  // Inner triangle clearly smaller than the cell
+  inner.style.width = '55%';
+  inner.style.height = '55%';
+  inner.style.transform = 'translate(-50%, -50%)';
+  inner.style.transformOrigin = '50% 50%';
+  inner.style.background = 'yellow';
+
+  // Upright equilateral triangle (approx. 60° angles)
+  inner.style.clipPath = 'polygon(50% 21%, 10% 90%, 90% 90%)';
+
+
+  // AURA: true triangular outline using inline SVG
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const aura = document.createElementNS(SVG_NS, 'svg');
+  aura.setAttribute('class', 'orca-stealth-bait-aura');
+  aura.setAttribute('viewBox', '0 0 100 100');
+
+  aura.style.position = 'absolute';
+  aura.style.left = '50%';
+  aura.style.top = '50%';
+
+  // Bigger than the cell so it clearly invades neighbouring cells
+  aura.style.width = '190%';
+  aura.style.height = '190%';
+  aura.style.transform = 'translate(-50%, -50%)';
+  aura.style.transformOrigin = '50% 50%';
+  aura.style.pointerEvents = 'none';
+
+  // Polygon: perfect triangle, stroke only, no fill
+  const poly = document.createElementNS(SVG_NS, 'polygon');
+  poly.setAttribute('points', '50,5 5,95 95,95');
+  poly.setAttribute('fill', 'none');
+  poly.setAttribute('stroke', 'yellow');
+  poly.setAttribute('stroke-width', '3');
+
+  aura.appendChild(poly);
+
+  // Start invisible if you fade it in via CSS animation
+  aura.style.opacity = '0.0';
+
+  // Draw order: aura behind, solid bait on top
+  cell.appendChild(aura);
+  cell.appendChild(inner);
+  baitsContainer.appendChild(cell);
+
+  const bait = {
+    id: nextBaitId++,
+    col,
+    row,
+    hp: BAIT_MAX_HP,
+    alive: true,
+    el: cell,
+    inner,
+    aura
+  };
+
+  baits.push(bait);
+  updateBaitPosition(bait);
+
+  console.log('[overlay] BAIT placed at', col, row, 'id=', bait.id);
+
+  return bait;
+}
+
+
+  function killBait(bait) {
+    if (!bait || !bait.alive) return;
+    bait.alive = false;
+    if (bait.el && bait.el.parentNode) {
+      bait.el.parentNode.removeChild(bait.el);
+    }
+    console.log('[overlay] BAIT destroyed at', bait.col, bait.row, 'id=', bait.id);
+    clearBaitAlertsForBait(bait.id);
+  }
+
+  function applyBaitHit(bait) {
+    if (!bait || !bait.alive) return;
+    bait.hp--;
+    if (bait.hp <= 0) {
+      killBait(bait);
+    } else {
+      if (bait.el) {
+        bait.el.style.opacity = '0.4';
+        setTimeout(() => {
+          if (bait.alive && bait.el) {
+            bait.el.style.opacity = '1.0';
+          }
+        }, 120);
+      }
+    }
+  }
+
+  function clearBaitAlertsForBait(baitId) {
+    // Arena: sector-based alerts
+    ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+      const sa = sectorAlerts[name];
+      if (!sa) return;
+      if (sa.source === 'bait' && sa.sourceBaitId === baitId) {
+        sa.state = 'idle';
+        sa.targetCol = null;
+        sa.targetRow = null;
+        sa.timer = 0;
+        sa.seeingNow = false;
+        sa.source = null;
+        sa.sourceBaitId = null;
+      }
+    });
+
+    // Dungeon: room-based alerts
+    for (const key in roomAlerts) {
+      const ra = roomAlerts[key];
+      if (!ra) continue;
+      if (ra.source === 'bait' && ra.sourceBaitId === baitId) {
+        ra.state = 'idle';
+        ra.targetCol = null;
+        ra.targetRow = null;
+        ra.timer = 0;
+        ra.seeingNow = false;
+        ra.source = null;
+        ra.sourceBaitId = null;
+      }
+    }
+
+    // Any guard still in alert with no active tracking goes back to patrol/return
+    guards.forEach((g) => {
+      if (g.state !== 'alert_chaser') return;
+
+      const layoutType = getLayoutType();
+      if (layoutType === 'dungeon') {
+        const key = getGuardRoomKey(g);
+        const ra = roomAlerts[key];
+        if (!ra || ra.state !== 'tracking') {
+          g.state = 'return_to_patrol';
+          g.path = null;
+          g.pathTargetCol = null;
+          g.pathTargetRow = null;
+        }
+      } else {
+        const s = getSector(g.col, g.row);
+        const sa = sectorAlerts[s];
+        if (!sa || sa.state !== 'tracking') {
+          g.state = 'return_to_patrol';
+          g.path = null;
+          g.pathTargetCol = null;
+          g.pathTargetRow = null;
+        }
+      }
+    });
+
+    updateModeVisual();
+  }
+
 
 
   // --------------------------------------------------
@@ -2545,25 +2914,34 @@ function updateHudLayout() {
     if (guard.state !== 'alert_chaser') return;
     if (guard.state === 'stunned' || guard.state === 'dead') return;
 
-
     if (guard.shootCooldown > 0) {
       guard.shootCooldown--;
       return;
     }
 
-    // Only shoot if currently seeing the player
-    if (!guard.seenPlayer) {
+    // Decide current target: player has priority, then bait
+    let targetCol = null;
+    let targetRow = null;
+
+    if (guard.seenPlayer) {
+      targetCol = playerCol;
+      targetRow = playerRow;
+    } else if (guard.seenBait && guard.seenBaitId != null) {
+      const bait = getBaitById(guard.seenBaitId);
+      if (!bait || !bait.alive) {
+        return;
+      }
+      targetCol = bait.col;
+      targetRow = bait.row;
+    } else {
       return;
     }
 
-    const realTargetCol = playerCol;
-    const realTargetRow = playerRow;
-
-    if (!hasLineOfShot(guard, realTargetCol, realTargetRow)) {
+    if (!hasLineOfShot(guard, targetCol, targetRow)) {
       return;
     }
 
-    spawnBulletFromGuard(guard, realTargetCol, realTargetRow);
+    spawnBulletFromGuard(guard, targetCol, targetRow);
   }
 
   // Line-of-sight for FOV: returns true only if all cells
@@ -2819,7 +3197,8 @@ function updateHudLayout() {
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') return;
 
-      const color = guard.seenPlayer
+      const isTrackingTarget = guard.seenPlayer || guard.seenBait;
+      const color = isTrackingTarget
         ? 'rgba(255, 64, 64, ' + baseAlpha + ')'
         : 'rgba(255, 0, 0, ' + baseAlpha + ')';
 
@@ -2835,6 +3214,7 @@ function updateHudLayout() {
       });
     });
   }
+
 
   function handleGuardSpotsPlayer(guard) {
     console.log(
@@ -2859,34 +3239,74 @@ function updateHudLayout() {
     manageMemory = !!manageMemory;
 
     let anySeen = false;
-    const sectorSaw = { NW: false, NE: false, SW: false, SE: false };
+    const sectorSawPlayer = { NW: false, NE: false, SW: false, SE: false };
+    const sectorSawBait   = { NW: false, NE: false, SW: false, SE: false };
+    const sectorTargetBait = { NW: null, NE: null, SW: null, SE: null };
 
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') {
         guard.fovCells = [];
         guard.wasSeeingPlayer = guard.seenPlayer;
+        guard.wasSeeingBait = guard.seenBait;
         guard.seenPlayer = false;
+        guard.seenBait = false;
+        guard.seenBaitId = null;
         return;
       }
 
       guard.fovCells = computeGuardFovCellsForGuard(guard);
-      const prevSeen = guard.seenPlayer;
-      const nextSeen = guard.fovCells.some(
+
+      const prevSeenPlayer = guard.seenPlayer;
+      const prevSeenBait   = guard.seenBait;
+
+      let nextSeenPlayer = false;
+      let seenBaitObj = null;
+
+      // Check player in FOV
+      nextSeenPlayer = guard.fovCells.some(
         (c) => c.col === playerCol && c.row === playerRow
       );
 
-      guard.wasSeeingPlayer = prevSeen;
-      guard.seenPlayer = nextSeen;
-
-      if (nextSeen) {
-        anySeen = true;
-        guard.lastSeenPlayerCol = playerCol;
-        guard.lastSeenPlayerRow = playerRow;
-        const s = getSector(guard.col, guard.row);
-        sectorSaw[s] = true;
+      // If no player, check for any alive bait in FOV
+      if (!nextSeenPlayer) {
+        for (let i = 0; i < guard.fovCells.length; i++) {
+          const cell = guard.fovCells[i];
+          const bait = findPlacedBaitAtCell(cell.col, cell.row);
+          if (bait && bait.alive) {
+            seenBaitObj = bait;
+            break;
+          }
+        }
       }
 
-      if (!prevSeen && nextSeen) {
+      guard.wasSeeingPlayer = prevSeenPlayer;
+      guard.wasSeeingBait = prevSeenBait;
+      guard.seenPlayer = nextSeenPlayer;
+      guard.seenBait = !!seenBaitObj;
+      guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
+
+      if (nextSeenPlayer || guard.seenBait) {
+        anySeen = true;
+      }
+
+      const s = getSector(guard.col, guard.row);
+
+      if (nextSeenPlayer) {
+        guard.lastSeenPlayerCol = playerCol;
+        guard.lastSeenPlayerRow = playerRow;
+        sectorSawPlayer[s] = true;
+      } else if (guard.seenBait && seenBaitObj) {
+        sectorSawBait[s] = true;
+        if (!sectorTargetBait[s]) {
+          sectorTargetBait[s] = {
+            col: seenBaitObj.col,
+            row: seenBaitObj.row,
+            baitId: seenBaitObj.id
+          };
+        }
+      }
+
+      if (!prevSeenPlayer && nextSeenPlayer) {
         handleGuardSpotsPlayer(guard);
       }
     });
@@ -2895,48 +3315,70 @@ function updateHudLayout() {
     ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
       const sa = sectorAlerts[name];
       if (!sa) return;
-      sa.seeingNow = !!sectorSaw[name];
+      sa.seeingNow = !!sectorSawPlayer[name] || !!sectorSawBait[name];
     });
 
     if (manageMemory) {
-      // Update sector states with 3s memory
+      // Update sector states with memory, for both player and bait
       ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
         const sa = sectorAlerts[name];
         if (!sa) return;
 
-        if (sectorSaw[name]) {
-          // At least one guard in this sector sees the player now
+        const sawPlayer = !!sectorSawPlayer[name];
+        const sawBait = !!sectorSawBait[name];
+
+        if (sawPlayer) {
+          // Player has priority over bait
           sa.state = 'tracking';
           sa.targetCol = playerCol;
           sa.targetRow = playerRow;
           sa.timer = ALERT_MEMORY_TICKS;
+          sa.source = 'player';
+          sa.sourceBaitId = null;
+        } else if (sawBait) {
+          sa.state = 'tracking';
+          const info = sectorTargetBait[name];
+          if (info) {
+            sa.targetCol = info.col;
+            sa.targetRow = info.row;
+            sa.source = 'bait';
+            sa.sourceBaitId = info.baitId;
+          } else {
+            sa.targetCol = null;
+            sa.targetRow = null;
+            sa.source = 'bait';
+            sa.sourceBaitId = null;
+          }
+          sa.timer = ALERT_MEMORY_TICKS;
         } else if (sa.state === 'tracking') {
-          // Sector was tracking, but no one sees the player this tick
+          // Sector was tracking: decay memory
           if (sa.timer > 0) {
             sa.timer--;
 
             if (sa.timer > 0) {
-              // Behaviour depends on ALERT_TARGET_MODE:
-              //  - 'realtime'  -> keep following the live player position
-              //  - 'last_seen' -> keep the last stored target (no update here)
-              if (ALERT_TARGET_MODE === 'realtime') {
+              if (sa.source === 'player' && ALERT_TARGET_MODE === 'realtime') {
                 sa.targetCol = playerCol;
                 sa.targetRow = playerRow;
               }
+              // For bait, keep last target; baits do not move.
             } else {
               sa.state = 'idle';
               sa.targetCol = null;
               sa.targetRow = null;
+              sa.source = null;
+              sa.sourceBaitId = null;
             }
           } else {
             sa.state = 'idle';
             sa.targetCol = null;
             sa.targetRow = null;
+            sa.source = null;
+            sa.sourceBaitId = null;
           }
         }
       });
 
-      // Global alert: on if any guard sees OR at least one sector is tracking
+      // Global alert: on if any guard sees player/bait OR at least one sector is tracking
       const trackingNow =
         sectorAlerts.NW.state === 'tracking' ||
         sectorAlerts.NE.state === 'tracking' ||
@@ -2955,7 +3397,7 @@ function updateHudLayout() {
         if (sa && sa.state === 'tracking') {
           g.state = 'alert_chaser';
         } else {
-          if (g.state === 'alert_chaser' && !g.seenPlayer) {
+          if (g.state === 'alert_chaser' && !g.seenPlayer && !g.seenBait) {
             g.state = 'return_to_patrol';
             g.path = null;
             g.pathTargetCol = null;
@@ -2971,73 +3413,134 @@ function updateHudLayout() {
     renderGuardFov();
   }
 
+
+    // Dungeon: room-based alert logic.
     // Dungeon: room-based alert logic.
   function updateAllFovAndAlertDungeon(manageMemory) {
     manageMemory = !!manageMemory;
 
     let anySeen = false;
-    const roomsSaw = {}; // roomKey -> true
+    const roomsSawPlayer = {};
+    const roomsSawBait = {};
+    const roomTargetBait = {};
 
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') {
         guard.fovCells = [];
         guard.wasSeeingPlayer = guard.seenPlayer;
+        guard.wasSeeingBait = guard.seenBait;
         guard.seenPlayer = false;
+        guard.seenBait = false;
+        guard.seenBaitId = null;
         return;
       }
 
       guard.fovCells = computeGuardFovCellsForGuard(guard);
-      const prevSeen = guard.seenPlayer;
-      const nextSeen = guard.fovCells.some(
+
+      const prevSeenPlayer = guard.seenPlayer;
+      const prevSeenBait   = guard.seenBait;
+
+      let nextSeenPlayer = false;
+      let seenBaitObj = null;
+
+      nextSeenPlayer = guard.fovCells.some(
         (c) => c.col === playerCol && c.row === playerRow
       );
 
-      guard.wasSeeingPlayer = prevSeen;
-      guard.seenPlayer = nextSeen;
-
-      if (nextSeen) {
-        anySeen = true;
-        guard.lastSeenPlayerCol = playerCol;
-        guard.lastSeenPlayerRow = playerRow;
-
-        const roomKey = getGuardRoomKey(guard);
-        if (roomKey) {
-          roomsSaw[roomKey] = true;
+      if (!nextSeenPlayer) {
+        for (let i = 0; i < guard.fovCells.length; i++) {
+          const cell = guard.fovCells[i];
+          const bait = findPlacedBaitAtCell(cell.col, cell.row);
+          if (bait && bait.alive) {
+            seenBaitObj = bait;
+            break;
+          }
         }
       }
 
-      if (!prevSeen && nextSeen) {
+      guard.wasSeeingPlayer = prevSeenPlayer;
+      guard.wasSeeingBait = prevSeenBait;
+      guard.seenPlayer = nextSeenPlayer;
+      guard.seenBait = !!seenBaitObj;
+      guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
+
+      if (nextSeenPlayer || guard.seenBait) {
+        anySeen = true;
+      }
+
+      const roomKey = getGuardRoomKey(guard);
+      if (roomKey) {
+        if (nextSeenPlayer) {
+          roomsSawPlayer[roomKey] = true;
+        } else if (guard.seenBait && seenBaitObj) {
+          roomsSawBait[roomKey] = true;
+          if (!roomTargetBait[roomKey]) {
+            roomTargetBait[roomKey] = {
+              col: seenBaitObj.col,
+              row: seenBaitObj.row,
+              baitId: seenBaitObj.id
+            };
+          }
+        }
+      }
+
+      if (!prevSeenPlayer && nextSeenPlayer) {
         handleGuardSpotsPlayer(guard);
       }
     });
 
     if (manageMemory) {
-      // Ensure entries for rooms that saw the player
-      for (const key in roomsSaw) {
+      // Ensure entries for rooms that saw something
+      const allKeys = new Set([
+        ...Object.keys(roomsSawPlayer),
+        ...Object.keys(roomsSawBait)
+      ]);
+
+      allKeys.forEach((key) => {
         if (!roomAlerts[key]) {
           roomAlerts[key] = {
             state: 'idle',
             targetCol: null,
             targetRow: null,
             timer: 0,
-            seeingNow: false
+            seeingNow: false,
+            source: null,
+            sourceBaitId: null
           };
         }
-      }
+      });
 
       // Update alert/memory state per room
       for (const key in roomAlerts) {
         const ra = roomAlerts[key];
         if (!ra) continue;
 
-        // Who is currently seeing the player in this room?
-        ra.seeingNow = !!roomsSaw[key];
+        const sawPlayer = !!roomsSawPlayer[key];
+        const sawBait = !!roomsSawBait[key];
 
-        if (roomsSaw[key]) {
-          // At least one guard in this room sees the player
+        ra.seeingNow = sawPlayer || sawBait;
+
+        if (sawPlayer) {
           ra.state = 'tracking';
           ra.targetCol = playerCol;
           ra.targetRow = playerRow;
+          ra.timer = ALERT_MEMORY_TICKS;
+          ra.source = 'player';
+          ra.sourceBaitId = null;
+        } else if (sawBait) {
+          ra.state = 'tracking';
+          const info = roomTargetBait[key];
+          if (info) {
+            ra.targetCol = info.col;
+            ra.targetRow = info.row;
+            ra.source = 'bait';
+            ra.sourceBaitId = info.baitId;
+          } else {
+            ra.targetCol = null;
+            ra.targetRow = null;
+            ra.source = 'bait';
+            ra.sourceBaitId = null;
+          }
           ra.timer = ALERT_MEMORY_TICKS;
         } else if (ra.state === 'tracking') {
           // Room was tracking: decay memory
@@ -3048,17 +3551,21 @@ function updateHudLayout() {
               ra.targetCol = null;
               ra.targetRow = null;
               ra.timer = 0;
+              ra.source = null;
+              ra.sourceBaitId = null;
             }
           } else {
             ra.state = 'idle';
             ra.targetCol = null;
             ra.targetRow = null;
             ra.timer = 0;
+            ra.source = null;
+            ra.sourceBaitId = null;
           }
         }
       }
 
-      // Global alert: on if any room is tracking or any guard sees the player
+      // Global alert: on if any room is tracking or any guard sees player/bait
       let trackingNow = false;
       for (const key in roomAlerts) {
         const ra = roomAlerts[key];
@@ -3081,8 +3588,8 @@ function updateHudLayout() {
           // Only guards whose room is in alert become (or stay) chasers
           g.state = 'alert_chaser';
         } else {
-          // Room is idle: if guard was in alert and no longer sees player, send it home
-          if (g.state === 'alert_chaser' && !g.seenPlayer) {
+          // Room is idle: if guard was in alert and no longer sees player/bait, send it home
+          if (g.state === 'alert_chaser' && !g.seenPlayer && !g.seenBait) {
             g.state = 'return_to_patrol';
             g.path = null;
             g.pathTargetCol = null;
@@ -3620,7 +4127,7 @@ function updateHudLayout() {
     });
   }
 
-    function computePreferredAlertTarget(guard) {
+  function computePreferredAlertTarget(guard) {
     const layoutType = getLayoutType();
 
     // Dungeon: room-based behaviour + optional last_seen targeting
@@ -3628,22 +4135,30 @@ function updateHudLayout() {
       const roomKey = getGuardRoomKey(guard);
       const ra = roomAlerts[roomKey];
 
-      // Base target: live player position
-      let px = playerCol;
-      let py = playerRow;
+      let px;
+      let py;
 
-      // In 'last_seen' mode, when no one in the room is currently seeing the player
-      // but the room is still tracking, chase the last seen position instead.
-      if (
-        ALERT_TARGET_MODE === 'last_seen' &&
-        ra &&
-        ra.state === 'tracking' &&
-        ra.seeingNow !== true &&
-        typeof ra.targetCol === 'number' &&
-        typeof ra.targetRow === 'number'
-      ) {
+      if (ra && ra.state === 'tracking' && ra.source === 'bait' &&
+          typeof ra.targetCol === 'number' && typeof ra.targetRow === 'number') {
+        // Chase bait position
         px = ra.targetCol;
         py = ra.targetRow;
+      } else {
+        // Base target: live player position
+        px = playerCol;
+        py = playerRow;
+
+        if (
+          ALERT_TARGET_MODE === 'last_seen' &&
+          ra &&
+          ra.state === 'tracking' &&
+          ra.seeingNow !== true &&
+          typeof ra.targetCol === 'number' &&
+          typeof ra.targetRow === 'number'
+        ) {
+          px = ra.targetCol;
+          py = ra.targetRow;
+        }
       }
 
       const slotDir = guard.preferredCardinal || 'N';
@@ -3699,20 +4214,31 @@ function updateHudLayout() {
       return { col: guard.col, row: guard.row };
     }
 
-    // Base target: live player position
-    let px = playerCol;
-    let py = playerRow;
+    let px;
+    let py;
 
-    // In 'last_seen' mode, if this sector is in memory (tracking but no one sees now),
-    // use the stored last seen position instead (if available).
-    if (
-      ALERT_TARGET_MODE === 'last_seen' &&
-      sa.seeingNow !== true &&
-      typeof sa.targetCol === 'number' &&
-      typeof sa.targetRow === 'number'
-    ) {
+    if (sa.source === 'bait' &&
+        typeof sa.targetCol === 'number' &&
+        typeof sa.targetRow === 'number') {
+      // Chase bait position
       px = sa.targetCol;
       py = sa.targetRow;
+    } else {
+      // Base target: live player position
+      px = playerCol;
+      py = playerRow;
+
+      // In 'last_seen' mode, if this sector is in memory (tracking but no one sees now),
+      // use the stored last seen position instead (if available).
+      if (
+        ALERT_TARGET_MODE === 'last_seen' &&
+        sa.seeingNow !== true &&
+        typeof sa.targetCol === 'number' &&
+        typeof sa.targetRow === 'number'
+      ) {
+        px = sa.targetCol;
+        py = sa.targetRow;
+      }
     }
 
     const slotDir = guard.preferredCardinal || 'N';
@@ -3758,111 +4284,156 @@ function updateHudLayout() {
     return { col: px, row: py };
   }
 
-  // --------------------------------------------------
-  // Alert / chasing behavior (uses BFS towards preferred target)
-  // --------------------------------------------------
 
-  function stepGuardAlert(guard) {
-    if (guard.state === 'stunned') return;
+// --------------------------------------------------
+// Alert / chasing behavior (uses BFS towards preferred target)
+// --------------------------------------------------
 
-    const layoutType = getLayoutType();
+function stepGuardAlert(guard) {
+  if (guard.state === 'stunned') return;
 
-    // Arena: keep sector gate; Dungeon: FSM is driven by roomAlerts, so skip it.
-    if (layoutType !== 'dungeon') {
-      const sectorName = getSector(guard.col, guard.row);
-      const sa = sectorAlerts[sectorName];
+  const layoutType = getLayoutType();
 
-      if (!sa || sa.state !== 'tracking') {
-        // Sector not in alert: back to patrol
-        guard.state = 'patrol';
-        guard.path = null;
-        guard.pathTargetCol = null;
-        guard.pathTargetRow = null;
-        updateGuardPosition(guard);
-        return;
-      }
-    }
+  // Arena: keep sector gate; Dungeon: FSM is driven by roomAlerts, so skip it.
+  if (layoutType !== 'dungeon') {
+    const sectorName = getSector(guard.col, guard.row);
+    const sa = sectorAlerts[sectorName];
 
-    // If this guard currently sees the real player, stop rushing closer:
-    // just orient, and if needed, try a very small local reposition
-    // to get line-of-shot.
-    if (guard.seenPlayer) {
-      const tx = playerCol;
-      const ty = playerRow;
-     
-      aimGuardAtTarget(guard, tx, ty);
-
-      // Already have line-of-shot -> stand and shoot from here
-      if (hasLineOfShot(guard, tx, ty)) {
-        updateGuardLookDirection(guard);
-        updateGuardPosition(guard);
-        return;
-      }
-
-      // Try tiny local moves (4-neighborhood) to gain line-of-shot
-      const localDirs = [
-        { dx: 1, dy: 0 },
-        { dx: -1, dy: 0 },
-        { dx: 0, dy: 1 },
-        { dx: 0, dy: -1 }
-      ];
-
-      for (let i = 0; i < localDirs.length; i++) {
-        const d = localDirs[i];
-        const nc = guard.col + d.dx;
-        const nr = guard.row + d.dy;
-
-        if (nc < 0 || nr < 0 || nc >= gridCols || nr >= gridRows) continue;
-        if (nc === playerCol && nr === playerRow) continue;
-        if (!isWalkable(nc, nr)) continue;
-        if (isCellOccupiedByOtherGuard(nc, nr, guard)) continue;
-
-        const tmp = { col: nc, row: nr };
-        if (!hasLineOfShot(tmp, tx, ty)) continue;
-
-        guard.col = nc;
-        guard.row = nr;
-        aimGuardAtTarget(guard, tx, ty);
-        clampGuard(guard);
-        updateGuardPosition(guard);
-        updateGuardLookDirection(guard);
-        return;
-      }
-
-      // Cannot improve, stay still and keep looking
-      updateGuardLookDirection(guard);
+    if (!sa || sa.state !== 'tracking') {
+      // Sector not in alert: back to patrol
+      guard.state = 'patrol';
+      guard.path = null;
+      guard.pathTargetCol = null;
+      guard.pathTargetRow = null;
       updateGuardPosition(guard);
       return;
     }
-
-    // Guard does NOT currently see the player but sector is tracking:
-    // chase towards a preferred cardinal shooting slot around the player.
-    const preferred = computePreferredAlertTarget(guard);
-    const targetCol = preferred.col;
-    const targetRow = preferred.row;
-
-    aimGuardAtTarget(guard, playerCol, playerRow);
-
-    ensureGuardPath(guard, targetCol, targetRow);
-
-    if (!guard.path) {
-      // Cannot find path: just look around in place
-      updateGuardLookDirection(guard);
-      updateGuardPosition(guard);
-      return;
-    }
-
-    const moved = stepGuardAlongPath(guard);
-    if (!moved) {
-      updateGuardLookDirection(guard);
-      updateGuardPosition(guard);
-      return;
-    }
-
-    updateGuardLookDirection(guard);
   }
 
-    function stepGuardReturnToPatrol(guard) {
+  // -------------------------------------------------------
+  // 1) Decide current "focus target":
+  //    - player has priority if visible
+  //    - otherwise, if a bait is visible, treat it exactly
+  //      like the player (same behaviour, same micro-moves).
+  // -------------------------------------------------------
+  let targetType = null;      // "player" | "bait" | null
+  let tx = null;
+  let ty = null;
+
+  if (guard.seenPlayer) {
+    // Player in FOV: highest priority
+    targetType = 'player';
+    tx = playerCol;
+    ty = playerRow;
+  } else if (guard.seenBait && guard.seenBaitId != null) {
+    // No player, but a bait is in FOV: use that as focus
+    const bait = getBaitById(guard.seenBaitId);
+    if (bait && bait.alive) {
+      targetType = 'bait';
+      tx = bait.col;
+      ty = bait.row;
+    }
+  }
+
+  // -------------------------------------------------------
+  // 2) If we see a focus target (player or bait),
+  //    FIRST try local solution:
+  //      - orient towards it
+  //      - try tiny local moves to gain line-of-shot
+  //    If that fails, we NOW FALL THROUGH to BFS chasing
+  //    instead of freezing in place.
+  // -------------------------------------------------------
+  if (targetType) {
+    // Aim at the current focus (player or bait)
+    aimGuardAtTarget(guard, tx, ty);
+
+    // Already have line-of-shot -> stand here and shoot
+    if (hasLineOfShot(guard, tx, ty)) {
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      return;
+    }
+
+    // Try tiny local moves (4-neighborhood) to gain line-of-shot
+    const localDirs = [
+      { dx: 1, dy: 0 },
+      { dx: -1, dy: 0 },
+      { dx: 0, dy: 1 },
+      { dx: 0, dy: -1 }
+    ];
+
+    for (let i = 0; i < localDirs.length; i++) {
+      const d = localDirs[i];
+      const nc = guard.col + d.dx;
+      const nr = guard.row + d.dy;
+
+      if (nc < 0 || nr < 0 || nc >= gridCols || nr >= gridRows) continue;
+
+      // Do not intentionally step on the target cell itself
+      // (works for both player and bait).
+      if (nc === tx && nr === ty) continue;
+
+      if (!isWalkable(nc, nr)) continue;
+      if (isCellOccupiedByOtherGuard(nc, nr, guard)) continue;
+
+      const tmp = { col: nc, row: nr };
+      if (!hasLineOfShot(tmp, tx, ty)) continue;
+
+      // This local step improves line-of-shot, take it
+      guard.col = nc;
+      guard.row = nr;
+      aimGuardAtTarget(guard, tx, ty);
+      clampGuard(guard);
+      updateGuardPosition(guard);
+      updateGuardLookDirection(guard);
+      return;
+    }
+
+    // IMPORTANT CHANGE:
+    // Old behaviour here was:
+    //   "Cannot improve: stay still, keep looking at the target" + return;
+    // That caused guards to freeze when the bait/player was visible
+    // but unreachable from any adjacent tile.
+    //
+    // Now we DO NOT return here: we fall through to the BFS logic
+    // below, so the guard can try to reposition more aggressively
+    // (e.g., turning corners, navigating narrow corridors, etc.).
+  }
+
+  // -------------------------------------------------------
+  // 3) We do NOT currently have a good shooting position:
+  //    -> chase towards a preferred cardinal slot around
+  //       the current alert target (player or bait), based
+  //       on sector / room alert data.
+  // -------------------------------------------------------
+  const preferred = computePreferredAlertTarget(guard);
+  const targetCol = preferred.col;
+  const targetRow = preferred.row;
+
+  // Face the current alert target slot
+  // (in dungeon mode this comes from roomAlerts).
+  aimGuardAtTarget(guard, targetCol, targetRow);
+
+  ensureGuardPath(guard, targetCol, targetRow);
+
+  if (!guard.path) {
+    // Cannot find path: just look around in place
+    updateGuardLookDirection(guard);
+    updateGuardPosition(guard);
+    return;
+  }
+
+  const moved = stepGuardAlongPath(guard);
+  if (!moved) {
+    updateGuardLookDirection(guard);
+    updateGuardPosition(guard);
+    return;
+  }
+
+  updateGuardLookDirection(guard);
+}
+
+  function stepGuardReturnToPatrol(guard) {
     // If no valid home is defined, fall back to patrol
     if (typeof guard.homeCol !== 'number' || typeof guard.homeRow !== 'number') {
       guard.state = 'patrol';
@@ -3991,7 +4562,7 @@ function updateHudLayout() {
   }
 
 
-    // Force a guard that is stuck for too long to "try hard":
+  // Force a guard that is stuck for too long to "try hard":
   // teleport back to a safe walkable cell inside its patrol rect.
   function forceGuardTryHard(guard) {
     if (!guard) return;
@@ -4216,7 +4787,7 @@ function updateHudLayout() {
   }
 
   function applyPickupEffect(pickup) {
-    if (!pickup) return;
+    if (!pickup) return false; // false = not consumed
 
     if (pickup.type === 'medikit') {
       if (playerHP < playerHPMax) {
@@ -4229,22 +4800,51 @@ function updateHudLayout() {
           playerHPMax
         );
         updateModeVisual();
+        return true; // consumed
       } else {
         console.log(
-          '[overlay] PLAYER picked MEDIKIT but HP already full.'
+          '[overlay] PLAYER stepped on MEDIKIT but HP already full. Pickup stays on map.'
         );
+        return false;
       }
     } else if (pickup.type === 'ammo') {
-      playerAmmo += 2;
-      if (playerAmmo > playerAmmoMax) playerAmmo = playerAmmoMax;
-      console.log(
-        '[overlay] PLAYER picked AMMO. Ammo:',
-        playerAmmo,
-        '/',
-        playerAmmoMax
-      );
-      updateModeVisual();
+      if (playerAmmo < playerAmmoMax) {
+        playerAmmo += 2;
+        if (playerAmmo > playerAmmoMax) playerAmmo = playerAmmoMax;
+        console.log(
+          '[overlay] PLAYER picked AMMO. Ammo:',
+          playerAmmo,
+          '/',
+          playerAmmoMax
+        );
+        updateModeVisual();
+        return true; // consumed
+      } else {
+        console.log(
+          '[overlay] PLAYER stepped on AMMO but ammo already full. Pickup stays on map.'
+        );
+        return false;
+      }
+    } else if (pickup.type === 'bait') {
+      if (playerBaits < PLAYER_BAIT_MAX) {
+        playerBaits++;
+        console.log(
+          '[overlay] PLAYER picked BAIT. Baits:',
+          playerBaits,
+          '/',
+          PLAYER_BAIT_MAX
+        );
+        updateModeVisual();
+        return true; // consumed
+      } else {
+        console.log(
+          '[overlay] PLAYER stepped on BAIT but inventory is full. Pickup stays on map.'
+        );
+        return false;
+      }
     }
+
+    return false;
   }
 
   function checkPickupCollisions() {
@@ -4252,11 +4852,13 @@ function updateHudLayout() {
       const p = pickups[i];
       if (p.collected) continue;
       if (p.col === playerCol && p.row === playerRow) {
-        p.collected = true;
-        if (p.el && p.el.parentNode) {
-          p.el.parentNode.removeChild(p.el);
+        const consumed = applyPickupEffect(p);
+        if (consumed) {
+          p.collected = true;
+          if (p.el && p.el.parentNode) {
+            p.el.parentNode.removeChild(p.el);
+          }
         }
-        applyPickupEffect(p);
       }
     }
   }
@@ -4424,6 +5026,10 @@ function updateHudLayout() {
 
     // 7) Blink pickups
     updatePickupsBlink();
+
+    // 8) Player blink while invulnerable
+    updatePlayerBlink();
+
   }
 
 
@@ -4513,7 +5119,7 @@ function updateHudLayout() {
       return;
     }
 
-    // Block everything else, except arrows and A / shoot keys
+    // Block everything else, except arrows, A, shoot keys, D
     ev.preventDefault();
     ev.stopPropagation();
 
@@ -4531,17 +5137,68 @@ function updateHudLayout() {
     } else if (PLAYER_SHOOT_KEYS.indexOf(key) !== -1) {
       // Player shoots in the facing direction
       spawnBulletFromPlayer();
+    } else if (key === 'd' || key === 'D') {
+      // Place bait in front of the player (if any available)
+      placeBaitInFrontOfPlayer();
     } else {
 
       if (DEBUG) {
         console.log(
-          '[overlay] Key blocked in GAME mode (not arrows, not Space/A):',
+          '[overlay] Key blocked in GAME mode (not arrows, not Space/A/S/D):',
           key
         );
       }
       return;
     }
   }
+
+
+  function placeBaitInFrontOfPlayer() {
+    // No baits in inventory
+    if (playerBaits <= 0) {
+      console.log('[overlay] PLAYER tried to place BAIT but inventory is empty.');
+      return;
+    }
+
+    // Do not place if game is over
+    if (isGameOver) return;
+
+    let dx = 0;
+    let dy = 0;
+    if (playerDir === 'up') {
+      dy = -1;
+    } else if (playerDir === 'down') {
+      dy = 1;
+    } else if (playerDir === 'left') {
+      dx = -1;
+    } else if (playerDir === 'right') {
+      dx = 1;
+    }
+
+    const targetCol = playerCol + dx;
+    const targetRow = playerRow + dy;
+
+    if (
+      targetCol < 0 ||
+      targetRow < 0 ||
+      targetCol >= gridCols ||
+      targetRow >= gridRows
+    ) {
+      return;
+    }
+
+    // Use same constraints as pickups: walkable, no guard, no other bait, no pickup, no player
+    if (!isCellFreeForPickup(targetCol, targetRow)) {
+      console.log('[overlay] Cannot place BAIT on non-free cell at', targetCol, targetRow);
+      return;
+    }
+
+    createPlacedBait(targetCol, targetRow);
+    playerBaits--;
+    if (playerBaits < 0) playerBaits = 0;
+    updateModeVisual();
+  }
+
 
   // --------------------------------------------------
   // Init
