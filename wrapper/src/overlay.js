@@ -54,6 +54,10 @@
   const PATROL_STEPS_PER_TICK = 1;    // patrol speed
   const ALERT_STEPS_PER_TICK  = 2;    // alert / chasing speed
 
+  // Extra speed multiplier when a guard spots a dead guard ("corpse alert")
+  const CORPSE_ALERT_SPEED_MULT = 1.5; // +50% speed, tweak here
+  const GUARD_ANIM_MIN_STEP_MS = 40;   // min ms per sub-step when animating fast moves
+
   // Bullets
   const BULLET_STEPS_PER_TICK       = 4;  // cells per tick
   const GUARD_FIRE_COOLDOWN_TICKS   = 2;  // ticks between shots (~1s at 250ms)
@@ -506,10 +510,13 @@
       sectorAlerts.SW.sourceBaitId =
       sectorAlerts.SE.sourceBaitId = null;
 
+    sectorAlerts.NW.corpseBoost =
+      sectorAlerts.NE.corpseBoost =
+      sectorAlerts.SW.corpseBoost =
+      sectorAlerts.SE.corpseBoost = 1.0;
 
 
     // --- PICKUPS FIX ---
-
 
     // Remove any pickups that were spawned before (random defaults, etc.)
     clearAllPickups();
@@ -567,7 +574,6 @@
   // --------------------------------------------------
   // Overlay state
   // --------------------------------------------------
-
   // 'edit' | 'game'
   let mode = 'edit';
 
@@ -576,6 +582,7 @@
   let isGameOver = false;
 
   let overlayDiv = null;
+  let alertAreasContainer = null;
   let guardsContainer = null;
   let fovContainer = null;
   let bulletsContainer = null;
@@ -659,14 +666,49 @@
   //   targetCol/Row: last known player position (for memory)
   //   timer: memory countdown
   //   seeingNow: true if at least one guard in this sector sees the player this tick
-  const sectorAlerts = {
-    NW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
-    NE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
-    SW: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null },
-    SE: { state: 'idle', targetCol: null, targetRow: null, timer: 0, seeingNow: false, source: null, sourceBaitId: null }
+   const sectorAlerts = {
+    NW: {
+      state: 'idle',
+      targetCol: null,
+      targetRow: null,
+      timer: 0,
+      seeingNow: false,
+      source: null,
+      sourceBaitId: null,
+      // Permanent speed boost multiplier for this sector when a corpse is spotted
+      corpseBoost: 1.0
+    },
+    NE: {
+      state: 'idle',
+      targetCol: null,
+      targetRow: null,
+      timer: 0,
+      seeingNow: false,
+      source: null,
+      sourceBaitId: null,
+      corpseBoost: 1.0
+    },
+    SW: {
+      state: 'idle',
+      targetCol: null,
+      targetRow: null,
+      timer: 0,
+      seeingNow: false,
+      source: null,
+      sourceBaitId: null,
+      corpseBoost: 1.0
+    },
+    SE: {
+      state: 'idle',
+      targetCol: null,
+      targetRow: null,
+      timer: 0,
+      seeingNow: false,
+      source: null,
+      sourceBaitId: null,
+      corpseBoost: 1.0
+    }
   };
-
-
 
   // Room-based alert states (used only in dungeon layout).
   // Key format: "minCol,maxCol,minRow,maxRow"
@@ -878,6 +920,16 @@
       document.head.appendChild(existingStyle);
     }
 
+    // Alert areas container (red tinted rectangles per room/sector)
+    alertAreasContainer = document.createElement('div');
+    alertAreasContainer.id = 'orca-stealth-alert-areas';
+    alertAreasContainer.style.position = 'absolute';
+    alertAreasContainer.style.left = '0';
+    alertAreasContainer.style.top = '0';
+    alertAreasContainer.style.width = '100%';
+    alertAreasContainer.style.height = '100%';
+    alertAreasContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(alertAreasContainer);
 
     // FOV container (under guards and player)
     fovContainer = document.createElement('div');
@@ -1070,10 +1122,14 @@
         gameOverDiv.style.display = 'flex';
       }
 
+      // Clear local alert areas when game is over
+      clearAlertAreas();
+
       // Re-position HUD after any change
       updateHudLayout();
       return;
     }
+
 
     // Hide GAME OVER overlay in normal play/edit
     if (gameOverDiv) {
@@ -1103,11 +1159,10 @@
     } else {
 
       const alertText = inAlert ? 'ALERT' : 'STEALTH';
-      if (inAlert) {
-        overlayDiv.style.background = 'rgba(255, 64, 64, 0.14)';
-      } else {
-        overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
-      }
+
+      // Base background stays neutral; red tint is now drawn per room/sector
+      overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
+
       if (hud) {
         hud.textContent =
           '[MODE: GAME] HP ' +
@@ -1132,7 +1187,88 @@
 
     // Re-position HUD after any change
     updateHudLayout();
+
+    // Re-render alert areas for current alert state
+    renderAlertAreas();
   }
+
+  function clearAlertAreas() {
+    if (!alertAreasContainer) return;
+    while (alertAreasContainer.firstChild) {
+      alertAreasContainer.removeChild(alertAreasContainer.firstChild);
+    }
+  }
+
+  function createAlertAreaRect(minCol, maxCol, minRow, maxRow) {
+    if (!alertAreasContainer) return;
+    if (cellW <= 0 || cellH <= 0) return;
+
+    const div = document.createElement('div');
+    div.style.position = 'absolute';
+    div.style.left = (minCol * cellW) + 'px';
+    div.style.top = (minRow * cellH) + 'px';
+    div.style.width = ((maxCol - minCol + 1) * cellW) + 'px';
+    div.style.height = ((maxRow - minRow + 1) * cellH) + 'px';
+    // Same tint as previous full-grid alert background
+    div.style.background = 'rgba(255, 64, 64, 0.14)';
+    div.style.pointerEvents = 'none';
+
+    alertAreasContainer.appendChild(div);
+  }
+
+  // Draw red tinted overlay only on alert rooms/sectors
+  function renderAlertAreas() {
+    if (!alertAreasContainer) return;
+
+    clearAlertAreas();
+
+    if (mode !== 'game') return;
+    if (cellW <= 0 || cellH <= 0) return;
+
+    const layoutType = getLayoutType();
+
+    if (layoutType === 'dungeon') {
+      // Rooms: keys "minCol,maxCol,minRow,maxRow"
+      for (const key in roomAlerts) {
+        const ra = roomAlerts[key];
+        if (!ra || ra.state !== 'tracking') continue;
+
+        const parts = key.split(',');
+        if (parts.length !== 4) continue;
+
+        const minCol = parseInt(parts[0], 10);
+        const maxCol = parseInt(parts[1], 10);
+        const minRow = parseInt(parts[2], 10);
+        const maxRow = parseInt(parts[3], 10);
+
+        if (!isFinite(minCol) || !isFinite(maxCol) ||
+            !isFinite(minRow) || !isFinite(maxRow)) {
+          continue;
+        }
+
+        createAlertAreaRect(minCol, maxCol, minRow, maxRow);
+      }
+    } else {
+      // Arena: static quadrants based on midCol/midRow
+      const sectorRects = {
+        NW: { minCol: 0,       maxCol: midCol - 1,    minRow: 0,        maxRow: midRow - 1 },
+        NE: { minCol: midCol,  maxCol: gridCols - 1,  minRow: 0,        maxRow: midRow - 1 },
+        SW: { minCol: 0,       maxCol: midCol - 1,    minRow: midRow,   maxRow: gridRows - 1 },
+        SE: { minCol: midCol,  maxCol: gridCols - 1,  minRow: midRow,   maxRow: gridRows - 1 }
+      };
+
+      ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
+        const sa = sectorAlerts[name];
+        if (!sa || sa.state !== 'tracking') return;
+
+        const rect = sectorRects[name];
+        if (!rect) return;
+
+        createAlertAreaRect(rect.minCol, rect.maxCol, rect.minRow, rect.maxRow);
+      });
+    }
+  }
+
 
 
 
@@ -1825,8 +1961,12 @@ function updateHudLayout() {
     // only FOV, no alert memory
     updateAllFovAndAlert(false);
 
+    // Redraw local alert areas with new geometry
+    renderAlertAreas();
+
     // Re-position HUD according to new canvas size / grid
     updateHudLayout();
+
 
     // Spawn adjustment: run once per levelConfig (reset in applyExternalLevelConfig)
     if (!guardSpawnsInitialized) {
@@ -1936,6 +2076,58 @@ function updateHudLayout() {
     }
     return null;
   }
+
+  // Find a *dead* guard at given cell (used for corpse-alert logic)
+  function findDeadGuardAtCell(col, row) {
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (g.state !== 'dead') continue;
+      if (g.col === col && g.row === row) {
+        return g;
+      }
+    }
+    return null;
+  }
+
+    // Returns the permanent speed multiplier for a guard based on
+  // room (dungeon) or sector (arena) corpse-alert state.
+  function getGuardSpeedMultiplier(guard) {
+    const layoutType = getLayoutType();
+    let mult = 1.0;
+
+    if (layoutType === 'dungeon') {
+      const key = getGuardRoomKey(guard);
+      const ra = key ? roomAlerts[key] : null;
+      if (ra && typeof ra.corpseBoost === 'number') {
+        mult *= ra.corpseBoost;
+      }
+    } else {
+      const s = getSector(guard.col, guard.row);
+      const sa = sectorAlerts[s];
+      if (sa && typeof sa.corpseBoost === 'number') {
+        mult *= sa.corpseBoost;
+      }
+    }
+
+    return mult;
+  }
+
+  // Returns how many grid steps this guard should perform in this world tick.
+  // Callers should use this instead of the static PATROL/ALERT constants so
+  // corpse-based speed boosts take effect.
+  function getGuardStepsPerTick(guard) {
+    const isAlert =
+      guard.state === 'alert_chaser' ||
+      guard.state === 'return_to_patrol';
+
+    const baseSteps = isAlert ? ALERT_STEPS_PER_TICK : PATROL_STEPS_PER_TICK;
+    const mult = getGuardSpeedMultiplier(guard);
+
+    const steps = Math.max(1, Math.round(baseSteps * mult));
+    return steps;
+  }
+
+
 
   function findPickupAtCell(col, row) {
     for (let i = 0; i < pickups.length; i++) {
@@ -2124,6 +2316,81 @@ function updateHudLayout() {
   // Guard positioning
   // --------------------------------------------------
 
+  // Record every cell crossed in this world tick so we can animate
+  // multi-step movement instead of "teleporting" several cells at once.
+  function recordGuardStepForAnimation(guard) {
+    if (!guard || guard.renderTrailTick !== worldTick || !guard.renderTrail) {
+      return;
+    }
+
+    const last = guard.renderTrail[guard.renderTrail.length - 1];
+    if (last && last.col === guard.col && last.row === guard.row) {
+      return;
+    }
+
+    guard.renderTrail.push({ col: guard.col, row: guard.row });
+  }
+
+  // Prepare per-guard render trails at the start of each world tick.
+  function beginGuardStepAnimationRecording() {
+    guards.forEach((g) => {
+      if (g.activeRenderAnimation && typeof g.activeRenderAnimation.cancel === 'function') {
+        g.activeRenderAnimation.cancel();
+        g.activeRenderAnimation = null;
+      }
+      g.renderTrailTick = worldTick;
+      g.renderTrail = [{ col: g.col, row: g.row }];
+    });
+  }
+
+  // After simulation for the tick is done, animate guards through each
+  // visited cell so high speed looks like actual stepping, not a teleport.
+  function flushGuardStepAnimations() {
+    guards.forEach((guard) => {
+      if (
+        !guard ||
+        guard.renderTrailTick !== worldTick ||
+        !guard.renderTrail ||
+        guard.renderTrail.length < 2 ||
+        !guard.el
+      ) {
+        return;
+      }
+
+      const steps = guard.renderTrail.length - 1;
+      const stepDuration =
+        Math.max(GUARD_ANIM_MIN_STEP_MS, Math.floor(WORLD_TICK_MS / Math.max(steps, 1)));
+      const duration = stepDuration * steps;
+
+      const keyframes = guard.renderTrail.map((p) => ({
+        transform: 'translate(' + (p.col * cellW) + 'px, ' + (p.row * cellH) + 'px)'
+      }));
+
+      if (guard.activeRenderAnimation && typeof guard.activeRenderAnimation.cancel === 'function') {
+        guard.activeRenderAnimation.cancel();
+      }
+
+      // Keep size in sync with grid even while animating.
+      guard.el.style.width = cellW + 'px';
+      guard.el.style.height = cellH + 'px';
+
+      // Force start of the trail, then animate through all waypoints.
+      guard.el.style.transform = keyframes[0].transform;
+      if (typeof guard.el.animate !== 'function') {
+        // Fallback: snap to final position if WA API is unavailable.
+        guard.el.style.transform = keyframes[keyframes.length - 1].transform;
+        return;
+      }
+
+      const animation = guard.el.animate(keyframes, {
+        duration,
+        easing: 'linear',
+        fill: 'forwards'
+      });
+      guard.activeRenderAnimation = animation;
+    });
+  }
+
   function updateGuardPosition(guard) {
     if (!guard.el) return;
 
@@ -2141,6 +2408,8 @@ function updateHudLayout() {
     } else {
       guard.el.style.opacity = '1.0';
     }
+
+    recordGuardStepForAnimation(guard);
   }
 
 
@@ -3791,6 +4060,9 @@ function createPlacedBait(col, row) {
     const sectorSawPlayer = { NW: false, NE: false, SW: false, SE: false };
     const sectorSawBait   = { NW: false, NE: false, SW: false, SE: false };
     const sectorTargetBait = { NW: null, NE: null, SW: null, SE: null };
+    const sectorSawCorpse = { NW: false, NE: false, SW: false, SE: false };
+    const sectorCorpseInfo = { NW: null, NE: null, SW: null, SE: null };
+
 
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') {
@@ -3810,6 +4082,9 @@ function createPlacedBait(col, row) {
 
       let nextSeenPlayer = false;
       let seenBaitObj = null;
+      // Corpse detection is only meaningful while the guard is patrolling
+      let seenCorpseCell = null;
+
 
       // Check player in FOV
       nextSeenPlayer = guard.fovCells.some(
@@ -3828,13 +4103,27 @@ function createPlacedBait(col, row) {
         }
       }
 
+      // Check for any dead guard ("corpse") in FOV when this guard is patrolling
+      if (guard.state === 'patrol') {
+        for (let i = 0; i < guard.fovCells.length; i++) {
+          const cell = guard.fovCells[i];
+          const corpse = findDeadGuardAtCell(cell.col, cell.row);
+          if (corpse) {
+            // Remember the first corpse cell we see
+            seenCorpseCell = { col: corpse.col, row: corpse.row };
+            break;
+          }
+        }
+      }
+
+
       guard.wasSeeingPlayer = prevSeenPlayer;
       guard.wasSeeingBait = prevSeenBait;
       guard.seenPlayer = nextSeenPlayer;
       guard.seenBait = !!seenBaitObj;
       guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
 
-      if (nextSeenPlayer || guard.seenBait) {
+            if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell) {
         anySeen = true;
       }
 
@@ -3855,6 +4144,18 @@ function createPlacedBait(col, row) {
         }
       }
 
+      // Corpse sighting: mark this sector and remember one corpse position
+      if (seenCorpseCell) {
+        sectorSawCorpse[s] = true;
+        if (!sectorCorpseInfo[s]) {
+          sectorCorpseInfo[s] = {
+            col: seenCorpseCell.col,
+            row: seenCorpseCell.row
+          };
+        }
+      }
+
+
       if (!prevSeenPlayer && nextSeenPlayer) {
         handleGuardSpotsPlayer(guard);
       }
@@ -3864,8 +4165,12 @@ function createPlacedBait(col, row) {
     ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
       const sa = sectorAlerts[name];
       if (!sa) return;
-      sa.seeingNow = !!sectorSawPlayer[name] || !!sectorSawBait[name];
+      sa.seeingNow =
+        !!sectorSawPlayer[name] ||
+        !!sectorSawBait[name] ||
+        !!sectorSawCorpse[name];
     });
+
 
     if (manageMemory) {
       // Update sector states with memory, for both player and bait
@@ -3874,10 +4179,11 @@ function createPlacedBait(col, row) {
         if (!sa) return;
 
         const sawPlayer = !!sectorSawPlayer[name];
-        const sawBait = !!sectorSawBait[name];
+        const sawBait   = !!sectorSawBait[name];
+        const sawCorpse = !!sectorSawCorpse[name];
 
         if (sawPlayer) {
-          // Player has priority over bait
+          // Player has priority over everything
           sa.state = 'tracking';
           sa.targetCol = playerCol;
           sa.targetRow = playerRow;
@@ -3885,6 +4191,7 @@ function createPlacedBait(col, row) {
           sa.source = 'player';
           sa.sourceBaitId = null;
         } else if (sawBait) {
+          // Bait has priority over corpse
           sa.state = 'tracking';
           const info = sectorTargetBait[name];
           if (info) {
@@ -3899,8 +4206,30 @@ function createPlacedBait(col, row) {
             sa.sourceBaitId = null;
           }
           sa.timer = ALERT_MEMORY_TICKS;
+        } else if (sawCorpse) {
+          // Corpse sighting: trigger alert for this sector, with permanent speed boost
+          sa.state = 'tracking';
+          const info = sectorCorpseInfo[name];
+          if (info) {
+            sa.targetCol = info.col;
+            sa.targetRow = info.row;
+          } else {
+            sa.targetCol = null;
+            sa.targetRow = null;
+          }
+          sa.source = 'corpse';
+          sa.sourceBaitId = null;
+          // No memory timer for corpse-only alerts: timer stays 0 and sector will drop
+          // back to idle when guards no longer see it.
+          sa.timer = 0;
+
+          // Apply permanent speed boost for all guards in this sector
+          if (typeof sa.corpseBoost !== 'number' ||
+              sa.corpseBoost < CORPSE_ALERT_SPEED_MULT) {
+            sa.corpseBoost = CORPSE_ALERT_SPEED_MULT;
+          }
         } else if (sa.state === 'tracking') {
-          // Sector was tracking: decay memory
+          // Sector was tracking: decay memory (only for player/bait)
           if (sa.timer > 0) {
             sa.timer--;
 
@@ -3960,6 +4289,9 @@ function createPlacedBait(col, row) {
 
     // FOV always redrawn
     renderGuardFov();
+    // Update red alert areas per sector/room
+    renderAlertAreas();
+
   }
 
 
@@ -3972,6 +4304,10 @@ function createPlacedBait(col, row) {
     const roomsSawPlayer = {};
     const roomsSawBait = {};
     const roomTargetBait = {};
+
+    const roomsSawCorpse = {};
+    const roomCorpseInfo = {};
+
 
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') {
@@ -3991,6 +4327,8 @@ function createPlacedBait(col, row) {
 
       let nextSeenPlayer = false;
       let seenBaitObj = null;
+      let seenCorpseCell = null;
+
 
       nextSeenPlayer = guard.fovCells.some(
         (c) => c.col === playerCol && c.row === playerRow
@@ -4007,13 +4345,26 @@ function createPlacedBait(col, row) {
         }
       }
 
+      // Check for any dead guard ("corpse") in FOV while this guard is patrolling
+      if (guard.state === 'patrol') {
+        for (let i = 0; i < guard.fovCells.length; i++) {
+          const cell = guard.fovCells[i];
+          const corpse = findDeadGuardAtCell(cell.col, cell.row);
+          if (corpse) {
+            seenCorpseCell = { col: corpse.col, row: corpse.row };
+            break;
+          }
+        }
+      }
+
+
       guard.wasSeeingPlayer = prevSeenPlayer;
       guard.wasSeeingBait = prevSeenBait;
       guard.seenPlayer = nextSeenPlayer;
       guard.seenBait = !!seenBaitObj;
       guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
 
-      if (nextSeenPlayer || guard.seenBait) {
+      if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell) {
         anySeen = true;
       }
 
@@ -4031,6 +4382,16 @@ function createPlacedBait(col, row) {
             };
           }
         }
+
+        if (seenCorpseCell) {
+          roomsSawCorpse[roomKey] = true;
+          if (!roomCorpseInfo[roomKey]) {
+            roomCorpseInfo[roomKey] = {
+              col: seenCorpseCell.col,
+              row: seenCorpseCell.row
+            };
+          }
+        }
       }
 
       if (!prevSeenPlayer && nextSeenPlayer) {
@@ -4042,8 +4403,10 @@ function createPlacedBait(col, row) {
       // Ensure entries for rooms that saw something
       const allKeys = new Set([
         ...Object.keys(roomsSawPlayer),
-        ...Object.keys(roomsSawBait)
+        ...Object.keys(roomsSawBait),
+        ...Object.keys(roomsSawCorpse)
       ]);
+
 
       allKeys.forEach((key) => {
         if (!roomAlerts[key]) {
@@ -4054,10 +4417,13 @@ function createPlacedBait(col, row) {
             timer: 0,
             seeingNow: false,
             source: null,
-            sourceBaitId: null
+            sourceBaitId: null,
+            // Permanent speed boost multiplier for this room when a corpse is spotted
+            corpseBoost: 1.0
           };
         }
       });
+
 
       // Update alert/memory state per room
       for (const key in roomAlerts) {
@@ -4065,9 +4431,10 @@ function createPlacedBait(col, row) {
         if (!ra) continue;
 
         const sawPlayer = !!roomsSawPlayer[key];
-        const sawBait = !!roomsSawBait[key];
+        const sawBait   = !!roomsSawBait[key];
+        const sawCorpse = !!roomsSawCorpse[key];
 
-        ra.seeingNow = sawPlayer || sawBait;
+        ra.seeingNow = sawPlayer || sawBait || sawCorpse;
 
         if (sawPlayer) {
           ra.state = 'tracking';
@@ -4091,8 +4458,28 @@ function createPlacedBait(col, row) {
             ra.sourceBaitId = null;
           }
           ra.timer = ALERT_MEMORY_TICKS;
+        } else if (sawCorpse) {
+          // Corpse sighting: alert this room and give permanent speed boost
+          ra.state = 'tracking';
+          const info = roomCorpseInfo[key];
+          if (info) {
+            ra.targetCol = info.col;
+            ra.targetRow = info.row;
+          } else {
+            ra.targetCol = null;
+            ra.targetRow = null;
+          }
+          ra.source = 'corpse';
+          ra.sourceBaitId = null;
+          // No memory timer for corpse-only alerts
+          ra.timer = 0;
+
+          if (typeof ra.corpseBoost !== 'number' ||
+              ra.corpseBoost < CORPSE_ALERT_SPEED_MULT) {
+            ra.corpseBoost = CORPSE_ALERT_SPEED_MULT;
+          }
         } else if (ra.state === 'tracking') {
-          // Room was tracking: decay memory
+          // Room was tracking: decay memory (only for player/bait)
           if (ra.timer > 0) {
             ra.timer--;
             if (ra.timer <= 0) {
@@ -4151,6 +4538,9 @@ function createPlacedBait(col, row) {
     }
 
     renderGuardFov();
+    // Update red alert areas per room
+    renderAlertAreas();
+
   }
 
   // --------------------------------------------------
@@ -4474,7 +4864,6 @@ function createPlacedBait(col, row) {
     }
   }
 
-
   function stepGuardPatrol(guard) {
     // If observing is in progress, guard stays still and rotates FOV
     if (guard.observingTicksLeft && guard.observingTicksLeft > 0) {
@@ -4687,9 +5076,14 @@ function createPlacedBait(col, row) {
       let px;
       let py;
 
-      if (ra && ra.state === 'tracking' && ra.source === 'bait' &&
-          typeof ra.targetCol === 'number' && typeof ra.targetRow === 'number') {
-        // Chase bait position
+      if (
+        ra &&
+        ra.state === 'tracking' &&
+        (ra.source === 'bait' || ra.source === 'corpse') &&
+        typeof ra.targetCol === 'number' &&
+        typeof ra.targetRow === 'number'
+      ) {
+        // Chase bait or corpse position
         px = ra.targetCol;
         py = ra.targetRow;
       } else {
@@ -4701,6 +5095,7 @@ function createPlacedBait(col, row) {
           ALERT_TARGET_MODE === 'last_seen' &&
           ra &&
           ra.state === 'tracking' &&
+          ra.source === 'player' &&
           ra.seeingNow !== true &&
           typeof ra.targetCol === 'number' &&
           typeof ra.targetRow === 'number'
@@ -4709,6 +5104,7 @@ function createPlacedBait(col, row) {
           py = ra.targetRow;
         }
       }
+
 
       const slotDir = guard.preferredCardinal || 'N';
       const maxR = 6;
@@ -5231,7 +5627,8 @@ function stepGuardAlert(guard) {
       guard.deviationActive = false;
       guard.observingTicksLeft = 0;
 
-      for (let i = 0; i < ALERT_STEPS_PER_TICK; i++) {
+      const stepsThisTick = getGuardStepsPerTick(guard);
+      for (let i = 0; i < stepsThisTick; i++) {
         stepGuardAlert(guard);
         if (guard.state !== 'alert_chaser') {
           break;
@@ -5247,13 +5644,20 @@ function stepGuardAlert(guard) {
       guard.deviationActive = false;
       guard.observingTicksLeft = 0;
 
-      stepGuardReturnToPatrol(guard);
+      const stepsThisTick = getGuardStepsPerTick(guard);
+      for (let i = 0; i < stepsThisTick; i++) {
+        stepGuardReturnToPatrol(guard);
+        if (guard.state !== 'return_to_patrol') {
+          break;
+        }
+      }
       registerGuardMovementHistory(guard);
       return;
     }
 
     // Default: PATROL (including observing & deviation sub-behaviours)
-    for (let i = 0; i < PATROL_STEPS_PER_TICK; i++) {
+    const stepsThisTick = getGuardStepsPerTick(guard);
+    for (let i = 0; i < stepsThisTick; i++) {
       stepGuardPatrol(guard);
     }
     registerGuardMovementHistory(guard);
@@ -5674,6 +6078,7 @@ function stepGuardAlert(guard) {
     updateAllFovAndAlert(true);
 
     // 2) Movimento guardie (patrol / alert / stunned)
+    beginGuardStepAnimationRecording();
     guards.forEach(stepGuard);
 
     // 3) Ricalcola solo le forme dei FOV dopo il movimento (senza toccare timer)
@@ -5681,6 +6086,9 @@ function stepGuardAlert(guard) {
 
     // 4) Attacchi a distanza
     guards.forEach(shootingTickForGuard);
+
+    // 5) Animate multi-step guard movement for this tick
+    flushGuardStepAnimations();
 
     // 5) Movimento proiettili
     stepBullets();
