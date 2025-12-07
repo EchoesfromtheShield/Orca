@@ -69,6 +69,9 @@
   const PLAYER_BULLET_RANGE_CELLS   = 9;  // max distance (in cells) for player bullets
   const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
 
+  // Player corpse-drag speed (1 = normal speed, 0.33 = 33% of normal)
+  const PLAYER_DRAG_SPEED_MULT      = 0.33;
+
   // Pickup spawn handles (random pickups on walkable ground)
   const INITIAL_MEDIKIT_PICKUPS     = 2;  // number of medikit pickups to spawn
   const INITIAL_AMMO_PICKUPS        = 3;  // number of ammo pickups to spawn
@@ -107,9 +110,9 @@
   const PATROL_DEV_OUT_STEPS_MAX          = 4;    // max steps going away from the perimeter
   const PATROL_DEV_BACK_STEPS_MAX         = 4;    // max steps to return to the perimeter
 
-// Anti-stuck: after ~5 seconds of being stuck or oscillating,
-// a guard will try hard to reset its position inside the patrol rect.
-  const GUARD_TRY_HARD_STUCK_TICKS = 20; // 20 ticks * 250ms ≈ 5s
+// Anti-stuck: after being stuck/oscillating for a long time, a guard
+// will try hard to reset its position inside the patrol rect.
+  const GUARD_TRY_HARD_STUCK_TICKS = 48; // ~12s at 250ms/tick
 
  // Guard FOV mode di base:
   //  - "wobble": guards sweep their view left/right (testa che oscilla)
@@ -600,6 +603,10 @@
   let prevPlayerRow = 0;
   // 'up' | 'down' | 'left' | 'right'
   let playerDir = 'up';
+  let playerDraggingCorpse = false;
+  let playerDraggedGuard = null;
+  let playerDragKeyHeld = false;
+  let playerMoveCooldownTicks = 0;
 
   // Player HP
   let playerHPMax = 5;
@@ -5488,14 +5495,20 @@ function stepGuardAlert(guard) {
       guard.shootCooldown === 0 &&
       guard.observingTicksLeft <= 0;
 
+    const hasLongStill =
+      typeof guard.stillTicks === 'number' &&
+      guard.stillTicks >= GUARD_TRY_HARD_STUCK_TICKS;
+
+    const hasOscillation =
+      typeof guard.stuckCounter === 'number' &&
+      guard.stuckCounter >= 4 &&
+      guard.stillTicks >= (GUARD_TRY_HARD_STUCK_TICKS / 2);
+
     const shouldTryHard =
       isDungeon &&
       isCalmState &&
       notEngaged &&
-      (
-        (guard.stillTicks && guard.stillTicks >= GUARD_TRY_HARD_STUCK_TICKS) ||
-        (guard.stuckCounter && guard.stuckCounter >= 2)
-      );
+      (hasLongStill || hasOscillation);
 
     if (shouldTryHard) {
       forceGuardTryHard(guard);
@@ -6070,6 +6083,9 @@ function stepGuardAlert(guard) {
     if (playerHitCooldown > 0) {
       playerHitCooldown--;
     }
+    if (playerMoveCooldownTicks > 0) {
+      playerMoveCooldownTicks--;
+    }
 
     // Assegna slot cardinali per settore (N/E/S/W) una volta per tick
     assignSectorCardinals();
@@ -6109,10 +6125,52 @@ function stepGuardAlert(guard) {
   // Player movement
   // --------------------------------------------------
 
+  function getPlayerDragMoveCooldownTicks() {
+    const mult = Math.max(PLAYER_DRAG_SPEED_MULT, 0.01);
+    const slowdownTicks = Math.max(0, Math.round((1 / mult) - 1));
+    return slowdownTicks;
+  }
+
+  function stopDraggingCorpse() {
+    if (playerDraggedGuard) {
+      playerDraggedGuard.draggedByPlayer = false;
+    }
+    playerDraggingCorpse = false;
+    playerDraggedGuard = null;
+    playerDragKeyHeld = false;
+    playerMoveCooldownTicks = 0;
+  }
+
+  function tryStartDraggingCorpse() {
+    const corpse = findDeadGuardAtCell(playerCol, playerRow);
+    if (!corpse) {
+      return false;
+    }
+    if (corpse.state !== 'dead' && corpse.dead !== true) {
+      return false;
+    }
+    playerDraggingCorpse = true;
+    playerDraggedGuard = corpse;
+    playerDragKeyHeld = true;
+    corpse.draggedByPlayer = true;
+    playerMoveCooldownTicks = 0; // allow immediate first move
+    return true;
+  }
+
   function tryMovePlayer(dCol, dRow, newDir) {
     // Do not move if game is over
     if (isGameOver) {
       return;
+    }
+
+    // Respect movement cooldown while dragging a corpse
+    if (playerDraggingCorpse && playerMoveCooldownTicks > 0) {
+      return;
+    }
+
+    // If somehow the dragged guard disappeared, stop dragging
+    if (playerDraggingCorpse && (!playerDraggedGuard || playerDraggedGuard.state !== 'dead')) {
+      stopDraggingCorpse();
     }
 
     prevPlayerCol = playerCol;
@@ -6142,6 +6200,25 @@ function stepGuardAlert(guard) {
     playerCol = targetCol;
     playerRow = targetRow;
     playerDir = newDir;
+
+    // Move the dragged corpse along with the player
+    if (playerDraggingCorpse && playerDraggedGuard) {
+      playerDraggedGuard.col = playerCol;
+      playerDraggedGuard.row = playerRow;
+      clampGuard(playerDraggedGuard);
+      updateGuardPosition(playerDraggedGuard);
+    }
+
+    // If A is held and we just stepped onto a corpse, auto-start dragging
+    if (!playerDraggingCorpse && playerDragKeyHeld) {
+      tryStartDraggingCorpse();
+    }
+
+    if (playerDraggingCorpse) {
+      playerMoveCooldownTicks = getPlayerDragMoveCooldownTicks();
+    } else {
+      playerMoveCooldownTicks = 0;
+    }
 
     clampPlayer();
     updatePlayerPosition();
@@ -6195,17 +6272,48 @@ function stepGuardAlert(guard) {
     ev.preventDefault();
     ev.stopPropagation();
 
-    if (key === 'ArrowUp') {
-      tryMovePlayer(0, -1, 'up');
-    } else if (key === 'ArrowDown') {
-      tryMovePlayer(0, 1, 'down');
-    } else if (key === 'ArrowLeft') {
-      tryMovePlayer(-1, 0, 'left');
-    } else if (key === 'ArrowRight') {
-      tryMovePlayer(1, 0, 'right');
+    const isArrow =
+      key === 'ArrowUp' ||
+      key === 'ArrowDown' ||
+      key === 'ArrowLeft' ||
+      key === 'ArrowRight';
+
+    // While dragging a corpse, only arrows are honored; other actions blocked
+    if (playerDraggingCorpse) {
+      if (key === 'a' || key === 'A') {
+        playerDragKeyHeld = true;
+        return;
+      }
+      if (isArrow) {
+        if (key === 'ArrowUp') {
+          tryMovePlayer(0, -1, 'up');
+        } else if (key === 'ArrowDown') {
+          tryMovePlayer(0, 1, 'down');
+        } else if (key === 'ArrowLeft') {
+          tryMovePlayer(-1, 0, 'left');
+        } else if (key === 'ArrowRight') {
+          tryMovePlayer(1, 0, 'right');
+        }
+      }
+      return;
+    }
+
+    if (isArrow) {
+      if (key === 'ArrowUp') {
+        tryMovePlayer(0, -1, 'up');
+      } else if (key === 'ArrowDown') {
+        tryMovePlayer(0, 1, 'down');
+      } else if (key === 'ArrowLeft') {
+        tryMovePlayer(-1, 0, 'left');
+      } else if (key === 'ArrowRight') {
+        tryMovePlayer(1, 0, 'right');
+      }
     } else if (key === 'a' || key === 'A') {
-      // Interaction key: try to activate a nearby marker
-      tryActivateNearbyMarker();
+      playerDragKeyHeld = true;
+      // If on a corpse, start dragging; otherwise use normal activation
+      if (!tryStartDraggingCorpse()) {
+        tryActivateNearbyMarker();
+      }
     } else if (PLAYER_SHOOT_KEYS.indexOf(key) !== -1) {
       // Player shoots in the facing direction
       spawnBulletFromPlayer();
@@ -6221,6 +6329,21 @@ function stepGuardAlert(guard) {
         );
       }
       return;
+    }
+  }
+
+  function onKeyUp(ev) {
+    const key = ev.key;
+
+    if (mode === 'edit') return;
+
+    if (key === 'a' || key === 'A') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      playerDragKeyHeld = false;
+      if (playerDraggingCorpse) {
+        stopDraggingCorpse();
+      }
     }
   }
 
@@ -6285,6 +6408,7 @@ function stepGuardAlert(guard) {
 
     window.addEventListener('resize', syncGeometry);
     window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
 
     guardTimer = window.setInterval(stepAllGuards, WORLD_TICK_MS);
 
