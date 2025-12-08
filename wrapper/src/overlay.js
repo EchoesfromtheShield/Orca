@@ -447,6 +447,11 @@
 
     // Force a new spawn-adjustment pass for this level
     guardSpawnsInitialized = false;
+    allPatchesUnlocked = false;
+    guardsFrozen = false;
+    if (allPatchesUnlockedDiv) {
+      allPatchesUnlockedDiv.style.display = 'none';
+    }
 
 
     // If the level config provides an explicit player spawn, use it.
@@ -591,8 +596,11 @@
   // Global game over flag
   // When true, the world simulation is frozen and input is ignored in GAME mode
   let isGameOver = false;
+  let allPatchesUnlocked = false;
+  let guardsFrozen = false;
 
   let overlayDiv = null;
+  let allPatchesUnlockedDiv = null;
   let alertAreasContainer = null;
   let guardsContainer = null;
   let fovContainer = null;
@@ -1091,6 +1099,32 @@
 
     overlayDiv.appendChild(gameOverDiv);
 
+    // ALL PATCHES UNLOCKED overlay
+    allPatchesUnlockedDiv = document.createElement('div');
+    allPatchesUnlockedDiv.id = 'orca-stealth-all-unlocked';
+    allPatchesUnlockedDiv.style.position = 'absolute';
+    allPatchesUnlockedDiv.style.left = '0';
+    allPatchesUnlockedDiv.style.top = '0';
+    allPatchesUnlockedDiv.style.width = '100%';
+    allPatchesUnlockedDiv.style.height = '100%';
+    allPatchesUnlockedDiv.style.display = 'none';
+    allPatchesUnlockedDiv.style.alignItems = 'center';
+    allPatchesUnlockedDiv.style.justifyContent = 'center';
+    allPatchesUnlockedDiv.style.pointerEvents = 'none';
+    allPatchesUnlockedDiv.style.fontFamily = 'monospace';
+    allPatchesUnlockedDiv.style.fontSize = '42px';
+    allPatchesUnlockedDiv.style.fontWeight = 'bold';
+    allPatchesUnlockedDiv.style.color = '#72dec2';
+    allPatchesUnlockedDiv.style.textShadow = '0 0 12px rgba(0,0,0,0.7)';
+    allPatchesUnlockedDiv.style.background = 'transparent';
+    allPatchesUnlockedDiv.style.zIndex = '5';
+
+    const allUnlockedLabel = document.createElement('div');
+    allUnlockedLabel.textContent = 'ALL PATCHES UNLOCKED';
+    allPatchesUnlockedDiv.appendChild(allUnlockedLabel);
+
+    overlayDiv.appendChild(allPatchesUnlockedDiv);
+
     document.body.appendChild(overlayDiv);
 
     updateModeVisual();
@@ -1221,6 +1255,11 @@
 
     // Re-render alert areas for current alert state
     renderAlertAreas();
+
+    // Keep final overlay visible if all patches unlocked
+    if (allPatchesUnlockedDiv) {
+      allPatchesUnlockedDiv.style.display = allPatchesUnlocked ? 'flex' : 'none';
+    }
   }
 
   function clearAlertAreas() {
@@ -2014,6 +2053,10 @@ function updateHudLayout() {
     // Initial random pickups: run once per levelConfig / overlay
     if (!pickupsInitialized) {
       spawnInitialPickupsRandom();
+    }
+
+    if (allPatchesUnlockedDiv) {
+      allPatchesUnlockedDiv.style.display = allPatchesUnlocked ? 'flex' : 'none';
     }
 
     log('Geometry synced:', {
@@ -4072,6 +4115,30 @@ function createPlacedBait(col, row) {
       '[overlay] Liberation trigger completed:',
       trigger.id || ('index ' + triggerIndex)
     );
+
+    // If all triggers are now completed, freeze guards and show overlay
+    const allCompleted = triggerRuntimeState.every((s) => s && s.completed);
+    if (allCompleted) {
+      allPatchesUnlocked = true;
+      guardsFrozen = true;
+      if (allPatchesUnlockedDiv) {
+        allPatchesUnlockedDiv.style.display = 'flex';
+      }
+      // Remove any guard bullets in flight
+      if (bullets && bullets.length) {
+        const survivors = [];
+        bullets.forEach((b) => {
+          if (b.ownerType === 'guard') {
+            if (b.el && b.el.parentNode) {
+              b.el.parentNode.removeChild(b.el);
+            }
+          } else {
+            survivors.push(b);
+          }
+        });
+        bullets = survivors;
+      }
+    }
   }
 
 
@@ -6411,6 +6478,21 @@ function stepGuardAlert(guard) {
 
     // If game is over, world simulation is frozen
     if (isGameOver) return;
+
+    // Freeze guards/actions after final unlock
+    if (guardsFrozen) {
+      // Still run minimal timers for blinking
+      worldTick++;
+      if (playerHitCooldown > 0) {
+        playerHitCooldown--;
+      }
+      if (playerMoveCooldownTicks > 0) {
+        playerMoveCooldownTicks--;
+      }
+      updatePickupsBlink();
+      updatePlayerBlink();
+      return;
+    }
 
     // Advance global world tick
     worldTick++;
