@@ -146,6 +146,11 @@ const ritualTypeArg = process.argv[12] || process.env.RITUAL_TYPE;
 const RITUAL_TYPE = normalizeRitualType(ritualTypeArg || 'fourCorners');
 const PATCH_RITUALS = parsePatchRituals(process.env.PATCH_RITUALS || '');
 
+if (PATCH_RITUALS.length) {
+  console.log('[patch_to_level] PATCH_RITUALS from env:', PATCH_RITUALS);
+}
+console.log('[patch_to_level] RITUAL_TYPE:', RITUAL_TYPE);
+
 // Per getKey: corner (0..3) con lucchetto "K"
 const keyCornerArg = process.argv[13] || process.env.KEY_CORNER_INDEX;
 const KEY_CORNER_INDEX = keyCornerArg != null

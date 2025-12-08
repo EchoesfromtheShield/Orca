@@ -17,7 +17,7 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
-const PORT = 4321;
+const PORT = parseInt(process.env.PORT || '4321', 10);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const UI_PATH = path.join(__dirname, 'patch_to_level_ui.html');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -36,7 +36,12 @@ function ensureLevelsDir() {
 }
 
 function sendJson(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+  });
   res.end(JSON.stringify(obj));
 }
 
@@ -179,6 +184,7 @@ function mapRitualLabel(val) {
     case 'destroytarget':
     case 'destroy target':
       return 'destroyTarget';
+    case 'pressure_tiles':
     case 'pressuretiles':
     case 'pressure tiles':
       return 'pressure_tiles';
@@ -196,7 +202,8 @@ function runPatchToLevel(options, cb) {
     medikits = 2,
     bait = 3,
     ritualType = 'fourCorners',
-    patchRituals = []
+    patchRituals = [],
+    wallChar = 'y'
   } = options;
 
   const baseName = path.basename(inputPath, path.extname(inputPath));
@@ -211,7 +218,7 @@ function runPatchToLevel(options, cb) {
     outJson,
     layout,
     String(guards),
-    'y', // wall char default
+    String(wallChar || 'y'),
     String(ammo),
     String(medikits),
     String(bait),
@@ -247,12 +254,34 @@ function runPatchToLevel(options, cb) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Simple request log for debugging
+  console.log('[ui-server]', req.method, req.url);
+
+  // Normalize path (strip querystring and trailing slashes)
+  const rawPath = (req.url || '').split('?')[0];
+  const urlPath = rawPath.replace(/\/+$/, '') || '/';
+  const pathKey = urlPath.toLowerCase();
+
+  const isUpload = pathKey === '/api/upload' || pathKey.startsWith('/api/upload/');
+  const isDetect = pathKey === '/api/detect' || pathKey.startsWith('/api/detect/');
+  const isExport = pathKey === '/api/export' || pathKey.startsWith('/api/export/');
+
+  // Handle CORS preflight for API routes
+  if (req.method === 'OPTIONS' && urlPath.startsWith('/api/')) {
+    res.writeHead(200, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+    });
+    return res.end();
+  }
+
   if (req.method === 'GET') {
-    if (req.url === '/' || req.url === '/tools/patch_to_level_ui.html') {
+    if (urlPath === '/' || urlPath === '/tools/patch_to_level_ui.html') {
       return fs.createReadStream(UI_PATH).pipe(res);
     }
     // Static fallback
-    const filePath = path.join(PROJECT_ROOT, req.url.replace(/^\//, ''));
+    const filePath = path.join(PROJECT_ROOT, urlPath.replace(/^\//, ''));
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       return fs.createReadStream(filePath).pipe(res);
     }
@@ -260,7 +289,7 @@ const server = http.createServer(async (req, res) => {
     return res.end('Not found');
   }
 
-  if (req.method === 'POST' && req.url === '/api/upload') {
+  if (req.method === 'POST' && isUpload) {
     try {
       ensureUploadDir();
       const buf = await readBody(req);
@@ -274,7 +303,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'POST' && req.url === '/api/detect') {
+  if (req.method === 'POST' && isDetect) {
     try {
       const body = JSON.parse((await readBody(req)).toString() || '{}');
       if (!body.filePath) {
@@ -287,7 +316,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'POST' && req.url === '/api/export') {
+  if (req.method === 'POST' && isExport) {
     try {
       const body = JSON.parse((await readBody(req)).toString() || '{}');
       const { filePath, patchRituals = [], settings = {} } = body;
@@ -295,6 +324,12 @@ const server = http.createServer(async (req, res) => {
       if (!fs.existsSync(filePath)) {
         return sendJson(res, 400, { error: 'filePath not found on server' });
       }
+
+      console.log('[ui-server] export payload', {
+        filePath,
+        patchRituals,
+        settings
+      });
 
       let responded = false;
       const safeSend = (status, obj) => {
@@ -304,7 +339,8 @@ const server = http.createServer(async (req, res) => {
       };
 
       const ritualType = mapRitualLabel(patchRituals[0] || 'fourCorners');
-      runPatchToLevel({
+      const ritualList = patchRituals.map(mapRitualLabel);
+      return runPatchToLevel({
         inputPath: filePath,
         layout: (settings.layout || 'arena').toLowerCase(),
         guards: settings.guards || 3,
@@ -312,20 +348,31 @@ const server = http.createServer(async (req, res) => {
         medikits: settings.medikits || 2,
         bait: settings.bait || 3,
         ritualType,
-        patchRituals: patchRituals.map(mapRitualLabel)
+        patchRituals: ritualList,
+        wallChar: settings.walls || 'y'
       }, (err, out) => {
         if (err) return safeSend(500, { error: err.message });
-        return safeSend(200, out);
+        console.log('[ui-server] export done with rituals', ritualList);
+        return safeSend(200, { ...out, rituals: ritualList });
       });
     } catch (err) {
+      console.warn('[ui-server] export error', err);
       return sendJson(res, 500, { error: err.message });
     }
   }
 
+  if (urlPath.startsWith('/api/')) {
+    console.warn('[ui-server] 404 API', req.method, urlPath, { isUpload, isDetect, isExport, pathKey });
+    return sendJson(res, 404, { error: 'Not found', path: urlPath });
+  }
   res.writeHead(404);
   res.end('Not found');
 });
 
 server.listen(PORT, () => {
   console.log(`[patch_to_level_ui_server] Listening on http://localhost:${PORT}/tools/patch_to_level_ui.html`);
+});
+
+server.on('error', (err) => {
+  console.error('[ui-server] listen error:', err);
 });
