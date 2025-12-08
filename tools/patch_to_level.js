@@ -126,9 +126,25 @@ function normalizeRitualType(raw) {
   return 'fourCorners';
 }
 
+function parsePatchRituals(raw) {
+  if (!raw) return [];
+  // Accept comma-separated or JSON array
+  let parts = [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      parts = parsed;
+    }
+  } catch (e) {
+    parts = raw.split(',');
+  }
+  return parts.map(normalizeRitualType);
+}
+
 // Rituale di unlock per tutte le patch generate
 const ritualTypeArg = process.argv[12] || process.env.RITUAL_TYPE;
 const RITUAL_TYPE = normalizeRitualType(ritualTypeArg || 'fourCorners');
+const PATCH_RITUALS = parsePatchRituals(process.env.PATCH_RITUALS || '');
 
 // Per getKey: corner (0..3) con lucchetto "K"
 const keyCornerArg = process.argv[13] || process.env.KEY_CORNER_INDEX;
@@ -831,7 +847,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
   // - we try to slightly shrink the patrol rect so they don't hug walls;
   // - spawn cells are chosen only from '.' floor tiles in that room.
   // --------------------------------------------------------------------
-  if (layoutType === 'dungeon') {
+  if (false && layoutType === 'dungeon') {
     if (commentBlocksGlobal.length === 0) {
       console.warn('[patch_to_level] Dungeon layout but no patches; falling back to legacy guards.');
     } else {
@@ -1355,10 +1371,12 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       { col: x + w - 1, row: y + h - 1 }
     ];
 
+    const ritualForPatch = PATCH_RITUALS[idx] || ritualType;
+
     const trigger = {
       id: b.id || `patch_${idx}`,
-      type: ritualType,
-      ritual: ritualType,
+      type: ritualForPatch,
+      ritual: ritualForPatch,
       corners,
       targetBlock: {
         x,
@@ -1368,11 +1386,11 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       }
     };
 
-    if (ritualType === 'getKey') {
+    if (ritualForPatch === 'getKey') {
       const maxCornerIdx = Math.max(0, corners.length - 1);
       const clamped = Math.min(maxCornerIdx, KEY_CORNER_INDEX);
       trigger.keyCornerIndex = clamped;
-    } else if (ritualType === 'destroyTarget') {
+    } else if (ritualForPatch === 'destroyTarget') {
       const centerCol = x + Math.floor((w - 1) / 2);
       const centerRow = y + Math.floor((h - 1) / 2);
       trigger.destroyTarget = {

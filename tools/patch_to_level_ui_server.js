@@ -21,10 +21,17 @@ const PORT = 4321;
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const UI_PATH = path.join(__dirname, 'patch_to_level_ui.html');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const LEVELS_DIR = path.join(PROJECT_ROOT, 'levels');
 
 function ensureUploadDir() {
   if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  }
+}
+
+function ensureLevelsDir() {
+  if (!fs.existsSync(LEVELS_DIR)) {
+    fs.mkdirSync(LEVELS_DIR, { recursive: true });
   }
 }
 
@@ -188,12 +195,13 @@ function runPatchToLevel(options, cb) {
     ammo = 3,
     medikits = 2,
     bait = 3,
-    ritualType = 'fourCorners'
+    ritualType = 'fourCorners',
+    patchRituals = []
   } = options;
 
   const baseName = path.basename(inputPath, path.extname(inputPath));
-  // Keep outputs in the upload dir for easy access
-  const outOrca = path.join(UPLOAD_DIR, `${baseName}_metalgear.orca`);
+  ensureLevelsDir();
+  const outOrca = path.join(LEVELS_DIR, `${baseName}_metalgear.orca`);
   const outJson = path.join(PROJECT_ROOT, 'generated-level.json');
 
   const args = [
@@ -215,7 +223,11 @@ function runPatchToLevel(options, cb) {
 
   const child = spawn(process.execPath, args, {
     cwd: PROJECT_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      PATCH_RITUALS: patchRituals.join(',')
+    }
   });
 
   let stdout = '';
@@ -299,7 +311,8 @@ const server = http.createServer(async (req, res) => {
         ammo: settings.ammo || 3,
         medikits: settings.medikits || 2,
         bait: settings.bait || 3,
-        ritualType
+        ritualType,
+        patchRituals: patchRituals.map(mapRitualLabel)
       }, (err, out) => {
         if (err) return safeSend(500, { error: err.message });
         return safeSend(200, out);
