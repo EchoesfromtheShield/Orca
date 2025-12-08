@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Patch to Level UI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #000;
+      color: #fff;
+      font-family: monospace;
+    }
+    h1, h2, h3, p {
+      margin: 0 0 12px 0;
+    }
+    button, select {
+      font-family: monospace;
+      font-size: 14px;
+      padding: 6px 10px;
+      border: 1px solid #444;
+      background: #111;
+      color: #fff;
+      cursor: pointer;
+    }
+    button:hover, select:hover {
+      border-color: #888;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .section {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #444;
+    }
+    .patch-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border: 1px solid #222;
+      padding: 6px 10px;
+      background: #0a0a0a;
+    }
+    .patch-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    #status {
+      margin-top: 12px;
+      min-height: 18px;
+      color: #72dec2;
+    }
+  </style>
+</head>
+<body>
+  <h2>Patch to Level UI</h2>
+
+  <div class="row">
+    <div>Select .orca file</div>
+    <button id="btnFile">Browse</button>
+    <input id="fileInput" type="file" accept=".orca" style="display:none" />
+    <div id="fileName"></div>
+  </div>
+
+  <div id="patchInfo">Patch detected: 0</div>
+  <div id="patchList" class="patch-list"></div>
+
+  <div class="section">
+    <div style="border-bottom:1px solid #fff; padding-bottom:6px; margin-bottom:8px;">level settings:</div>
+    <div class="col">
+      <label>level layout:
+        <select id="layout">
+          <option value="arena">ARENA</option>
+          <option value="dungeon">DUNGEON</option>
+        </select>
+      </label>
+      <label>guards per sector/room:
+        <select id="guards">
+          <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
+      <label>mediKit spawns:
+        <select id="medikits">
+          <option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
+      <label>ammo spawns:
+        <select id="ammo">
+          <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
+      <label>bait spawns:
+        <select id="bait">
+          <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="section row" style="justify-content:flex-start; gap:16px;">
+    <button id="exportBtn">export level</button>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const rituals = [
+      { label: '4 corners', value: 'fourCorners' },
+      { label: 'get the key', value: 'getKey' },
+      { label: 'destroy target', value: 'destroyTarget' },
+      { label: 'pressure tiles', value: 'pressure_tiles' }
+    ];
+
+    let serverFilePath = null;
+    let patchCount = 0;
+
+    const btnFile = document.getElementById('btnFile');
+    const fileInput = document.getElementById('fileInput');
+    const fileName = document.getElementById('fileName');
+    const patchInfo = document.getElementById('patchInfo');
+    const patchList = document.getElementById('patchList');
+    const statusEl = document.getElementById('status');
+
+    btnFile.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', async (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      fileName.textContent = file.name;
+      setStatus('Uploading...');
+      try {
+        const buf = await file.arrayBuffer();
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: {
+            'x-filename': file.name
+          },
+          body: buf
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'upload failed');
+        serverFilePath = data.path;
+        setStatus('Detecting patches...');
+        await detectPatches();
+      } catch (err) {
+        setStatus('Error: ' + err.message, true);
+      }
+    });
+
+    async function detectPatches() {
+      if (!serverFilePath) return;
+      const res = await fetch('/api/detect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: serverFilePath })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'detect failed');
+      }
+      patchCount = data.patchCount || 0;
+      patchInfo.textContent = 'patch detected: ' + patchCount;
+      renderPatchList();
+      setStatus('Ready');
+    }
+
+    function renderPatchList() {
+      patchList.innerHTML = '';
+      for (let i = 0; i < patchCount; i++) {
+        const row = document.createElement('div');
+        row.className = 'patch-row';
+        const label = document.createElement('div');
+        label.textContent = 'patch ' + (i + 1);
+        const sel = document.createElement('select');
+        sel.dataset.patchIndex = i;
+        rituals.forEach(r => {
+          const opt = document.createElement('option');
+          opt.value = r.value;
+          opt.textContent = r.label;
+          sel.appendChild(opt);
+        });
+        row.appendChild(label);
+        row.appendChild(sel);
+        patchList.appendChild(row);
+      }
+    }
+
+    document.getElementById('exportBtn').addEventListener('click', async () => {
+      if (!serverFilePath) {
+        setStatus('Select a .orca file first', true);
+        return;
+      }
+      const patchRituals = Array.from(
+        patchList.querySelectorAll('select')
+      ).map(sel => sel.value);
+
+      const payload = {
+        filePath: serverFilePath,
+        patchRituals,
+        settings: {
+          layout: document.getElementById('layout').value,
+          guards: parseInt(document.getElementById('guards').value, 10),
+          medikits: parseInt(document.getElementById('medikits').value, 10),
+          ammo: parseInt(document.getElementById('ammo').value, 10),
+          bait: parseInt(document.getElementById('bait').value, 10)
+        }
+      };
+
+      setStatus('Exporting...');
+      const res = await fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus('Error: ' + (data.error || 'export failed'), true);
+        return;
+      }
+      setStatus('Exported: ' + data.outOrca + ' / ' + data.outJson);
+    });
+
+    function setStatus(msg, isError = false) {
+      statusEl.textContent = msg || '';
+      statusEl.style.color = isError ? '#ff5555' : '#72dec2';
+    }
+  </script>
+</body>
+</html>
