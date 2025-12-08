@@ -122,6 +122,7 @@ function normalizeRitualType(raw) {
   const v = (raw || '').toString().trim().toLowerCase();
   if (v === 'getkey' || v === 'get_key' || v === 'key') return 'getKey';
   if (v === 'destroytarget' || v === 'destroy_target' || v === 'destroy') return 'destroyTarget';
+  if (v === 'pressure' || v === 'pressure_tiles' || v === 'pressuretiles') return 'pressure_tiles';
   return 'fourCorners';
 }
 

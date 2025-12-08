@@ -87,6 +87,11 @@
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
 
+  // Pressure tiles ritual: time required to apply pressure (in ticks)
+  const PRESSURE_APPLY_SECONDS      = 4;
+  const PRESSURE_APPLY_TICKS        = Math.ceil(
+    (PRESSURE_APPLY_SECONDS * 1000) / WORLD_TICK_MS
+  );
 
 
   // Alert / memory (how long sectors remember player absolute position after losing sight)
@@ -385,6 +390,9 @@
     if (trigger.ritual) return trigger.ritual;
     if (trigger.type === 'destroyTarget') return 'destroyTarget';
     if (trigger.type === 'getKey') return 'getKey';
+    if (trigger.type === 'pressure_tiles' || trigger.ritual === 'pressure_tiles') {
+      return 'pressure_tiles';
+    }
     return 'fourCorners';
   }
 
@@ -655,6 +663,10 @@
   // Each entry: { triggerIndex, col, row, hp, maxHP, el, outer, inner, dot, alive }
   let destroyTargets = [];
 
+  // NEW: pressure tiles (pressure_tiles ritual)
+  // Each entry: { triggerIndex, col, row, el, outer, inner, applied, holdTicks }
+  let pressureTiles = [];
+
 
   // Grid / geometry
   let gridCols = 120;
@@ -920,6 +932,18 @@
 .orca-stealth-bait-aura {
   animation-name: orcaBaitAura;
   animation-duration: 1.4s;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
+@keyframes orcaPressureBlink {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.35; }
+  100% { opacity: 1; }
+}
+.orca-stealth-pressure-blink {
+  animation-name: orcaPressureBlink;
+  animation-duration: 0.6s;
   animation-timing-function: ease-in-out;
   animation-iteration-count: infinite;
 }
@@ -1330,6 +1354,7 @@ function updateHudLayout() {
       gEl.style.position = 'absolute';
       gEl.style.left = '0';
       gEl.style.top = '0';
+      gEl.style.zIndex = '1'; // keep guards/corpses above pressure tiles
       gEl.style.pointerEvents = 'none';
 
       // Inner container, fills the guard cell
@@ -1964,6 +1989,8 @@ function updateHudLayout() {
     updateAllBaitsPosition();
     updatePatchMarkersPosition();
     updateAllDestroyTargetsPosition();
+    updateAllPressureTilesPosition();
+    ensurePressureTilesValid();
 
     // only FOV, no alert memory
     updateAllFovAndAlert(false);
@@ -3224,6 +3251,7 @@ function createPlacedBait(col, row) {
     cell.className = 'orca-stealth-destroy-target';
     cell.style.position = 'absolute';
     cell.style.boxSizing = 'border-box';
+    cell.style.zIndex = '2'; // keep destroy-target marker above guards/pressure tiles
     cell.style.pointerEvents = 'none';
 
     // Outer circle
@@ -3361,6 +3389,295 @@ function createPlacedBait(col, row) {
     completeLiberationTrigger(target.triggerIndex);
   }
 
+  // --------------------------------------------------
+  // Pressure tiles (pressure_tiles ritual)
+  // --------------------------------------------------
+
+  function hasWalkableNeighbor(col, row) {
+    const dirs = [
+      { dx: 1, dy: 0 },
+      { dx: -1, dy: 0 },
+      { dx: 0, dy: 1 },
+      { dx: 0, dy: -1 }
+    ];
+
+    for (let i = 0; i < dirs.length; i++) {
+      const nx = col + dirs[i].dx;
+      const ny = row + dirs[i].dy;
+      if (nx < 0 || ny < 0 || nx >= gridCols || ny >= gridRows) continue;
+      if (isWalkable(nx, ny)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function collectPressureTileCandidates(trigger) {
+    if (!trigger || !trigger.targetBlock) return [];
+    const rect = trigger.targetBlock;
+    const candidates = [];
+
+    // Try to read the block directly from Orca to inspect the real glyphs.
+    let blockLines = null;
+    try {
+      const client = window.orcaClient;
+      if (
+        client &&
+        client.orca &&
+        typeof client.orca.getBlock === 'function'
+      ) {
+        const raw = client.orca.getBlock(rect.x, rect.y, rect.w, rect.h);
+        if (typeof raw === 'string') {
+          blockLines = raw.split(/\r?\n/);
+        }
+      }
+    } catch (e) {
+      // best-effort; fall back to glyphAt below
+    }
+
+    // Skip the perimeter of the patch (comment frame) and keep only clear floor cells '.'
+    const minCol = rect.x + 1;
+    const maxCol = rect.x + rect.w - 2;
+    const minRow = rect.y + 1;
+    const maxRow = rect.y + rect.h - 2;
+
+    for (let row = minRow; row <= maxRow; row++) {
+      const localY = row - rect.y;
+      for (let col = minCol; col <= maxCol; col++) {
+        const localX = col - rect.x;
+        let glyph = getOrcaGlyph(col, row);
+
+        if (blockLines && blockLines[localY]) {
+          const line = blockLines[localY];
+          if (localX >= 0 && localX < line.length) {
+            glyph = line[localX];
+          }
+        }
+
+        if (glyph !== '.') continue;
+        if (!isWalkable(col, row)) continue;
+        if (!hasWalkableNeighbor(col, row)) continue;
+        candidates.push({ col, row });
+      }
+    }
+    return candidates;
+  }
+
+  function createPressureTile(triggerIndex, col, row) {
+    if (!patchMarkersContainer) return null;
+
+    const cell = document.createElement('div');
+    cell.className = 'orca-stealth-pressure';
+    cell.style.position = 'absolute';
+    cell.style.boxSizing = 'border-box';
+    cell.style.background = '#000000';
+    cell.style.zIndex = '0'; // keep below guards/corpses and markers
+    cell.style.pointerEvents = 'none';
+
+    const outer = document.createElement('div');
+    outer.style.position = 'absolute';
+    outer.style.left = '50%';
+    outer.style.top = '50%';
+    outer.style.width = '78%';
+    outer.style.height = '78%';
+    outer.style.transform = 'translate(-50%, -50%)';
+    outer.style.border = '2px solid #ffffff';
+    outer.style.boxSizing = 'border-box';
+
+    const inner = document.createElement('div');
+    inner.style.position = 'absolute';
+    inner.style.left = '50%';
+    inner.style.top = '50%';
+    inner.style.width = '46%';
+    inner.style.height = '46%';
+    inner.style.transform = 'translate(-50%, -50%)';
+    inner.style.border = '2px solid #ffffff';
+    inner.style.boxSizing = 'border-box';
+
+    outer.appendChild(inner);
+    cell.appendChild(outer);
+    patchMarkersContainer.appendChild(cell);
+
+    const tile = {
+      triggerIndex,
+      col,
+      row,
+      el: cell,
+      outer,
+      inner,
+      applied: false,
+      holdTicks: 0
+    };
+
+    pressureTiles.push(tile);
+    updatePressureTilePosition(tile);
+
+    return tile;
+  }
+
+  function createPressureTilesForTrigger(triggerIndex, trigger) {
+    const candidates = collectPressureTileCandidates(trigger);
+    if (!candidates.length) {
+      console.warn(
+        '[overlay] pressure_tiles: no walkable cells inside patch for trigger',
+        trigger && (trigger.id || triggerIndex)
+      );
+      return;
+    }
+
+    shuffleArray(candidates);
+
+    const desiredCount = 2 + Math.floor(Math.random() * 2); // 2 or 3
+    const count = Math.min(desiredCount, candidates.length);
+
+    for (let i = 0; i < count; i++) {
+      const c = candidates[i];
+      createPressureTile(triggerIndex, c.col, c.row);
+    }
+
+    if (count < desiredCount) {
+      console.warn(
+        '[overlay] pressure_tiles: only',
+        count,
+        'tile(s) placed (requested',
+        desiredCount,
+        ') for trigger',
+        trigger && (trigger.id || triggerIndex)
+      );
+    }
+  }
+
+  function updatePressureTilePosition(tile) {
+    if (!tile || !tile.el) return;
+    const x = tile.col * cellW;
+    const y = tile.row * cellH;
+    tile.el.style.width = cellW + 'px';
+    tile.el.style.height = cellH + 'px';
+    tile.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
+
+  function updateAllPressureTilesPosition() {
+    if (!pressureTiles || !pressureTiles.length) return;
+    pressureTiles.forEach(updatePressureTilePosition);
+  }
+
+  function updatePressureTileVisual(tile) {
+    if (!tile || !tile.outer || !tile.inner) return;
+    if (tile.applied) {
+      tile.outer.classList.add('orca-stealth-pressure-blink');
+      tile.inner.classList.add('orca-stealth-pressure-blink');
+    } else {
+      tile.outer.classList.remove('orca-stealth-pressure-blink');
+      tile.inner.classList.remove('orca-stealth-pressure-blink');
+    }
+  }
+
+  function isPressureTileOccupied(tile) {
+    if (!tile) return false;
+
+    if (playerCol === tile.col && playerRow === tile.row) {
+      return true;
+    }
+
+    // Guard alive on tile
+    const guardHere = guards.some(
+      (g) => g.col === tile.col && g.row === tile.row && g.state !== 'dead'
+    );
+    if (guardHere) return true;
+
+    // Corpse on tile
+    const corpse = findDeadGuardAtCell(tile.col, tile.row);
+    if (corpse) return true;
+
+    return false;
+  }
+
+  function updatePressureTilesState() {
+    if (!pressureTiles || !pressureTiles.length) return;
+
+    ensurePressureTilesValid();
+    if (!pressureTiles || !pressureTiles.length) return;
+
+    const triggersNeedingCheck = new Set();
+
+    pressureTiles.forEach((tile) => {
+      const st = triggerRuntimeState[tile.triggerIndex];
+      if (st && st.completed) {
+        tile.applied = true;
+        tile.holdTicks = PRESSURE_APPLY_TICKS;
+        updatePressureTileVisual(tile);
+        return;
+      }
+
+      const occupied = isPressureTileOccupied(tile);
+      if (occupied) {
+        tile.holdTicks++;
+        if (tile.holdTicks >= PRESSURE_APPLY_TICKS) {
+          if (!tile.applied) {
+            tile.applied = true;
+          }
+        }
+      } else {
+        tile.holdTicks = 0;
+        tile.applied = false;
+      }
+
+      updatePressureTileVisual(tile);
+      triggersNeedingCheck.add(tile.triggerIndex);
+    });
+
+    triggersNeedingCheck.forEach((idx) => {
+      const st = triggerRuntimeState[idx];
+      if (st && st.completed) return;
+      const tiles = pressureTiles.filter((t) => t.triggerIndex === idx);
+      if (!tiles.length) return;
+      const allApplied = tiles.every((t) => t.applied);
+      if (allApplied) {
+        completeLiberationTrigger(idx);
+      }
+    });
+  }
+
+  function removePressureTilesForTrigger(triggerIndex) {
+    if (!pressureTiles || !pressureTiles.length) return;
+    const survivors = [];
+    pressureTiles.forEach((t) => {
+      if (t.triggerIndex === triggerIndex) {
+        if (t.el && t.el.parentNode) {
+          t.el.parentNode.removeChild(t.el);
+        }
+      } else {
+        survivors.push(t);
+      }
+    });
+    pressureTiles = survivors;
+  }
+
+  function ensurePressureTilesValid() {
+    if (!pressureTiles || !pressureTiles.length) return;
+
+    const invalidTriggers = new Set();
+    pressureTiles.forEach((t) => {
+      const glyph = getOrcaGlyph(t.col, t.row);
+      if (glyph !== '.' || !isWalkable(t.col, t.row)) {
+        invalidTriggers.add(t.triggerIndex);
+      }
+    });
+
+    if (!invalidTriggers.size) return;
+
+    invalidTriggers.forEach((idx) => {
+      removePressureTilesForTrigger(idx);
+      const trigger = liberationTriggers[idx];
+      const st = triggerRuntimeState[idx];
+      if (trigger && st && !st.completed) {
+        createPressureTilesForTrigger(idx, trigger);
+      }
+    });
+
+    updateAllPressureTilesPosition();
+  }
+
   function initPatchMarkersDom() {
     if (!patchMarkersContainer) return;
 
@@ -3368,6 +3685,7 @@ function createPlacedBait(col, row) {
     patchMarkersContainer.innerHTML = '';
     patchMarkers = [];
     destroyTargets = [];
+    pressureTiles = [];
 
     if (!liberationTriggers || liberationTriggers.length === 0) {
       return;
@@ -3400,6 +3718,7 @@ function createPlacedBait(col, row) {
         el.style.position = 'absolute';
         el.style.boxSizing = 'border-box';
         el.style.pointerEvents = 'none';
+        el.style.zIndex = '2'; // above guards/corpses and pressure tiles
 
         const inner = document.createElement('div');
         inner.className = 'orca-stealth-patch-marker-inner';
@@ -3473,11 +3792,14 @@ function createPlacedBait(col, row) {
             'is missing destroyTarget.col/row'
           );
         }
+      } else if (ritual === 'pressure_tiles') {
+        createPressureTilesForTrigger(triggerIndex, trigger);
       }
     });
 
     updatePatchMarkersPosition();
     updateAllDestroyTargetsPosition();
+    updateAllPressureTilesPosition();
   }
 
 
@@ -3551,6 +3873,15 @@ function createPlacedBait(col, row) {
     if (ritual === 'destroyTarget') {
       console.log(
         '[overlay] Destroy-target ritual: action on marker ignored for trigger',
+        trigger.id || triggerIndex
+      );
+      return;
+    }
+
+    // --- Ritual: PRESSURE TILES ---
+    if (ritual === 'pressure_tiles') {
+      console.log(
+        '[overlay] pressure_tiles ritual: marker interaction ignored for trigger',
         trigger.id || triggerIndex
       );
       return;
@@ -3726,6 +4057,16 @@ function createPlacedBait(col, row) {
         }
       }
     });
+
+    // Lock pressure tiles of this trigger in applied state (visual only)
+    if (pressureTiles && pressureTiles.length) {
+      pressureTiles.forEach((t) => {
+        if (t.triggerIndex !== triggerIndex) return;
+        t.applied = true;
+        t.holdTicks = PRESSURE_APPLY_TICKS;
+        updatePressureTileVisual(t);
+      });
+    }
 
     console.log(
       '[overlay] Liberation trigger completed:',
@@ -6087,6 +6428,11 @@ function stepGuardAlert(guard) {
       playerMoveCooldownTicks--;
     }
 
+    // If A is held and we are standing on a corpse, auto-start dragging
+    if (playerDragKeyHeld && !playerDraggingCorpse) {
+      tryStartDraggingCorpse();
+    }
+
     // Assegna slot cardinali per settore (N/E/S/W) una volta per tick
     assignSectorCardinals();
 
@@ -6115,7 +6461,10 @@ function stepGuardAlert(guard) {
     // 7) Blink pickups
     updatePickupsBlink();
 
-    // 8) Player blink while invulnerable
+    // 8) Pressure tiles ritual handling
+    updatePressureTilesState();
+
+    // 9) Player blink while invulnerable
     updatePlayerBlink();
 
   }
@@ -6142,7 +6491,33 @@ function stepGuardAlert(guard) {
   }
 
   function tryStartDraggingCorpse() {
-    const corpse = findDeadGuardAtCell(playerCol, playerRow);
+    if (playerDraggingCorpse) {
+      return true;
+    }
+
+    let corpse = findDeadGuardAtCell(playerCol, playerRow);
+
+    // If none underfoot, try snapping onto an adjacent corpse cell (cardinal)
+    if (!corpse) {
+      const offsets = [
+        { dx: 1, dy: 0 },
+        { dx: -1, dy: 0 },
+        { dx: 0, dy: 1 },
+        { dx: 0, dy: -1 }
+      ];
+      for (let i = 0; i < offsets.length; i++) {
+        const nx = playerCol + offsets[i].dx;
+        const ny = playerRow + offsets[i].dy;
+        const c = findDeadGuardAtCell(nx, ny);
+        if (c) {
+          playerCol = nx;
+          playerRow = ny;
+          updatePlayerPosition();
+          corpse = c;
+          break;
+        }
+      }
+    }
     if (!corpse) {
       return false;
     }
@@ -6153,6 +6528,10 @@ function stepGuardAlert(guard) {
     playerDraggedGuard = corpse;
     playerDragKeyHeld = true;
     corpse.draggedByPlayer = true;
+    corpse.col = playerCol;
+    corpse.row = playerRow;
+    clampGuard(corpse);
+    updateGuardPosition(corpse);
     playerMoveCooldownTicks = 0; // allow immediate first move
     return true;
   }
