@@ -92,7 +92,7 @@
   ];
   const RIFLE_FOV_DEPTH             = RIFLE_FOV_WIDTHS.length; // 16
   const RIFLE_SHOT_DAMAGE           = 2;   // HP removed per rifle shot
-  const RIFLE_BEAM_DURATION_MS      = 2000;
+  const RIFLE_BEAM_DURATION_MS      = 900;
   const RIFLE_BEAM_DURATION_TICKS   = Math.ceil(
     (RIFLE_BEAM_DURATION_MS) / WORLD_TICK_MS
   );
@@ -1019,17 +1019,17 @@
 
 @keyframes orcaRifleBeamBlink {
   0%   { opacity: 1; }
-  50%  { opacity: 0.28; }
+  50%  { opacity: 0.12; }
   100% { opacity: 1; }
 }
 .orca-stealth-rifle-beam {
   position: absolute;
   left: 0;
   top: 0;
-  height: 2px;
+  height: 1px;
   pointer-events: none;
   animation-name: orcaRifleBeamBlink;
-  animation-duration: 0.45s;
+  animation-duration: 0.18s;
   animation-iteration-count: infinite;
   animation-timing-function: linear;
 }
@@ -1047,11 +1047,21 @@
   background: repeating-linear-gradient(
     to right,
     #ffeb3b 0%,
-    #ffeb3b 30%,
-    transparent 45%,
-    transparent 70%,
-    #ffeb3b 85%,
-    #ffeb3b 100%
+    #ffeb3b 8%,
+    transparent 14%,
+    transparent 22%,
+    #ffeb3b 28%,
+    #ffeb3b 34%,
+    transparent 40%,
+    transparent 48%,
+    #ffeb3b 54%,
+    #ffeb3b 60%,
+    transparent 66%,
+    transparent 74%,
+    #ffeb3b 80%,
+    #ffeb3b 86%,
+    transparent 92%,
+    transparent 100%
   );
 }
 .orca-stealth-rifle-beam .beam-left {
@@ -2581,7 +2591,7 @@ function updateHudLayout() {
   // Record every cell crossed in this world tick so we can animate
   // multi-step movement instead of "teleporting" several cells at once.
   function recordGuardStepForAnimation(guard) {
-    if (!guard || guard.renderTrailTick !== worldTick || !guard.renderTrail) {
+    if (!guard || guard.state === 'dead' || guard.renderTrailTick !== worldTick || !guard.renderTrail) {
       return;
     }
 
@@ -2596,6 +2606,15 @@ function updateHudLayout() {
   // Prepare per-guard render trails at the start of each world tick.
   function beginGuardStepAnimationRecording() {
     guards.forEach((g) => {
+      if (!g || g.state === 'dead') {
+        g.renderTrailTick = null;
+        g.renderTrail = null;
+        if (g.activeRenderAnimation && typeof g.activeRenderAnimation.cancel === 'function') {
+          g.activeRenderAnimation.cancel();
+          g.activeRenderAnimation = null;
+        }
+        return;
+      }
       if (g.activeRenderAnimation && typeof g.activeRenderAnimation.cancel === 'function') {
         g.activeRenderAnimation.cancel();
         g.activeRenderAnimation = null;
@@ -2611,6 +2630,7 @@ function updateHudLayout() {
     guards.forEach((guard) => {
       if (
         !guard ||
+        guard.state === 'dead' ||
         guard.renderTrailTick !== worldTick ||
         !guard.renderTrail ||
         guard.renderTrail.length < 2 ||
@@ -2803,8 +2823,8 @@ function updateHudLayout() {
       // Hollow yellow circle with inner cross
       inner.style.left = '50%';
       inner.style.top = '50%';
-      inner.style.width = '70%';
-      inner.style.height = '70%';
+      inner.style.width = '50%';
+      inner.style.height = '50%';
       inner.style.transform = 'translate(-50%, -50%)';
       inner.style.borderRadius = '50%';
       inner.style.border = '2px solid #ffeb3b';
@@ -5021,7 +5041,7 @@ function createPlacedBait(col, row) {
     const line = document.createElement('div');
     line.className = 'orca-stealth-rifle-beam';
     line.style.width = len + 'px';
-    line.style.height = Math.max(2, cellH * 0.12) + 'px';
+    line.style.height = Math.max(1, cellH * 0.06) + 'px';
     line.style.transformOrigin = '0 50%';
     line.style.transform =
       'translate(' + startX + 'px,' + startY + 'px) rotate(' + angleDeg + 'deg)';
@@ -6742,6 +6762,13 @@ function stepGuardAlert(guard) {
   function killGuard(guard) {
     if (!guard || guard.state === 'dead') return;
 
+    // Stop any ongoing movement animation and snap to logical position
+    if (guard.activeRenderAnimation && typeof guard.activeRenderAnimation.cancel === 'function') {
+      guard.activeRenderAnimation.cancel();
+      guard.activeRenderAnimation = null;
+    }
+    updateGuardPosition(guard);
+
     guard.state = 'dead';
     guard.dead = true;
     guard.hp = 0;
@@ -6753,6 +6780,8 @@ function stepGuardAlert(guard) {
     guard.seenPlayer = false;
     guard.wasSeeingPlayer = false;
     guard.fovCells = [];
+    guard.renderTrail = null;
+    guard.renderTrailTick = null;
 
     if (guard.el) {
       guard.el.style.opacity = '0.9';
@@ -7000,6 +7029,13 @@ function stepGuardAlert(guard) {
     guard.seenPlayer = false;
     guard.wasSeeingPlayer = false;
     guard.fovCells = [];
+    if (guard.activeRenderAnimation && typeof guard.activeRenderAnimation.cancel === 'function') {
+      guard.activeRenderAnimation.cancel();
+      guard.activeRenderAnimation = null;
+    }
+    guard.renderTrail = null;
+    guard.renderTrailTick = null;
+    updateGuardPosition(guard);
     if (guard.el) {
       guard.el.style.opacity = '0.25';
     }
