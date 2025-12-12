@@ -201,6 +201,7 @@ function runPatchToLevel(options, cb) {
     ammo = 3,
     medikits = 2,
     bait = 3,
+    rifle = 0,
     ritualType = 'fourCorners',
     patchRituals = [],
     wallChar = 'y'
@@ -225,7 +226,8 @@ function runPatchToLevel(options, cb) {
     '', // ritualId
     ritualType,
     '0',
-    '4'
+    '4',
+    String(rifle)
   ];
 
   const child = spawn(process.execPath, args, {
@@ -347,6 +349,7 @@ const server = http.createServer(async (req, res) => {
         ammo: settings.ammo || 3,
         medikits: settings.medikits || 2,
         bait: settings.bait || 3,
+        rifle: settings.rifle || 0,
         ritualType,
         patchRituals: ritualList,
         wallChar: settings.walls || 'y'

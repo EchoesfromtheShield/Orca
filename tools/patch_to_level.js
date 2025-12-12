@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp]
+//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -66,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups]');
   process.exit(1);
 }
 
@@ -93,10 +93,12 @@ const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
 //   argv[8]  -> AMMO_PICKUPS
 //   argv[9]  -> MEDIKIT_PICKUPS
 //   argv[10] -> BAIT_PICKUPS
+//   argv[15] -> RIFLE_PICKUPS (optional, can also use env.RIFLE_PICKUPS)
 //   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
 const baitArg = process.argv[10] || process.env.BAIT_PICKUPS;
+const rifleArg = process.argv[15] || process.env.RIFLE_PICKUPS;
 
 // Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
@@ -110,6 +112,10 @@ const MEDIKIT_PICKUP_COUNT = medArg != null
 const BAIT_PICKUP_COUNT = baitArg != null
   ? Math.max(0, parseInt(baitArg, 10) || 0)
   : 3;
+
+const RIFLE_PICKUP_COUNT = rifleArg != null
+  ? Math.max(0, parseInt(rifleArg, 10) || 0)
+  : 0;
 
 // Ritual: optional identifier for this level/ritual
 // Can be provided via CLI (11th arg) or env.RITUAL_ID
@@ -1444,6 +1450,15 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
         usedKeys.add(`${c.col},${c.row}`);
       });
 
+      // 4) Rifle (on cells not used by ammo+medikit+bait)
+      const remainingForRifle = allWalkable.filter(
+        (c) => !usedKeys.has(`${c.col},${c.row}`)
+      );
+      const rifleCells = pickRandomCells(remainingForRifle, RIFLE_PICKUP_COUNT);
+      rifleCells.forEach((c) => {
+        usedKeys.add(`${c.col},${c.row}`);
+      });
+
       // Push into pickups array
       ammoCells.forEach((pos) => {
         pickups.push({
@@ -1464,6 +1479,14 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       baitCells.forEach((pos) => {
         pickups.push({
           type: 'bait',
+          col: pos.col,
+          row: pos.row
+        });
+      });
+
+      rifleCells.forEach((pos) => {
+        pickups.push({
+          type: 'rifle',
           col: pos.col,
           row: pos.row
         });
@@ -2182,18 +2205,23 @@ try {
   const baitCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'bait').length
     : 0;
+  const rifleCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'rifle').length
+    : 0;
 
   console.log(
     '  Pickups requested: ammo =', AMMO_PICKUP_COUNT,
     ', medikit =', MEDIKIT_PICKUP_COUNT,
-    ', bait =', BAIT_PICKUP_COUNT
+    ', bait =', BAIT_PICKUP_COUNT,
+    ', rifle =', RIFLE_PICKUP_COUNT
   );
   console.log(
     '  Pickups generated:',
     totalPickups,
     '(ammo =', ammoCount,
     ', medikit =', medCount,
-    ', bait =', baitCount, ')'
+    ', bait =', baitCount,
+    ', rifle =', rifleCount, ')'
   );
   console.log('  Ritual unlock type:', RITUAL_TYPE);
   if (RITUAL_TYPE === 'getKey') {
@@ -2206,4 +2234,3 @@ try {
   console.error('[patch_to_level] Error:', err.message);
   process.exit(1);
 }
-

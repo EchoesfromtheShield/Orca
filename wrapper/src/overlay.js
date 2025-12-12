@@ -76,6 +76,7 @@
   const INITIAL_MEDIKIT_PICKUPS     = 2;  // number of medikit pickups to spawn
   const INITIAL_AMMO_PICKUPS        = 3;  // number of ammo pickups to spawn
   const INITIAL_BAIT_PICKUPS        = 3;  // NEW: legacy default number of bait pickups
+  const INITIAL_RIFLE_PICKUPS       = 0;  // rifle charges pickup (legacy default: none)
 
   // Player shoot keys
   const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
@@ -83,6 +84,18 @@
   // NEW: Bait tuning
   const BAIT_MAX_HP                 = 4;  // bait hit points (tunable)
   const PLAYER_BAIT_MAX             = 3;  // max baits that player can carry (tunable)
+  const PLAYER_RIFLE_MAX            = 3;  // max rifle charges player can carry
+  const RIFLE_FOV_WIDTHS            = [
+    1, 1, // first 2 cells depth -> width 1
+    3, 3, 3, 3, 3, 3, 3, 3, // next 8 cells depth -> width 3
+    5, 5, 5, 5, 5, 5 // last 6 cells depth -> width 5
+  ];
+  const RIFLE_FOV_DEPTH             = RIFLE_FOV_WIDTHS.length; // 16
+  const RIFLE_SHOT_DAMAGE           = 2;   // HP removed per rifle shot
+  const RIFLE_BEAM_DURATION_MS      = 2000;
+  const RIFLE_BEAM_DURATION_TICKS   = Math.ceil(
+    (RIFLE_BEAM_DURATION_MS) / WORLD_TICK_MS
+  );
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
@@ -463,6 +476,14 @@
     guardsFrozen = false;
     patchResetCountdowns = {};
     selectedEquipmentIndex = 0;
+    playerRifles = 0;
+    rifleAimActive = false;
+    rifleAimFovCells = [];
+    rifleAimTargetGuardId = null;
+    rifleAimAnchorCol = null;
+    rifleAimAnchorRow = null;
+    rifleAimAnchorDir = null;
+    clearRifleBeams();
     if (allPatchesUnlockedDiv) {
       allPatchesUnlockedDiv.style.display = 'none';
     }
@@ -654,6 +675,7 @@
 
   // Player baits inventory
   let playerBaits = 0; // number of baits currently carried
+  let playerRifles = 0; // number of rifle charges currently carried
   let selectedEquipmentIndex = 0; // 0 = BAIT, cycles with R
 
   // Guards
@@ -682,6 +704,17 @@
   let baitsContainer = null;
   let baits = [];
   let nextBaitId = 1;
+
+  // Rifle aim / beams
+  let rifleFxContainer = null;
+  let rifleAimActive = false;
+  let rifleAimFovCells = [];
+  let rifleAimTargetGuardId = null;
+  let rifleAimAnchorCol = null;
+  let rifleAimAnchorRow = null;
+  let rifleAimAnchorDir = null;
+  let rifleAimCandidates = [];
+  let rifleBeams = []; // { el, ttl }
 
   // NEW: destroy-targets associated with liberation triggers
   // Each entry: { triggerIndex, col, row, hp, maxHP, el, outer, inner, dot, alive }
@@ -983,6 +1016,83 @@
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
+
+@keyframes orcaRifleBeamBlink {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.28; }
+  100% { opacity: 1; }
+}
+.orca-stealth-rifle-beam {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 2px;
+  pointer-events: none;
+  animation-name: orcaRifleBeamBlink;
+  animation-duration: 0.45s;
+  animation-iteration-count: infinite;
+  animation-timing-function: linear;
+}
+.orca-stealth-rifle-beam .beam-center {
+  position: absolute;
+  height: 100%;
+  background: #ffeb3b;
+  left: 12%;
+  right: 12%;
+}
+.orca-stealth-rifle-beam .beam-dash {
+  position: absolute;
+  height: 100%;
+  top: 0;
+  background: repeating-linear-gradient(
+    to right,
+    #ffeb3b 0%,
+    #ffeb3b 30%,
+    transparent 45%,
+    transparent 70%,
+    #ffeb3b 85%,
+    #ffeb3b 100%
+  );
+}
+.orca-stealth-rifle-beam .beam-left {
+  left: 0;
+  width: 12%;
+}
+.orca-stealth-rifle-beam .beam-right {
+  right: 0;
+  width: 12%;
+}
+
+.orca-stealth-rifle-cross {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 75%;
+  height: 75%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.orca-stealth-rifle-cross .h,
+.orca-stealth-rifle-cross .v {
+  position: absolute;
+  background: #ffeb3b;
+  opacity: 0.95;
+}
+.orca-stealth-rifle-cross .h {
+  top: 50%;
+  left: 0;
+  width: 100%;
+  height: 16%;
+  transform: translateY(-50%);
+}
+.orca-stealth-rifle-cross .v {
+  left: 50%;
+  top: 0;
+  width: 16%;
+  height: 100%;
+  transform: translateX(-50%);
+}
+
       `;
       document.head.appendChild(existingStyle);
     }
@@ -1064,6 +1174,17 @@
     patchMarkersContainer.style.height = '100%';
     patchMarkersContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(patchMarkersContainer);
+
+    // Rifle FX container (beam + aim overlay, above patch markers, below player)
+    rifleFxContainer = document.createElement('div');
+    rifleFxContainer.id = 'orca-stealth-rifle-fx';
+    rifleFxContainer.style.position = 'absolute';
+    rifleFxContainer.style.left = '0';
+    rifleFxContainer.style.top = '0';
+    rifleFxContainer.style.width = '100%';
+    rifleFxContainer.style.height = '100%';
+    rifleFxContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(rifleFxContainer);
 
     // PLAYER ------------------------------------------------------
     playerDiv = document.createElement('div');
@@ -1215,6 +1336,11 @@
         styles.push('opacity: ' + (available ? '1' : '0.35'));
         const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
         return `<span${styleAttr}>${item.label} ${playerBaits}/${PLAYER_BAIT_MAX}</span>`;
+      } else if (item.id === 'rifle') {
+        const available = playerRifles > 0;
+        styles.push('opacity: ' + (available ? '1' : '0.35'));
+        const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+        return `<span${styleAttr}>${item.label} ${playerRifles}/${PLAYER_RIFLE_MAX}</span>`;
       }
 
       const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
@@ -2673,6 +2799,37 @@ function updateHudLayout() {
       label.style.color = '#ffffff';
 
       inner.appendChild(label);
+    } else if (type === 'rifle') {
+      // Hollow yellow circle with inner cross
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.transform = 'translate(-50%, -50%)';
+      inner.style.borderRadius = '50%';
+      inner.style.border = '2px solid #ffeb3b';
+      inner.style.background = 'transparent';
+
+      const crossH = document.createElement('div');
+      crossH.style.position = 'absolute';
+      crossH.style.left = '0';
+      crossH.style.top = '50%';
+      crossH.style.width = '100%';
+      crossH.style.height = '18%';
+      crossH.style.transform = 'translateY(-50%)';
+      crossH.style.background = '#ffeb3b';
+
+      const crossV = document.createElement('div');
+      crossV.style.position = 'absolute';
+      crossV.style.left = '50%';
+      crossV.style.top = '0';
+      crossV.style.width = '18%';
+      crossV.style.height = '100%';
+      crossV.style.transform = 'translateX(-50%)';
+      crossV.style.background = '#ffeb3b';
+
+      inner.appendChild(crossH);
+      inner.appendChild(crossV);
     }
 
     cell.appendChild(inner);
@@ -2761,6 +2918,7 @@ function updateHudLayout() {
       if (def.type === 'medikit') type = 'medikit';
       else if (def.type === 'ammo') type = 'ammo';
       else if (def.type === 'bait') type = 'bait';
+      else if (def.type === 'rifle') type = 'rifle';
 
       let col = typeof def.col === 'number' ? def.col : null;
       let row = typeof def.row === 'number' ? def.row : null;
@@ -2843,6 +3001,7 @@ function updateHudLayout() {
     placePickups('medikit', INITIAL_MEDIKIT_PICKUPS);
     placePickups('ammo', INITIAL_AMMO_PICKUPS);
     placePickups('bait', INITIAL_BAIT_PICKUPS);
+    placePickups('rifle', INITIAL_RIFLE_PICKUPS);
 
     console.log(
       '[overlay] Initial pickups spawned:',
@@ -2851,7 +3010,9 @@ function updateHudLayout() {
       INITIAL_AMMO_PICKUPS,
       'ammo,',
       INITIAL_BAIT_PICKUPS,
-      'bait.'
+      'bait,',
+      INITIAL_RIFLE_PICKUPS,
+      'rifle.'
     );
 
   }
@@ -4583,6 +4744,327 @@ function createPlacedBait(col, row) {
         fovContainer.appendChild(cellDiv);
       });
     });
+
+    // Rifle AIM FOV (yellow), drawn above guard FOV
+    if (rifleAimActive && rifleAimFovCells && rifleAimFovCells.length) {
+      const rifleColor = 'rgba(255, 235, 59, 0.25)';
+      rifleAimFovCells.forEach((cell) => {
+        const cellDiv = document.createElement('div');
+        cellDiv.style.position = 'absolute';
+        cellDiv.style.left = (cell.col * cellW) + 'px';
+        cellDiv.style.top = (cell.row * cellH) + 'px';
+        cellDiv.style.width = cellW + 'px';
+        cellDiv.style.height = cellH + 'px';
+        cellDiv.style.background = rifleColor;
+        fovContainer.appendChild(cellDiv);
+      });
+    }
+  }
+
+  // --------------------------------------------------
+  // Rifle AIM (FOV, targeting, beam)
+  // --------------------------------------------------
+
+  function clearRifleBeams() {
+    if (rifleFxContainer) {
+      while (rifleFxContainer.firstChild) {
+        rifleFxContainer.removeChild(rifleFxContainer.firstChild);
+      }
+    }
+    rifleBeams = [];
+  }
+
+  function updateRifleBeams() {
+    if (!rifleBeams || rifleBeams.length === 0) return;
+    for (let i = rifleBeams.length - 1; i >= 0; i--) {
+      const b = rifleBeams[i];
+      b.ttl = (b.ttl || 0) - 1;
+      if (b.ttl <= 0 || !b.el || !b.el.parentNode) {
+        if (b.el && b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        rifleBeams.splice(i, 1);
+      }
+    }
+  }
+
+  function setGuardRifleTarget(guard, active) {
+    if (!guard || !guard.inner) return;
+    let cross = guard.rifleCross;
+    if (active) {
+      if (!cross) {
+        cross = document.createElement('div');
+        cross.className = 'orca-stealth-rifle-cross';
+        const h = document.createElement('div');
+        h.className = 'h';
+        const v = document.createElement('div');
+        v.className = 'v';
+        cross.appendChild(h);
+        cross.appendChild(v);
+        guard.inner.appendChild(cross);
+        guard.rifleCross = cross;
+      }
+      cross.style.display = 'block';
+    } else if (cross) {
+      cross.style.display = 'none';
+    }
+  }
+
+  function clearRifleTargets() {
+    guards.forEach((g) => setGuardRifleTarget(g, false));
+  }
+
+  function computeRifleFovCells() {
+    const result = [];
+    if (cellW <= 0 || cellH <= 0) return result;
+
+    let dx = 0;
+    let dy = 0;
+    if (playerDir === 'up') dy = -1;
+    else if (playerDir === 'down') dy = 1;
+    else if (playerDir === 'left') dx = -1;
+    else if (playerDir === 'right') dx = 1;
+
+    if (dx === 0 && dy === 0) return result;
+
+    const candidates = [];
+
+    if (dx !== 0) {
+      for (let d = 1; d <= RIFLE_FOV_DEPTH; d++) {
+        const forwardCol = playerCol + dx * d;
+        if (forwardCol < 0 || forwardCol >= gridCols) break;
+
+        const w = RIFLE_FOV_WIDTHS[d - 1] || 1;
+        const half = (w - 1) / 2;
+        let startRow = playerRow - half;
+        let endRow = playerRow + half;
+
+        if (startRow > endRow) {
+          const tmp = startRow;
+          startRow = endRow;
+          endRow = tmp;
+        }
+
+        if (endRow < 0 || startRow > gridRows - 1) {
+          continue;
+        }
+
+        if (startRow < 0) startRow = 0;
+        if (endRow > gridRows - 1) endRow = gridRows - 1;
+
+        for (let ry = startRow; ry <= endRow; ry++) {
+          candidates.push({ col: forwardCol, row: ry });
+        }
+      }
+    } else if (dy !== 0) {
+      for (let d = 1; d <= RIFLE_FOV_DEPTH; d++) {
+        const forwardRow = playerRow + dy * d;
+        if (forwardRow < 0 || forwardRow >= gridRows) break;
+
+        const w = RIFLE_FOV_WIDTHS[d - 1] || 1;
+        const half = (w - 1) / 2;
+        let startCol = playerCol - half;
+        let endCol = playerCol + half;
+
+        if (startCol > endCol) {
+          const tmp = startCol;
+          startCol = endCol;
+          endCol = tmp;
+        }
+
+        if (endCol < 0 || startCol > gridCols - 1) {
+          continue;
+        }
+
+        if (startCol < 0) startCol = 0;
+        if (endCol > gridCols - 1) endCol = gridCols - 1;
+
+        for (let cx = startCol; cx <= endCol; cx++) {
+          candidates.push({ col: cx, row: forwardRow });
+        }
+      }
+    }
+
+    const seen = new Set();
+    for (let i = 0; i < candidates.length; i++) {
+      const cell = candidates[i];
+      const c = cell.col;
+      const r = cell.row;
+      if (c < 0 || r < 0 || c >= gridCols || r >= gridRows) continue;
+      const key = c + ':' + r;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!isWalkable(c, r)) continue;
+      if (!hasLineOfSightForFov(playerCol, playerRow, c, r)) continue;
+      result.push({ col: c, row: r });
+    }
+
+    return result;
+  }
+
+  function exitRifleAim(reason) {
+    rifleAimActive = false;
+    rifleAimFovCells = [];
+    rifleAimTargetGuardId = null;
+    rifleAimCandidates = [];
+    rifleAimAnchorCol = null;
+    rifleAimAnchorRow = null;
+    rifleAimAnchorDir = null;
+    clearRifleTargets();
+    renderGuardFov();
+    if (reason && DEBUG) {
+      console.log('[overlay] Rifle AIM exit:', reason);
+    }
+  }
+
+  function enterRifleAim() {
+    if (playerRifles <= 0) {
+      console.log('[overlay] PLAYER tried to AIM rifle without charges.');
+      return;
+    }
+    rifleAimActive = true;
+    rifleAimAnchorCol = playerCol;
+    rifleAimAnchorRow = playerRow;
+    rifleAimAnchorDir = playerDir;
+    updateRifleAimState(true);
+  }
+
+  function updateRifleAimState(forceRetarget) {
+    if (!rifleAimActive) return;
+
+    // Auto-exit if player moved or lost ammo
+    if (playerRifles <= 0) {
+      exitRifleAim('no-rifle');
+      return;
+    }
+    if (
+      rifleAimAnchorDir != null &&
+      rifleAimAnchorDir !== playerDir
+    ) {
+      exitRifleAim('direction-changed');
+      return;
+    }
+    if (
+      rifleAimAnchorCol != null &&
+      (rifleAimAnchorCol !== playerCol || rifleAimAnchorRow !== playerRow)
+    ) {
+      exitRifleAim('player-moved');
+      return;
+    }
+
+    rifleAimFovCells = computeRifleFovCells();
+
+    const fovKeys = new Set(
+      rifleAimFovCells.map((c) => c.col + ':' + c.row)
+    );
+
+    const candidates = [];
+    guards.forEach((g) => {
+      if (!g || g.state === 'dead') return;
+      const key = g.col + ':' + g.row;
+      if (fovKeys.has(key)) {
+        candidates.push(g);
+      }
+    });
+
+    rifleAimCandidates = candidates.map((g) => g.id || '');
+
+    let targetGuard = null;
+    if (rifleAimTargetGuardId) {
+      targetGuard = candidates.find(
+        (g) => (g.id || '') === rifleAimTargetGuardId
+      );
+    }
+    if (!targetGuard && candidates.length) {
+      if (forceRetarget) {
+        targetGuard = candidates[0];
+      } else {
+        targetGuard = candidates[Math.floor(Math.random() * candidates.length)];
+      }
+    }
+
+    rifleAimTargetGuardId = targetGuard ? (targetGuard.id || null) : null;
+
+    guards.forEach((g) => {
+      setGuardRifleTarget(g, rifleAimTargetGuardId === (g.id || null));
+    });
+
+    // Keep FOV rendering in sync
+    renderGuardFov();
+  }
+
+  function cycleRifleTarget() {
+    if (!rifleAimActive) return;
+    if (!rifleAimCandidates || rifleAimCandidates.length === 0) return;
+    const currentId = rifleAimTargetGuardId;
+    let idx = rifleAimCandidates.indexOf(currentId);
+    idx = (idx + 1) % rifleAimCandidates.length;
+    rifleAimTargetGuardId = rifleAimCandidates[idx];
+    guards.forEach((g) => {
+      setGuardRifleTarget(g, rifleAimTargetGuardId === (g.id || null));
+    });
+  }
+
+  function addRifleBeamEffect(fromCol, fromRow, toCol, toRow) {
+    if (!rifleFxContainer || cellW <= 0 || cellH <= 0) return;
+
+    const startX = (fromCol + 0.5) * cellW;
+    const startY = (fromRow + 0.5) * cellH;
+    const endX = (toCol + 0.5) * cellW;
+    const endY = (toRow + 0.5) * cellH;
+
+    const dx = endX - startX;
+    const dy = endY - startY;
+    const len = Math.max(2, Math.sqrt(dx * dx + dy * dy));
+    const angleDeg = Math.atan2(dy, dx) * (180 / Math.PI);
+
+    const line = document.createElement('div');
+    line.className = 'orca-stealth-rifle-beam';
+    line.style.width = len + 'px';
+    line.style.height = Math.max(2, cellH * 0.12) + 'px';
+    line.style.transformOrigin = '0 50%';
+    line.style.transform =
+      'translate(' + startX + 'px,' + startY + 'px) rotate(' + angleDeg + 'deg)';
+
+    const center = document.createElement('div');
+    center.className = 'beam-center';
+    const left = document.createElement('div');
+    left.className = 'beam-dash beam-left';
+    const right = document.createElement('div');
+    right.className = 'beam-dash beam-right';
+
+    line.appendChild(center);
+    line.appendChild(left);
+    line.appendChild(right);
+
+    rifleFxContainer.appendChild(line);
+    rifleBeams.push({ el: line, ttl: RIFLE_BEAM_DURATION_TICKS });
+  }
+
+  function fireRifleShot() {
+    if (!rifleAimActive) return;
+    const target = guards.find(
+      (g) => g && (g.id || '') === (rifleAimTargetGuardId || '') && g.state !== 'dead'
+    );
+    if (!target) {
+      exitRifleAim('target-lost');
+      return;
+    }
+
+    addRifleBeamEffect(playerCol, playerRow, target.col, target.row);
+
+    target.hp = Math.max(0, (target.hp || GUARD_MAX_HP) - RIFLE_SHOT_DAMAGE);
+    if (target.hp <= 0) {
+      killGuard(target);
+    } else {
+      updateGuardSpriteAppearance(target);
+    }
+
+    playerRifles--;
+    if (playerRifles < 0) playerRifles = 0;
+    updateModeVisual();
+
+    exitRifleAim('fired');
   }
 
 
@@ -6467,6 +6949,24 @@ function stepGuardAlert(guard) {
         );
         return false;
       }
+    } else if (pickup.type === 'rifle') {
+      if (playerRifles < PLAYER_RIFLE_MAX) {
+        playerRifles++;
+        if (playerRifles > PLAYER_RIFLE_MAX) playerRifles = PLAYER_RIFLE_MAX;
+        console.log(
+          '[overlay] PLAYER picked RIFLE charge. RIFLE:',
+          playerRifles,
+          '/',
+          PLAYER_RIFLE_MAX
+        );
+        updateModeVisual();
+        return true;
+      } else {
+        console.log(
+          '[overlay] PLAYER picked RIFLE but is already at max charges.'
+        );
+        return false;
+      }
     }
 
     return false;
@@ -6517,6 +7017,8 @@ function stepGuardAlert(guard) {
       clearInterval(guardTimer);
       guardTimer = null;
     }
+    exitRifleAim('game-over');
+    clearRifleBeams();
 
     if (gameOverDiv) {
       gameOverDiv.style.display = 'flex';
@@ -6627,6 +7129,7 @@ function stepGuardAlert(guard) {
         playerMoveCooldownTicks--;
       }
       updatePickupsBlink();
+      updateRifleBeams();
       updatePlayerBlink();
       return;
     }
@@ -6667,6 +7170,9 @@ function stepGuardAlert(guard) {
     // 3) Ricalcola solo le forme dei FOV dopo il movimento (senza toccare timer)
     updateAllFovAndAlert(false);
 
+    // 3.5) Rifle aim tracking (FOV + target) after positions are updated
+    updateRifleAimState(false);
+
     // 4) Attacchi a distanza
     guards.forEach(shootingTickForGuard);
 
@@ -6678,6 +7184,9 @@ function stepGuardAlert(guard) {
 
     // 6) Collisioni corpo a corpo (stealth / danno)
     checkGuardPlayerCollisions();
+
+    // 6.5) Rifle beams decay
+    updateRifleBeams();
 
     // 7) Blink pickups
     updatePickupsBlink();
@@ -6764,6 +7273,10 @@ function stepGuardAlert(guard) {
     // Do not move if game is over
     if (isGameOver) {
       return;
+    }
+
+    if (rifleAimActive) {
+      exitRifleAim('player-move-input');
     }
 
     // Respect movement cooldown while dragging a corpse
@@ -6925,7 +7438,11 @@ function stepGuardAlert(guard) {
       // Player shoots in the facing direction
       spawnBulletFromPlayer();
     } else if (key === 'r' || key === 'R') {
-      cycleSelectedEquipment();
+      if (rifleAimActive && getSelectedEquipmentId() === 'rifle') {
+        cycleRifleTarget();
+      } else {
+        cycleSelectedEquipment();
+      }
     } else if (key === 'd' || key === 'D') {
       useSelectedEquipment();
     } else {
@@ -6962,9 +7479,31 @@ function stepGuardAlert(guard) {
 
     if (selected.id === 'bait') {
       placeBaitInFrontOfPlayer();
+    } else if (selected.id === 'rifle') {
+      handleRifleAction();
     } else {
       // Placeholder for future equipment mechanics (shield / grenade / rifle)
     }
+  }
+
+  function handleRifleAction() {
+    if (playerRifles <= 0) {
+      console.log('[overlay] PLAYER tried to use RIFLE but inventory is empty.');
+      exitRifleAim('no-rifle');
+      return;
+    }
+
+    if (!rifleAimActive) {
+      enterRifleAim();
+      return;
+    }
+
+    if (!rifleAimTargetGuardId) {
+      exitRifleAim('no-target');
+      return;
+    }
+
+    fireRifleShot();
   }
 
   function placeBaitInFrontOfPlayer() {
