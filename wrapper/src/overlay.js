@@ -87,6 +87,12 @@
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
 
+  // Four-corners reset on alert (seconds)
+  const FOUR_CORNERS_RESET_SECONDS  = 5;
+  const FOUR_CORNERS_RESET_TICKS    = Math.ceil(
+    (FOUR_CORNERS_RESET_SECONDS * 1000) / WORLD_TICK_MS
+  );
+
   // Pressure tiles ritual: time required to apply pressure (in ticks)
   const PRESSURE_APPLY_SECONDS      = 4;
   const PRESSURE_APPLY_TICKS        = Math.ceil(
@@ -449,6 +455,7 @@
     guardSpawnsInitialized = false;
     allPatchesUnlocked = false;
     guardsFrozen = false;
+    patchResetCountdowns = {};
     if (allPatchesUnlockedDiv) {
       allPatchesUnlockedDiv.style.display = 'none';
     }
@@ -598,6 +605,7 @@
   let isGameOver = false;
   let allPatchesUnlocked = false;
   let guardsFrozen = false;
+  let patchResetCountdowns = {}; // triggerIndex -> ticks left for fourCorners reset
 
   let overlayDiv = null;
   let allPatchesUnlockedDiv = null;
@@ -953,6 +961,18 @@
   animation-name: orcaPressureBlink;
   animation-duration: 0.6s;
   animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+
+@keyframes orcaCornerBlinkFast {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.25; }
+  100% { opacity: 1; }
+}
+.orca-stealth-corner-blink-fast {
+  animation-name: orcaCornerBlinkFast;
+  animation-duration: 0.35s;
+  animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
       `;
@@ -2991,6 +3011,51 @@ function updateHudLayout() {
 
     const survivors = [];
 
+    function processCollision(bullet, col, row) {
+      // Out of bounds
+      if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) {
+        return false;
+      }
+
+      // Bait hit
+      const hitBait = findPlacedBaitAtCell(col, row);
+      if (hitBait) {
+        applyBaitHit(hitBait);
+        return false;
+      }
+
+      // Destroy-target (player bullets only)
+      if (bullet.ownerType === 'player') {
+        const hitTarget = findDestroyTargetAtCell(col, row);
+        if (hitTarget) {
+          applyDestroyTargetHit(hitTarget);
+          return false;
+        }
+      }
+
+      // Player hit (guard bullet)
+      if (bullet.ownerType === 'guard' && col === playerCol && row === playerRow) {
+        applyPlayerHit({ id: 'bullet:' + (bullet.fromGuardId || 'guard') });
+        return false;
+      }
+
+      // Guard hit (player bullet)
+      if (bullet.ownerType === 'player') {
+        const hitGuard = findGuardAtCell(col, row);
+        if (hitGuard) {
+          applyGuardHit(hitGuard, bullet);
+          return false;
+        }
+      }
+
+      // Wall / Orca code
+      if (!isWalkable(col, row)) {
+        return false;
+      }
+
+      return true;
+    }
+
     for (let i = 0; i < bullets.length; i++) {
       const b = bullets[i];
       if (!b.alive || !b.el) {
@@ -3002,81 +3067,20 @@ function updateHudLayout() {
 
       let alive = true;
 
+      // Process collision on current cell (important when spawning adjacent)
+      if (!processCollision(b, b.col, b.row)) {
+        if (b.el.parentNode) {
+          b.el.parentNode.removeChild(b.el);
+        }
+        alive = false;
+      }
+
       // Each bullet can advance up to BULLET_STEPS_PER_TICK cells per world tick
       for (let step = 0; step < BULLET_STEPS_PER_TICK && alive; step++) {
         const nextCol = b.col + b.dx;
         const nextRow = b.row + b.dy;
 
-        // Out of bounds
-        if (
-          nextCol < 0 ||
-          nextRow < 0 ||
-          nextCol >= gridCols ||
-          nextRow >= gridRows
-        ) {
-          if (b.el.parentNode) {
-            b.el.parentNode.removeChild(b.el);
-          }
-          alive = false;
-          break;
-        }
-
-        // --- bullet hits a bait (both guard and player bullets) ---
-        const hitBait = findPlacedBaitAtCell(nextCol, nextRow);
-        if (hitBait) {
-          applyBaitHit(hitBait); // reduces HP and eventually killBait() + clearBaitAlertsForBait()
-
-          if (b.el.parentNode) {
-            b.el.parentNode.removeChild(b.el);
-          }
-          alive = false;
-          break;
-        }
-
-        // --- NEW: player bullets can damage destroy-targets ---
-        if (b.ownerType === 'player') {
-          const hitTarget = findDestroyTargetAtCell(nextCol, nextRow);
-          if (hitTarget) {
-            applyDestroyTargetHit(hitTarget);
-
-            if (b.el.parentNode) {
-              b.el.parentNode.removeChild(b.el);
-            }
-            alive = false;
-            break;
-          }
-        }
-        // ----------------------------------------------------------
-
-        // Player hit (only for guard bullets)
-        if (
-          b.ownerType === 'guard' &&
-          nextCol === playerCol &&
-          nextRow === playerRow
-        ) {
-          applyPlayerHit({ id: 'bullet:' + (b.fromGuardId || 'guard') });
-          if (b.el.parentNode) {
-            b.el.parentNode.removeChild(b.el);
-          }
-          alive = false;
-          break;
-        }
-
-        // Guard hit (only for player bullets)
-        if (b.ownerType === 'player') {
-          const hitGuard = findGuardAtCell(nextCol, nextRow);
-          if (hitGuard) {
-            applyGuardHit(hitGuard, b);
-            if (b.el.parentNode) {
-              b.el.parentNode.removeChild(b.el);
-            }
-            alive = false;
-            break;
-          }
-        }
-
-        // Wall / Orca code hit
-        if (!isWalkable(nextCol, nextRow)) {
+        if (!processCollision(b, nextCol, nextRow)) {
           if (b.el.parentNode) {
             b.el.parentNode.removeChild(b.el);
           }
@@ -3729,6 +3733,7 @@ function createPlacedBait(col, row) {
     patchMarkers = [];
     destroyTargets = [];
     pressureTiles = [];
+    patchResetCountdowns = {};
 
     if (!liberationTriggers || liberationTriggers.length === 0) {
       return;
@@ -3989,6 +3994,93 @@ function createPlacedBait(col, row) {
     }
   }
 
+  // -----------------------------
+  // Four-corners reset on alert
+  // -----------------------------
+  function maybeStartFourCornersResetOnAlert() {
+    // Alert active?
+    const alertActive = anySectorTracking() || (globalAlertLevel > 0);
+    if (!alertActive) return;
+    if (!patchMarkers || !patchMarkers.length) return;
+
+    liberationTriggers.forEach((trigger, idx) => {
+      if (!trigger) return;
+      const st = triggerRuntimeState[idx];
+      if (st && st.completed) return;
+      const ritual = getTriggerRitualType(trigger);
+      if (ritual !== 'fourCorners') return;
+      if (patchResetCountdowns[idx] != null) return;
+
+      const markers = getMarkersForTrigger(idx);
+      if (!markers.length) return;
+      const activeCount = markers.filter((m) => m.active).length;
+      if (activeCount > 0 && activeCount < markers.length) {
+        patchResetCountdowns[idx] = FOUR_CORNERS_RESET_TICKS;
+        setCornerBlink(idx, true);
+      }
+    });
+  }
+
+  function updateFourCornersResetCountdowns() {
+    const keys = Object.keys(patchResetCountdowns);
+    if (!keys.length) return;
+
+    keys.forEach((k) => {
+      const idx = parseInt(k, 10);
+      const st = triggerRuntimeState[idx];
+      if (st && st.completed) {
+        setCornerBlink(idx, false);
+        delete patchResetCountdowns[idx];
+        return;
+      }
+
+      const markers = getMarkersForTrigger(idx);
+      if (!markers.length || markers.every((m) => !m.active)) {
+        setCornerBlink(idx, false);
+        delete patchResetCountdowns[idx];
+        return;
+      }
+
+      // Ensure any newly activated corner blinks
+      setCornerBlink(idx, true);
+
+      patchResetCountdowns[idx] = patchResetCountdowns[idx] - 1;
+      if (patchResetCountdowns[idx] <= 0) {
+        setCornerBlink(idx, false);
+        resetFourCornersMarkers(idx);
+      }
+    });
+  }
+
+  function getMarkersForTrigger(triggerIndex) {
+    return patchMarkers.filter((m) => m.triggerIndex === triggerIndex);
+  }
+
+  function setCornerBlink(triggerIndex, enabled) {
+    const markers = getMarkersForTrigger(triggerIndex);
+    markers.forEach((m) => {
+      if (!m.active || !m.inner) return;
+      if (enabled) {
+        m.inner.classList.add('orca-stealth-corner-blink-fast');
+      } else {
+        m.inner.classList.remove('orca-stealth-corner-blink-fast');
+      }
+    });
+  }
+
+  function resetFourCornersMarkers(triggerIndex) {
+    const markers = getMarkersForTrigger(triggerIndex);
+    markers.forEach((m) => {
+      m.active = false;
+      if (m.inner) {
+        m.inner.classList.remove('orca-stealth-corner-blink-fast');
+        m.inner.style.background = '#ffffff';
+        m.inner.style.border = 'none';
+      }
+    });
+    delete patchResetCountdowns[triggerIndex];
+  }
+
   function liberatePatchInOrca(trigger) {
     const client = window.orcaClient;
     if (!client || !client.orca) {
@@ -4109,6 +4201,12 @@ function createPlacedBait(col, row) {
         t.holdTicks = PRESSURE_APPLY_TICKS;
         updatePressureTileVisual(t);
       });
+    }
+
+    // Clear pending countdown for fourCorners (if any)
+    if (patchResetCountdowns[triggerIndex] != null) {
+      setCornerBlink(triggerIndex, false);
+      delete patchResetCountdowns[triggerIndex];
     }
 
     console.log(
@@ -6520,6 +6618,8 @@ function stepGuardAlert(guard) {
 
     // 1) Tick di "percezione": aggiorna FOV + stati di alert + memoria 3s
     updateAllFovAndAlert(true);
+    // Four-corners: if alert and partial progress, start reset countdown
+    maybeStartFourCornersResetOnAlert();
 
     // 2) Movimento guardie (patrol / alert / stunned)
     beginGuardStepAnimationRecording();
@@ -6546,7 +6646,10 @@ function stepGuardAlert(guard) {
     // 8) Pressure tiles ritual handling
     updatePressureTilesState();
 
-    // 9) Player blink while invulnerable
+    // 9) Four-corners reset countdown (alert decay)
+    updateFourCornersResetCountdowns();
+
+    // 10) Player blink while invulnerable
     updatePlayerBlink();
 
   }
@@ -6884,4 +6987,3 @@ function stepGuardAlert(guard) {
     setTimeout(initOverlay, 300);
   });
 })();
-
