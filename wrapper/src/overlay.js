@@ -83,6 +83,12 @@
   // NEW: Bait tuning
   const BAIT_MAX_HP                 = 4;  // bait hit points (tunable)
   const PLAYER_BAIT_MAX             = 3;  // max baits that player can carry (tunable)
+  const EQUIPMENT_ITEMS             = [
+    { id: 'bait', label: 'BAIT' },
+    { id: 'shield', label: 'SHIELD' },
+    { id: 'grenade', label: 'GRENADE' },
+    { id: 'rifle', label: 'RIFLE' }
+  ];
 
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
@@ -456,6 +462,7 @@
     allPatchesUnlocked = false;
     guardsFrozen = false;
     patchResetCountdowns = {};
+    selectedEquipmentIndex = 0;
     if (allPatchesUnlockedDiv) {
       allPatchesUnlockedDiv.style.display = 'none';
     }
@@ -647,6 +654,7 @@
 
   // Player baits inventory
   let playerBaits = 0; // number of baits currently carried
+  let selectedEquipmentIndex = 0; // 0 = BAIT, cycles with R
 
   // Guards
   let guards = [];
@@ -1177,6 +1185,45 @@
     );
   }
 
+  function getSelectedEquipmentId() {
+    const eq = EQUIPMENT_ITEMS[selectedEquipmentIndex];
+    return eq ? eq.id : 'bait';
+  }
+
+  function getSelectedEquipment() {
+    return EQUIPMENT_ITEMS[selectedEquipmentIndex] || EQUIPMENT_ITEMS[0];
+  }
+
+  function cycleSelectedEquipment() {
+    selectedEquipmentIndex =
+      (selectedEquipmentIndex + 1) % Math.max(1, EQUIPMENT_ITEMS.length);
+    updateModeVisual();
+  }
+
+  function renderEquipmentHudLine() {
+    const selectedId = getSelectedEquipmentId();
+    const parts = EQUIPMENT_ITEMS.map((item) => {
+      const isSelected = item.id === selectedId;
+      const styles = [];
+
+      if (isSelected) {
+        styles.push('font-weight: bold');
+      }
+
+      if (item.id === 'bait') {
+        const available = playerBaits > 0;
+        styles.push('opacity: ' + (available ? '1' : '0.35'));
+        const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+        return `<span${styleAttr}>${item.label} ${playerBaits}/${PLAYER_BAIT_MAX}</span>`;
+      }
+
+      const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+      return `<span${styleAttr}>${item.label}</span>`;
+    });
+
+    return `<div>${parts.join('&nbsp;&nbsp;')}</div>`;
+  }
+
   function updateModeVisual() {
     if (!overlayDiv) return;
     const hud = document.getElementById('orca-stealth-hud');
@@ -1186,7 +1233,7 @@
       overlayDiv.style.background = 'rgba(0, 0, 0, 0.85)';
 
       if (hud) {
-        hud.textContent =
+        const line =
           'GAME OVER  HP ' +
           playerHP +
           '/' +
@@ -1195,11 +1242,8 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
-          '  BAIT ' +
-          playerBaits +
-          '/' +
-          PLAYER_BAIT_MAX +
           '  (F1: back to EDIT / tweak ORCA)';
+        hud.innerHTML = `<div>${line}</div>${renderEquipmentHudLine()}`;
         hud.style.color = '#ff4444';
       }
 
@@ -1226,7 +1270,7 @@
     if (mode === 'edit') {
       overlayDiv.style.background = 'rgba(0, 128, 128, 0.03)';
       if (hud) {
-        hud.textContent =
+        const line =
           '[MODE: EDIT] HP ' +
           playerHP +
           '/' +
@@ -1235,10 +1279,8 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
-          '  BAIT ' +
-          playerBaits +
-          '/' +
-          PLAYER_BAIT_MAX;
+          '  (F1: play, GAME: Arrows move, S: shoot, R: cycle equip, D: use equip)';
+        hud.innerHTML = `<div>${line}</div>${renderEquipmentHudLine()}`;
         hud.style.color = '#ffffff';
       }
     } else {
@@ -1249,7 +1291,7 @@
       overlayDiv.style.background = 'rgba(0, 128, 128, 0.10)';
 
       if (hud) {
-        hud.textContent =
+        const line =
           '[MODE: GAME] HP ' +
           playerHP +
           '/' +
@@ -1258,13 +1300,10 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
-          '  BAIT ' +
-          playerBaits +
-          '/' +
-          PLAYER_BAIT_MAX +
           '  [' +
           alertText +
-          ']  (F1: toggle, Arrows: move, S: shoot, D: place bait, Space: Orca clock)';
+          ']  (F1: toggle, Arrows: move, S: shoot, R: cycle equip, D: use equip, Space: Orca clock)';
+        hud.innerHTML = `<div>${line}</div>${renderEquipmentHudLine()}`;
         hud.style.color = '#ffffff';
       }
 
@@ -6832,7 +6871,7 @@ function stepGuardAlert(guard) {
       return;
     }
 
-    // Block everything else, except arrows, A, shoot keys, D
+    // Block everything else, except arrows, A, shoot keys, R, D
     ev.preventDefault();
     ev.stopPropagation();
 
@@ -6842,10 +6881,14 @@ function stepGuardAlert(guard) {
       key === 'ArrowLeft' ||
       key === 'ArrowRight';
 
-    // While dragging a corpse, only arrows are honored; other actions blocked
+    // While dragging a corpse, arrows move; A keeps dragging; R still cycles equipment
     if (playerDraggingCorpse) {
       if (key === 'a' || key === 'A') {
         playerDragKeyHeld = true;
+        return;
+      }
+      if (key === 'r' || key === 'R') {
+        cycleSelectedEquipment();
         return;
       }
       if (isArrow) {
@@ -6881,14 +6924,15 @@ function stepGuardAlert(guard) {
     } else if (PLAYER_SHOOT_KEYS.indexOf(key) !== -1) {
       // Player shoots in the facing direction
       spawnBulletFromPlayer();
+    } else if (key === 'r' || key === 'R') {
+      cycleSelectedEquipment();
     } else if (key === 'd' || key === 'D') {
-      // Place bait in front of the player (if any available)
-      placeBaitInFrontOfPlayer();
+      useSelectedEquipment();
     } else {
 
       if (DEBUG) {
         console.log(
-          '[overlay] Key blocked in GAME mode (not arrows, not Space/A/S/D):',
+          '[overlay] Key blocked in GAME mode (not arrows, not Space/A/S/D/R):',
           key
         );
       }
@@ -6911,6 +6955,17 @@ function stepGuardAlert(guard) {
     }
   }
 
+
+  function useSelectedEquipment() {
+    const selected = getSelectedEquipment();
+    if (!selected) return;
+
+    if (selected.id === 'bait') {
+      placeBaitInFrontOfPlayer();
+    } else {
+      // Placeholder for future equipment mechanics (shield / grenade / rifle)
+    }
+  }
 
   function placeBaitInFrontOfPlayer() {
     // No baits in inventory
