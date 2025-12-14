@@ -1373,6 +1373,15 @@
 
       if (isSelected) {
         styles.push('font-weight: bold');
+        if (item.id === 'bait') {
+          styles.push('color: yellow');
+        } else if (item.id === 'shield') {
+          styles.push('color: #ff00ff');
+        } else if (item.id === 'rifle') {
+          styles.push('color: #00d8ff');
+        } else if (item.id === 'grenade') {
+          styles.push('color: #ff5533');
+        }
       }
 
       if (item.id === 'bait') {
@@ -1409,7 +1418,7 @@
     const hud = document.getElementById('orca-stealth-hud');
     updatePlayerSpriteFill();
     if (shieldActive) {
-      setPlayerColor('#ff9800');
+      setPlayerColor('#ff00ff');
     } else if (shieldBlinkTicks <= 0) {
       setPlayerColor('yellow');
     }
@@ -1465,7 +1474,7 @@
           playerAmmo +
           '/' +
           playerAmmoMax +
-          '  (F1: play, GAME: Arrows move, S: shoot, R: cycle equip, D: use equip)';
+          '  (F1: play, GAME: Arrows move, S: shoot, F: cycle equip, D: use equip)';
         hud.innerHTML = `<div>${line}</div>${renderEquipmentHudLine()}`;
         hud.style.color = '#ffffff';
       }
@@ -1488,7 +1497,7 @@
           playerAmmoMax +
           '  [' +
           alertText +
-          ']  (F1: toggle, Arrows: move, S: shoot, R: cycle equip, D: use equip, Space: Orca clock)';
+          ']  (F1: toggle, Arrows: move, S: shoot, F: cycle equip, D: use equip, Space: Orca clock)';
         hud.innerHTML = `<div>${line}</div>${renderEquipmentHudLine()}`;
         hud.style.color = '#ffffff';
       }
@@ -2903,14 +2912,14 @@ function updateHudLayout() {
     // Upright equilateral triangle (apex up, base down)
     inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
     } else if (type === 'shield') {
-      // Small fuchsia triangle
+      // Small fuchsia diamond
       inner.style.left = '50%';
       inner.style.top = '50%';
       inner.style.width = '60%';
       inner.style.height = '60%';
       inner.style.transform = 'translate(-50%, -50%)';
       inner.style.background = '#ff00ff';
-      inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
+      inner.style.clipPath = 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)';
     } else if (type === 'grenade') {
       // Orange "G" placeholder
       inner.style.left = '50%';
@@ -2928,7 +2937,7 @@ function updateHudLayout() {
       label.style.fontFamily = 'monospace';
       label.style.fontSize = '80%';
       label.style.fontWeight = 'bold';
-      label.style.color = '#ff9800';
+      label.style.color = '#ff5533';
       inner.appendChild(label);
     } else if (type === 'key') {
       // NEW: blinking white "K" (no background)
@@ -7638,7 +7647,7 @@ function stepGuardAlert(guard) {
       return;
     }
 
-    // Block everything else, except arrows, A, shoot keys, R, D
+    // Block everything else, except arrows, A, shoot keys, F, D
     ev.preventDefault();
     ev.stopPropagation();
 
@@ -7648,13 +7657,13 @@ function stepGuardAlert(guard) {
       key === 'ArrowLeft' ||
       key === 'ArrowRight';
 
-    // While dragging a corpse, arrows move; A keeps dragging; R still cycles equipment
+    // While dragging a corpse, arrows move; A keeps dragging; F still cycles equipment
     if (playerDraggingCorpse) {
       if (key === 'a' || key === 'A') {
         playerDragKeyHeld = true;
         return;
       }
-      if (key === 'r' || key === 'R') {
+      if (key === 'f' || key === 'F') {
         cycleSelectedEquipment();
         return;
       }
@@ -7691,7 +7700,7 @@ function stepGuardAlert(guard) {
     } else if (PLAYER_SHOOT_KEYS.indexOf(key) !== -1) {
       // Player shoots in the facing direction
       spawnBulletFromPlayer();
-    } else if (key === 'r' || key === 'R') {
+    } else if (key === 'f' || key === 'F') {
       if (rifleAimActive && getSelectedEquipmentId() === 'rifle') {
         cycleRifleTarget();
       } else {
@@ -7703,7 +7712,7 @@ function stepGuardAlert(guard) {
 
       if (DEBUG) {
         console.log(
-          '[overlay] Key blocked in GAME mode (not arrows, not Space/A/S/D/R):',
+          '[overlay] Key blocked in GAME mode (not arrows, not Space/A/S/D/F):',
           key
         );
       }
