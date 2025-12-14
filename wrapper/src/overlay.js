@@ -68,6 +68,7 @@
   // Player ranged weapon
   const PLAYER_BULLET_RANGE_CELLS   = 9;  // max distance (in cells) for player bullets
   const PLAYER_INITIAL_AMMO         = 6;  // initial ammo for player
+  const PLAYER_GRENADE_MAX          = 3;  // placeholder grenade capacity
 
   // Player corpse-drag speed (1 = normal speed, 0.33 = 33% of normal)
   const PLAYER_DRAG_SPEED_MULT      = 0.33;
@@ -78,6 +79,7 @@
   const INITIAL_BAIT_PICKUPS        = 3;  // NEW: legacy default number of bait pickups
   const INITIAL_RIFLE_PICKUPS       = 0;  // rifle charges pickup (legacy default: none)
   const INITIAL_SHIELD_PICKUPS      = 0;  // shield charges pickup (legacy default: none)
+  const INITIAL_GRENADE_PICKUPS     = 0;  // grenade pickups (placeholder mechanics)
 
   // Player shoot keys
   const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
@@ -103,6 +105,8 @@
     (SHIELD_DURATION_SECONDS * 1000) / WORLD_TICK_MS
   );
   const SHIELD_BLINK_TICKS           = 6; // quick flash when consumed/timeout
+  const BASIC_LOOT_CHANCE            = 0.5; // 50% drop chance for basic loot
+  const SPECIAL_LOOT_CHANCE          = 0.3; // 30% drop chance for special loot
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
@@ -484,6 +488,7 @@
     patchResetCountdowns = {};
     selectedEquipmentIndex = 0;
     playerShields = 0;
+    playerGrenades = 0;
     shieldActive = false;
     shieldTicks = 0;
     shieldBlinkTicks = 0;
@@ -702,6 +707,7 @@
   let playerBaits = 0; // number of baits currently carried
   let playerRifles = 0; // number of rifle charges currently carried
   let playerShields = 0; // number of shield charges currently carried
+  let playerGrenades = 0; // number of grenades carried (placeholder)
   let selectedEquipmentIndex = 0; // 0 = BAIT, cycles with R
 
   // Guards
@@ -1384,6 +1390,11 @@
         styles.push('opacity: ' + (available ? '1' : '0.35'));
         const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
         return `<span${styleAttr}>${item.label} ${playerRifles}/${PLAYER_RIFLE_MAX}</span>`;
+      } else if (item.id === 'grenade') {
+        const available = playerGrenades > 0;
+        styles.push('opacity: ' + (available ? '1' : '0.35'));
+        const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+        return `<span${styleAttr}>${item.label} ${playerGrenades}/${PLAYER_GRENADE_MAX}</span>`;
       }
 
       const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
@@ -2486,6 +2497,35 @@ function updateHudLayout() {
     return null;
   }
 
+  function findAdjacentFreeCell(baseCol, baseRow) {
+    const offsets = [
+      { dx: 1, dy: 0 },
+      { dx: -1, dy: 0 },
+      { dx: 0, dy: 1 },
+      { dx: 0, dy: -1 },
+      { dx: 1, dy: 1 },
+      { dx: 1, dy: -1 },
+      { dx: -1, dy: 1 },
+      { dx: -1, dy: -1 }
+    ];
+    // Shuffle offsets to randomize placement
+    for (let i = offsets.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = offsets[i];
+      offsets[i] = offsets[j];
+      offsets[j] = tmp;
+    }
+    for (let i = 0; i < offsets.length; i++) {
+      const col = baseCol + offsets[i].dx;
+      const row = baseRow + offsets[i].dy;
+      if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) continue;
+      if (isCellFreeForPickup(col, row)) {
+        return { col, row };
+      }
+    }
+    return null;
+  }
+
   function getBaitById(id) {
     for (let i = 0; i < baits.length; i++) {
       if (baits[i].id === id) return baits[i];
@@ -2871,6 +2911,25 @@ function updateHudLayout() {
       inner.style.transform = 'translate(-50%, -50%)';
       inner.style.background = '#ff00ff';
       inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
+    } else if (type === 'grenade') {
+      // Orange "G" placeholder
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.transform = 'translate(-50%, -50%)';
+      inner.style.background = 'transparent';
+      const label = document.createElement('div');
+      label.textContent = 'G';
+      label.style.position = 'absolute';
+      label.style.left = '50%';
+      label.style.top = '50%';
+      label.style.transform = 'translate(-50%, -50%)';
+      label.style.fontFamily = 'monospace';
+      label.style.fontSize = '80%';
+      label.style.fontWeight = 'bold';
+      label.style.color = '#ff9800';
+      inner.appendChild(label);
     } else if (type === 'key') {
       // NEW: blinking white "K" (no background)
       inner.style.left = '50%';
@@ -3013,6 +3072,7 @@ function updateHudLayout() {
       else if (def.type === 'bait') type = 'bait';
       else if (def.type === 'rifle') type = 'rifle';
       else if (def.type === 'shield') type = 'shield';
+      else if (def.type === 'grenade') type = 'grenade';
 
       let col = typeof def.col === 'number' ? def.col : null;
       let row = typeof def.row === 'number' ? def.row : null;
@@ -3097,6 +3157,7 @@ function updateHudLayout() {
     placePickups('bait', INITIAL_BAIT_PICKUPS);
     placePickups('rifle', INITIAL_RIFLE_PICKUPS);
     placePickups('shield', INITIAL_SHIELD_PICKUPS);
+    placePickups('grenade', INITIAL_GRENADE_PICKUPS);
 
     console.log(
       '[overlay] Initial pickups spawned:',
@@ -3109,7 +3170,9 @@ function updateHudLayout() {
       INITIAL_RIFLE_PICKUPS,
       'rifle,',
       INITIAL_SHIELD_PICKUPS,
-      'shield.'
+      'shield,',
+      INITIAL_GRENADE_PICKUPS,
+      'grenade.'
     );
 
   }
@@ -6869,6 +6932,7 @@ function stepGuardAlert(guard) {
 
     // NEW: gestisci eventuale drop della KEY
     handleGuardDeathDrops(guard);
+    spawnGuardLoot(guard);
   }
 
 
@@ -6908,6 +6972,27 @@ function stepGuardAlert(guard) {
     }
 
     dropKeyForTrigger(guard, trigIndex);
+  }
+
+  function spawnGuardLoot(guard) {
+    if (!guard) return;
+
+    function trySpawn(type) {
+      const pos = findAdjacentFreeCell(guard.col, guard.row);
+      if (!pos) return;
+      createPickup(type, pos.col, pos.row);
+    }
+
+    if (Math.random() < BASIC_LOOT_CHANCE) {
+      const basicType = Math.random() < 0.5 ? 'ammo' : 'medikit';
+      trySpawn(basicType);
+    }
+
+    if (Math.random() < SPECIAL_LOOT_CHANCE) {
+      const specials = ['rifle', 'shield', 'bait', 'grenade'];
+      const pick = specials[Math.floor(Math.random() * specials.length)];
+      trySpawn(pick);
+    }
   }
 
   function dropKeyForTrigger(guard, triggerIndex) {
@@ -7091,6 +7176,24 @@ function stepGuardAlert(guard) {
       } else {
         console.log(
           '[overlay] PLAYER picked SHIELD but is already at max charges.'
+        );
+        return false;
+      }
+    } else if (pickup.type === 'grenade') {
+      if (playerGrenades < PLAYER_GRENADE_MAX) {
+        playerGrenades++;
+        if (playerGrenades > PLAYER_GRENADE_MAX) playerGrenades = PLAYER_GRENADE_MAX;
+        console.log(
+          '[overlay] PLAYER picked GRENADE. GRENADE:',
+          playerGrenades,
+          '/',
+          PLAYER_GRENADE_MAX
+        );
+        updateModeVisual();
+        return true;
+      } else {
+        console.log(
+          '[overlay] PLAYER picked GRENADE but is already at max grenades.'
         );
         return false;
       }
