@@ -77,6 +77,7 @@
   const INITIAL_AMMO_PICKUPS        = 3;  // number of ammo pickups to spawn
   const INITIAL_BAIT_PICKUPS        = 3;  // NEW: legacy default number of bait pickups
   const INITIAL_RIFLE_PICKUPS       = 0;  // rifle charges pickup (legacy default: none)
+  const INITIAL_SHIELD_PICKUPS      = 0;  // shield charges pickup (legacy default: none)
 
   // Player shoot keys
   const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
@@ -96,6 +97,12 @@
   const RIFLE_BEAM_DURATION_TICKS   = Math.ceil(
     (RIFLE_BEAM_DURATION_MS) / WORLD_TICK_MS
   );
+  const SHIELD_MAX                   = 3;
+  const SHIELD_DURATION_SECONDS      = 6;
+  const SHIELD_DURATION_TICKS        = Math.ceil(
+    (SHIELD_DURATION_SECONDS * 1000) / WORLD_TICK_MS
+  );
+  const SHIELD_BLINK_TICKS           = 6; // quick flash when consumed/timeout
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
@@ -476,6 +483,10 @@
     guardsFrozen = false;
     patchResetCountdowns = {};
     selectedEquipmentIndex = 0;
+    playerShields = 0;
+    shieldActive = false;
+    shieldTicks = 0;
+    shieldBlinkTicks = 0;
     playerRifles = 0;
     rifleAimActive = false;
     rifleAimFovCells = [];
@@ -484,6 +495,7 @@
     rifleAimAnchorRow = null;
     rifleAimAnchorDir = null;
     clearRifleBeams();
+    setPlayerColor('yellow');
     if (allPatchesUnlockedDiv) {
       allPatchesUnlockedDiv.style.display = 'none';
     }
@@ -644,9 +656,19 @@
 
   // Big centered GAME OVER overlay
   let gameOverDiv = null;
+  function setPlayerColor(color) {
+    if (!playerInner) return;
+    playerInner.style.background = color;
+  }
+
+  function updatePlayerSpriteFill() {
+    if (!playerInner) return;
+    // Base color is yellow; shield logic will override per tick
+    playerInner.style.background = 'yellow';
+  }
 
 
-  // Player
+// Player
   let playerDiv = null;
   let playerInner = null;
   let playerCol = 0;
@@ -659,6 +681,9 @@
   let playerDraggedGuard = null;
   let playerDragKeyHeld = false;
   let playerMoveCooldownTicks = 0;
+  let shieldActive = false;
+  let shieldTicks = 0;
+  let shieldBlinkTicks = 0;
 
   // Player HP
   let playerHPMax = 5;
@@ -676,6 +701,7 @@
   // Player baits inventory
   let playerBaits = 0; // number of baits currently carried
   let playerRifles = 0; // number of rifle charges currently carried
+  let playerShields = 0; // number of shield charges currently carried
   let selectedEquipmentIndex = 0; // 0 = BAIT, cycles with R
 
   // Guards
@@ -1036,7 +1062,7 @@
 .orca-stealth-rifle-beam .beam-center {
   position: absolute;
   height: 100%;
-  background: #ffeb3b;
+  background: #00d8ff;
   left: 12%;
   right: 12%;
 }
@@ -1046,20 +1072,20 @@
   top: 0;
   background: repeating-linear-gradient(
     to right,
-    #ffeb3b 0%,
-    #ffeb3b 8%,
+    #00d8ff 0%,
+    #00d8ff 8%,
     transparent 14%,
     transparent 22%,
-    #ffeb3b 28%,
-    #ffeb3b 34%,
+    #00d8ff 28%,
+    #00d8ff 34%,
     transparent 40%,
     transparent 48%,
-    #ffeb3b 54%,
-    #ffeb3b 60%,
+    #00d8ff 54%,
+    #00d8ff 60%,
     transparent 66%,
     transparent 74%,
-    #ffeb3b 80%,
-    #ffeb3b 86%,
+    #00d8ff 80%,
+    #00d8ff 86%,
     transparent 92%,
     transparent 100%
   );
@@ -1085,7 +1111,7 @@
 .orca-stealth-rifle-cross .h,
 .orca-stealth-rifle-cross .v {
   position: absolute;
-  background: #ffeb3b;
+  background: #00d8ff;
   opacity: 0.95;
 }
 .orca-stealth-rifle-cross .h {
@@ -1212,11 +1238,13 @@
     playerInner.style.width = '100%';
     playerInner.style.height = '100%';
     playerInner.style.background = 'yellow';
+    playerInner.style.boxSizing = 'border-box';
     playerInner.style.clipPath = 'polygon(50% 12%, 14% 88%, 86% 88%)';
     playerInner.style.transformOrigin = '50% 50%';
 
     playerDiv.appendChild(playerInner);
     overlayDiv.appendChild(playerDiv);
+    updatePlayerSpriteFill();
 
     // HUD (bottom-right)
     const hud = document.createElement('div');
@@ -1346,6 +1374,11 @@
         styles.push('opacity: ' + (available ? '1' : '0.35'));
         const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
         return `<span${styleAttr}>${item.label} ${playerBaits}/${PLAYER_BAIT_MAX}</span>`;
+      } else if (item.id === 'shield') {
+        const available = playerShields > 0;
+        styles.push('opacity: ' + (available ? '1' : '0.35'));
+        const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+        return `<span${styleAttr}>${item.label} ${playerShields}/${SHIELD_MAX}</span>`;
       } else if (item.id === 'rifle') {
         const available = playerRifles > 0;
         styles.push('opacity: ' + (available ? '1' : '0.35'));
@@ -1363,6 +1396,12 @@
   function updateModeVisual() {
     if (!overlayDiv) return;
     const hud = document.getElementById('orca-stealth-hud');
+    updatePlayerSpriteFill();
+    if (shieldActive) {
+      setPlayerColor('#ff9800');
+    } else if (shieldBlinkTicks <= 0) {
+      setPlayerColor('yellow');
+    }
 
     // GAME OVER overrides normal Edit/Game visuals
     if (isGameOver) {
@@ -2302,6 +2341,31 @@ function updateHudLayout() {
     }
   }
 
+  function updateShieldState() {
+    if (shieldActive) {
+      shieldTicks--;
+      setPlayerColor('#ff00ff');
+      if (shieldTicks <= 0) {
+        shieldActive = false;
+        shieldBlinkTicks = SHIELD_BLINK_TICKS;
+      }
+      return;
+    }
+
+    if (shieldBlinkTicks > 0) {
+      shieldBlinkTicks--;
+      const flashOn = (shieldBlinkTicks % 2 === 0);
+      setPlayerColor(flashOn ? '#ff00ff' : 'yellow');
+      if (shieldBlinkTicks <= 0) {
+        setPlayerColor('yellow');
+      }
+      return;
+    }
+
+    // Default color when no shield effects
+    setPlayerColor('yellow');
+  }
+
 
   function clampPlayer() {
     if (playerCol < 0) playerCol = 0;
@@ -2793,10 +2857,19 @@ function updateHudLayout() {
       inner.style.left = '50%';
       inner.style.top = '50%';
       inner.style.width = '70%';
-      inner.style.height = '70%';
+    inner.style.height = '70%';
+    inner.style.transform = 'translate(-50%, -50%)';
+    inner.style.background = 'yellow';
+    // Upright equilateral triangle (apex up, base down)
+    inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
+    } else if (type === 'shield') {
+      // Small fuchsia triangle
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '60%';
+      inner.style.height = '60%';
       inner.style.transform = 'translate(-50%, -50%)';
-      inner.style.background = 'yellow';
-      // Upright equilateral triangle (apex up, base down)
+      inner.style.background = '#ff00ff';
       inner.style.clipPath = 'polygon(50% 6%, 8% 94%, 92% 94%)';
     } else if (type === 'key') {
       // NEW: blinking white "K" (no background)
@@ -2820,14 +2893,14 @@ function updateHudLayout() {
 
       inner.appendChild(label);
     } else if (type === 'rifle') {
-      // Hollow yellow circle with inner cross
+      // Hollow electric-blue circle with inner cross
       inner.style.left = '50%';
       inner.style.top = '50%';
       inner.style.width = '50%';
       inner.style.height = '50%';
       inner.style.transform = 'translate(-50%, -50%)';
       inner.style.borderRadius = '50%';
-      inner.style.border = '2px solid #ffeb3b';
+      inner.style.border = '2px solid #00d8ff';
       inner.style.background = 'transparent';
 
       const crossH = document.createElement('div');
@@ -2837,7 +2910,7 @@ function updateHudLayout() {
       crossH.style.width = '100%';
       crossH.style.height = '18%';
       crossH.style.transform = 'translateY(-50%)';
-      crossH.style.background = '#ffeb3b';
+      crossH.style.background = '#00d8ff';
 
       const crossV = document.createElement('div');
       crossV.style.position = 'absolute';
@@ -2846,7 +2919,7 @@ function updateHudLayout() {
       crossV.style.width = '18%';
       crossV.style.height = '100%';
       crossV.style.transform = 'translateX(-50%)';
-      crossV.style.background = '#ffeb3b';
+      crossV.style.background = '#00d8ff';
 
       inner.appendChild(crossH);
       inner.appendChild(crossV);
@@ -2939,6 +3012,7 @@ function updateHudLayout() {
       else if (def.type === 'ammo') type = 'ammo';
       else if (def.type === 'bait') type = 'bait';
       else if (def.type === 'rifle') type = 'rifle';
+      else if (def.type === 'shield') type = 'shield';
 
       let col = typeof def.col === 'number' ? def.col : null;
       let row = typeof def.row === 'number' ? def.row : null;
@@ -3022,6 +3096,7 @@ function updateHudLayout() {
     placePickups('ammo', INITIAL_AMMO_PICKUPS);
     placePickups('bait', INITIAL_BAIT_PICKUPS);
     placePickups('rifle', INITIAL_RIFLE_PICKUPS);
+    placePickups('shield', INITIAL_SHIELD_PICKUPS);
 
     console.log(
       '[overlay] Initial pickups spawned:',
@@ -3032,7 +3107,9 @@ function updateHudLayout() {
       INITIAL_BAIT_PICKUPS,
       'bait,',
       INITIAL_RIFLE_PICKUPS,
-      'rifle.'
+      'rifle,',
+      INITIAL_SHIELD_PICKUPS,
+      'shield.'
     );
 
   }
@@ -4767,7 +4844,7 @@ function createPlacedBait(col, row) {
 
     // Rifle AIM FOV (yellow), drawn above guard FOV
     if (rifleAimActive && rifleAimFovCells && rifleAimFovCells.length) {
-      const rifleColor = 'rgba(255, 235, 59, 0.25)';
+    const rifleColor = 'rgba(0, 216, 255, 0.25)';
       rifleAimFovCells.forEach((cell) => {
         const cellDiv = document.createElement('div');
         cellDiv.style.position = 'absolute';
@@ -6934,6 +7011,7 @@ function stepGuardAlert(guard) {
           '/',
           playerHPMax
         );
+        updatePlayerSpriteFill();
         updateModeVisual();
         return true; // consumed
       } else {
@@ -6952,6 +7030,7 @@ function stepGuardAlert(guard) {
           '/',
           playerAmmoMax
         );
+        updatePlayerSpriteFill();
         updateModeVisual();
         return true;
       } else {
@@ -6970,6 +7049,7 @@ function stepGuardAlert(guard) {
           '/',
           PLAYER_BAIT_MAX
         );
+        updatePlayerSpriteFill();
         updateModeVisual();
         return true;
       } else {
@@ -6993,6 +7073,24 @@ function stepGuardAlert(guard) {
       } else {
         console.log(
           '[overlay] PLAYER picked RIFLE but is already at max charges.'
+        );
+        return false;
+      }
+    } else if (pickup.type === 'shield') {
+      if (playerShields < SHIELD_MAX) {
+        playerShields++;
+        if (playerShields > SHIELD_MAX) playerShields = SHIELD_MAX;
+        console.log(
+          '[overlay] PLAYER picked SHIELD charge. SHIELD:',
+          playerShields,
+          '/',
+          SHIELD_MAX
+        );
+        updateModeVisual();
+        return true;
+      } else {
+        console.log(
+          '[overlay] PLAYER picked SHIELD but is already at max charges.'
         );
         return false;
       }
@@ -7055,6 +7153,11 @@ function stepGuardAlert(guard) {
     }
     exitRifleAim('game-over');
     clearRifleBeams();
+    shieldActive = false;
+    shieldTicks = 0;
+    shieldBlinkTicks = 0;
+    setPlayerColor('yellow');
+    updatePlayerSpriteFill();
 
     if (gameOverDiv) {
       gameOverDiv.style.display = 'flex';
@@ -7073,12 +7176,21 @@ function stepGuardAlert(guard) {
       return;
     }
 
+    if (shieldActive) {
+      shieldActive = false;
+      shieldTicks = 0;
+      shieldBlinkTicks = SHIELD_BLINK_TICKS;
+      console.log('[overlay] SHIELD absorbed damage.');
+      return;
+    }
+
     if (playerHitCooldown > 0) {
       return;
     }
 
     playerHP--;
     if (playerHP < 0) playerHP = 0;
+    updatePlayerSpriteFill();
 
     const srcId = source && source.id ? source.id : 'unknown';
     console.log(
@@ -7167,6 +7279,7 @@ function stepGuardAlert(guard) {
       updatePickupsBlink();
       updateRifleBeams();
       updatePlayerBlink();
+      updateShieldState();
       return;
     }
 
@@ -7235,6 +7348,8 @@ function stepGuardAlert(guard) {
 
     // 10) Player blink while invulnerable
     updatePlayerBlink();
+    // 11) Shield timers / visuals
+    updateShieldState();
 
   }
 
@@ -7517,6 +7632,8 @@ function stepGuardAlert(guard) {
       placeBaitInFrontOfPlayer();
     } else if (selected.id === 'rifle') {
       handleRifleAction();
+    } else if (selected.id === 'shield') {
+      handleShieldAction();
     } else {
       // Placeholder for future equipment mechanics (shield / grenade / rifle)
     }
@@ -7540,6 +7657,24 @@ function stepGuardAlert(guard) {
     }
 
     fireRifleShot();
+  }
+
+  function handleShieldAction() {
+    if (shieldActive) {
+      // Already active, ignore re-activation
+      return;
+    }
+    if (playerShields <= 0) {
+      console.log('[overlay] PLAYER tried to use SHIELD but inventory is empty.');
+      return;
+    }
+    playerShields--;
+    if (playerShields < 0) playerShields = 0;
+    shieldActive = true;
+    shieldTicks = SHIELD_DURATION_TICKS;
+    shieldBlinkTicks = 0;
+    setPlayerColor('#ff00ff'); // bright fuchsia
+    updateModeVisual();
   }
 
   function placeBaitInFrontOfPlayer() {
