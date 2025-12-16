@@ -56,6 +56,8 @@
 
   // Extra speed multiplier when a guard spots a dead guard ("corpse alert")
   const CORPSE_ALERT_SPEED_MULT = 1.5; // +50% speed, tweak here
+  // Temporary speed multiplier for alerts triggered by hits / stunned-ally sighting
+  const TEMP_ALERT_SPEED_MULT   = 1.5; // +50% speed while that alert is active
   const GUARD_ANIM_MIN_STEP_MS = 40;   // min ms per sub-step when animating fast moves
 
   // Bullets
@@ -582,6 +584,10 @@
       sectorAlerts.NE.corpseBoost =
       sectorAlerts.SW.corpseBoost =
       sectorAlerts.SE.corpseBoost = 1.0;
+    sectorAlerts.NW.tempBoost =
+      sectorAlerts.NE.tempBoost =
+      sectorAlerts.SW.tempBoost =
+      sectorAlerts.SE.tempBoost = 1.0;
 
 
     // --- PICKUPS FIX ---
@@ -784,7 +790,9 @@
       source: null,
       sourceBaitId: null,
       // Permanent speed boost multiplier for this sector when a corpse is spotted
-      corpseBoost: 1.0
+      corpseBoost: 1.0,
+      // Temporary speed boost while alert is active (hit/stunned sightings)
+      tempBoost: 1.0
     },
     NE: {
       state: 'idle',
@@ -794,7 +802,8 @@
       seeingNow: false,
       source: null,
       sourceBaitId: null,
-      corpseBoost: 1.0
+      corpseBoost: 1.0,
+      tempBoost: 1.0
     },
     SW: {
       state: 'idle',
@@ -804,7 +813,8 @@
       seeingNow: false,
       source: null,
       sourceBaitId: null,
-      corpseBoost: 1.0
+      corpseBoost: 1.0,
+      tempBoost: 1.0
     },
     SE: {
       state: 'idle',
@@ -814,7 +824,8 @@
       seeingNow: false,
       source: null,
       sourceBaitId: null,
-      corpseBoost: 1.0
+      corpseBoost: 1.0,
+      tempBoost: 1.0
     }
   };
 
@@ -846,6 +857,25 @@
       guard.minRow + ',' +
       guard.maxRow
     );
+  }
+
+  // Ensure a roomAlerts entry exists with default fields
+  function ensureRoomAlertEntry(key) {
+    if (!key) return null;
+    if (!roomAlerts[key]) {
+      roomAlerts[key] = {
+        state: 'idle',
+        targetCol: null,
+        targetRow: null,
+        timer: 0,
+        seeingNow: false,
+        source: null,
+        sourceBaitId: null,
+        corpseBoost: 1.0,
+        tempBoost: 1.0
+      };
+    }
+    return roomAlerts[key];
   }
 
 
@@ -2445,6 +2475,18 @@ function updateHudLayout() {
     return null;
   }
 
+  // Find a stunned (but alive) guard at given cell
+  function findStunnedGuardAtCell(col, row) {
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (g.state !== 'stunned') continue;
+      if (g.col === col && g.row === row) {
+        return g;
+      }
+    }
+    return null;
+  }
+
     // Returns the permanent speed multiplier for a guard based on
   // room (dungeon) or sector (arena) corpse-alert state.
   function getGuardSpeedMultiplier(guard) {
@@ -2454,12 +2496,18 @@ function updateHudLayout() {
     if (layoutType === 'dungeon') {
       const key = getGuardRoomKey(guard);
       const ra = key ? roomAlerts[key] : null;
+      if (ra && ra.state === 'tracking' && typeof ra.tempBoost === 'number') {
+        mult *= ra.tempBoost;
+      }
       if (ra && typeof ra.corpseBoost === 'number') {
         mult *= ra.corpseBoost;
       }
     } else {
       const s = getSector(guard.col, guard.row);
       const sa = sectorAlerts[s];
+      if (sa && sa.state === 'tracking' && typeof sa.tempBoost === 'number') {
+        mult *= sa.tempBoost;
+      }
       if (sa && typeof sa.corpseBoost === 'number') {
         mult *= sa.corpseBoost;
       }
@@ -3607,6 +3655,7 @@ function createPlacedBait(col, row) {
         sa.seeingNow = false;
         sa.source = null;
         sa.sourceBaitId = null;
+        sa.tempBoost = 1.0;
       }
     });
 
@@ -5265,6 +5314,8 @@ function createPlacedBait(col, row) {
     const sectorTargetBait = { NW: null, NE: null, SW: null, SE: null };
     const sectorSawCorpse = { NW: false, NE: false, SW: false, SE: false };
     const sectorCorpseInfo = { NW: null, NE: null, SW: null, SE: null };
+    const sectorSawStunned = { NW: false, NE: false, SW: false, SE: false };
+    const sectorStunnedInfo = { NW: null, NE: null, SW: null, SE: null };
 
 
     guards.forEach((guard) => {
@@ -5287,6 +5338,7 @@ function createPlacedBait(col, row) {
       let seenBaitObj = null;
       // Corpse detection is only meaningful while the guard is patrolling
       let seenCorpseCell = null;
+      let seenStunnedCell = null;
 
 
       // Check player in FOV
@@ -5319,6 +5371,16 @@ function createPlacedBait(col, row) {
         }
       }
 
+      // Stunned guard detection (alert trigger)
+      for (let i = 0; i < guard.fovCells.length; i++) {
+        const cell = guard.fovCells[i];
+        const stunned = findStunnedGuardAtCell(cell.col, cell.row);
+        if (stunned) {
+          seenStunnedCell = { col: stunned.col, row: stunned.row };
+          break;
+        }
+      }
+
 
       guard.wasSeeingPlayer = prevSeenPlayer;
       guard.wasSeeingBait = prevSeenBait;
@@ -5326,7 +5388,7 @@ function createPlacedBait(col, row) {
       guard.seenBait = !!seenBaitObj;
       guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
 
-            if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell) {
+      if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell || !!seenStunnedCell) {
         anySeen = true;
       }
 
@@ -5358,6 +5420,16 @@ function createPlacedBait(col, row) {
         }
       }
 
+      if (seenStunnedCell) {
+        sectorSawStunned[s] = true;
+        if (!sectorStunnedInfo[s]) {
+          sectorStunnedInfo[s] = {
+            col: seenStunnedCell.col,
+            row: seenStunnedCell.row
+          };
+        }
+      }
+
 
       if (!prevSeenPlayer && nextSeenPlayer) {
         handleGuardSpotsPlayer(guard);
@@ -5371,7 +5443,8 @@ function createPlacedBait(col, row) {
       sa.seeingNow =
         !!sectorSawPlayer[name] ||
         !!sectorSawBait[name] ||
-        !!sectorSawCorpse[name];
+        !!sectorSawCorpse[name] ||
+        !!sectorSawStunned[name];
     });
 
 
@@ -5380,9 +5453,13 @@ function createPlacedBait(col, row) {
       ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
         const sa = sectorAlerts[name];
         if (!sa) return;
+        if (typeof sa.tempBoost !== 'number') {
+          sa.tempBoost = 1.0;
+        }
 
         const sawPlayer = !!sectorSawPlayer[name];
         const sawBait   = !!sectorSawBait[name];
+        const sawStunned = !!sectorSawStunned[name];
         const sawCorpse = !!sectorSawCorpse[name];
 
         if (sawPlayer) {
@@ -5409,6 +5486,26 @@ function createPlacedBait(col, row) {
             sa.sourceBaitId = null;
           }
           sa.timer = ALERT_MEMORY_TICKS;
+        } else if (sawStunned) {
+          // Stunned-ally sighting: temporary alert with speed boost
+          sa.state = 'tracking';
+          const info = sectorStunnedInfo[name];
+          if (info) {
+            sa.targetCol = info.col;
+            sa.targetRow = info.row;
+          } else {
+            sa.targetCol = null;
+            sa.targetRow = null;
+          }
+          sa.source = 'stunned_guard';
+          sa.sourceBaitId = null;
+          sa.timer = ALERT_MEMORY_TICKS;
+          if (typeof sa.tempBoost !== 'number') {
+            sa.tempBoost = 1.0;
+          }
+          if (sa.tempBoost < TEMP_ALERT_SPEED_MULT) {
+            sa.tempBoost = TEMP_ALERT_SPEED_MULT;
+          }
         } else if (sawCorpse) {
           // Corpse sighting: trigger alert for this sector, with permanent speed boost
           sa.state = 'tracking';
@@ -5448,6 +5545,7 @@ function createPlacedBait(col, row) {
               sa.targetRow = null;
               sa.source = null;
               sa.sourceBaitId = null;
+              sa.tempBoost = 1.0;
             }
           } else {
             sa.state = 'idle';
@@ -5455,6 +5553,7 @@ function createPlacedBait(col, row) {
             sa.targetRow = null;
             sa.source = null;
             sa.sourceBaitId = null;
+            sa.tempBoost = 1.0;
           }
         }
       });
@@ -5510,6 +5609,8 @@ function createPlacedBait(col, row) {
 
     const roomsSawCorpse = {};
     const roomCorpseInfo = {};
+    const roomsSawStunned = {};
+    const roomStunnedInfo = {};
 
 
     guards.forEach((guard) => {
@@ -5531,6 +5632,7 @@ function createPlacedBait(col, row) {
       let nextSeenPlayer = false;
       let seenBaitObj = null;
       let seenCorpseCell = null;
+      let seenStunnedCell = null;
 
 
       nextSeenPlayer = guard.fovCells.some(
@@ -5560,6 +5662,16 @@ function createPlacedBait(col, row) {
         }
       }
 
+      // Stunned guard detection (alert trigger)
+      for (let i = 0; i < guard.fovCells.length; i++) {
+        const cell = guard.fovCells[i];
+        const stunned = findStunnedGuardAtCell(cell.col, cell.row);
+        if (stunned) {
+          seenStunnedCell = { col: stunned.col, row: stunned.row };
+          break;
+        }
+      }
+
 
       guard.wasSeeingPlayer = prevSeenPlayer;
       guard.wasSeeingBait = prevSeenBait;
@@ -5567,7 +5679,7 @@ function createPlacedBait(col, row) {
       guard.seenBait = !!seenBaitObj;
       guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
 
-      if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell) {
+      if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell || !!seenStunnedCell) {
         anySeen = true;
       }
 
@@ -5595,6 +5707,16 @@ function createPlacedBait(col, row) {
             };
           }
         }
+
+        if (seenStunnedCell) {
+          roomsSawStunned[roomKey] = true;
+          if (!roomStunnedInfo[roomKey]) {
+            roomStunnedInfo[roomKey] = {
+              col: seenStunnedCell.col,
+              row: seenStunnedCell.row
+            };
+          }
+        }
       }
 
       if (!prevSeenPlayer && nextSeenPlayer) {
@@ -5607,24 +5729,13 @@ function createPlacedBait(col, row) {
       const allKeys = new Set([
         ...Object.keys(roomsSawPlayer),
         ...Object.keys(roomsSawBait),
-        ...Object.keys(roomsSawCorpse)
+        ...Object.keys(roomsSawCorpse),
+        ...Object.keys(roomsSawStunned)
       ]);
 
 
       allKeys.forEach((key) => {
-        if (!roomAlerts[key]) {
-          roomAlerts[key] = {
-            state: 'idle',
-            targetCol: null,
-            targetRow: null,
-            timer: 0,
-            seeingNow: false,
-            source: null,
-            sourceBaitId: null,
-            // Permanent speed boost multiplier for this room when a corpse is spotted
-            corpseBoost: 1.0
-          };
-        }
+        ensureRoomAlertEntry(key);
       });
 
 
@@ -5632,12 +5743,16 @@ function createPlacedBait(col, row) {
       for (const key in roomAlerts) {
         const ra = roomAlerts[key];
         if (!ra) continue;
+        if (typeof ra.tempBoost !== 'number') {
+          ra.tempBoost = 1.0;
+        }
 
         const sawPlayer = !!roomsSawPlayer[key];
         const sawBait   = !!roomsSawBait[key];
+        const sawStunned = !!roomsSawStunned[key];
         const sawCorpse = !!roomsSawCorpse[key];
 
-        ra.seeingNow = sawPlayer || sawBait || sawCorpse;
+        ra.seeingNow = sawPlayer || sawBait || sawCorpse || sawStunned;
 
         if (sawPlayer) {
           ra.state = 'tracking';
@@ -5661,6 +5776,25 @@ function createPlacedBait(col, row) {
             ra.sourceBaitId = null;
           }
           ra.timer = ALERT_MEMORY_TICKS;
+        } else if (sawStunned) {
+          ra.state = 'tracking';
+          const info = roomStunnedInfo[key];
+          if (info) {
+            ra.targetCol = info.col;
+            ra.targetRow = info.row;
+          } else {
+            ra.targetCol = null;
+            ra.targetRow = null;
+          }
+          ra.source = 'stunned_guard';
+          ra.sourceBaitId = null;
+          ra.timer = ALERT_MEMORY_TICKS;
+          if (typeof ra.tempBoost !== 'number') {
+            ra.tempBoost = 1.0;
+          }
+          if (ra.tempBoost < TEMP_ALERT_SPEED_MULT) {
+            ra.tempBoost = TEMP_ALERT_SPEED_MULT;
+          }
         } else if (sawCorpse) {
           // Corpse sighting: alert this room and give permanent speed boost
           ra.state = 'tracking';
@@ -5692,6 +5826,7 @@ function createPlacedBait(col, row) {
               ra.timer = 0;
               ra.source = null;
               ra.sourceBaitId = null;
+              ra.tempBoost = 1.0;
             }
           } else {
             ra.state = 'idle';
@@ -5700,6 +5835,7 @@ function createPlacedBait(col, row) {
             ra.timer = 0;
             ra.source = null;
             ra.sourceBaitId = null;
+            ra.tempBoost = 1.0;
           }
         }
       }
@@ -6279,14 +6415,18 @@ function createPlacedBait(col, row) {
       let px;
       let py;
 
-      if (
+      const hasStaticTarget =
         ra &&
         ra.state === 'tracking' &&
-        (ra.source === 'bait' || ra.source === 'corpse') &&
+        (ra.source === 'bait' ||
+         ra.source === 'corpse' ||
+         ra.source === 'stunned_guard' ||
+         ra.source === 'hit') &&
         typeof ra.targetCol === 'number' &&
-        typeof ra.targetRow === 'number'
-      ) {
-        // Chase bait or corpse position
+        typeof ra.targetRow === 'number';
+
+      if (hasStaticTarget) {
+        // Chase the reported position (bait/corpse/stunned/hit event)
         px = ra.targetCol;
         py = ra.targetRow;
       } else {
@@ -6365,10 +6505,15 @@ function createPlacedBait(col, row) {
     let px;
     let py;
 
-    if (sa.source === 'bait' &&
-        typeof sa.targetCol === 'number' &&
-        typeof sa.targetRow === 'number') {
-      // Chase bait position
+    const hasStaticTarget =
+      (sa.source === 'bait' ||
+       sa.source === 'corpse' ||
+       sa.source === 'stunned_guard' ||
+       sa.source === 'hit') &&
+      typeof sa.targetCol === 'number' &&
+      typeof sa.targetRow === 'number';
+
+    if (hasStaticTarget) {
       px = sa.targetCol;
       py = sa.targetRow;
     } else {
@@ -6945,8 +7090,91 @@ function stepGuardAlert(guard) {
   }
 
 
+  function triggerTemporaryAlertForGuard(guard, source, targetCol, targetRow) {
+    if (!guard) return;
+
+    const layoutType = getLayoutType();
+    const safeCol = (typeof targetCol === 'number') ? targetCol : null;
+    const safeRow = (typeof targetRow === 'number') ? targetRow : null;
+
+    if (layoutType === 'dungeon') {
+      const roomKey = getGuardRoomKey(guard);
+      const ra = ensureRoomAlertEntry(roomKey);
+      if (ra) {
+        if (ra.state !== 'tracking') {
+          ra.state = 'tracking';
+          ra.timer = ALERT_MEMORY_TICKS;
+          ra.source = source;
+          ra.sourceBaitId = null;
+          ra.targetCol = safeCol;
+          ra.targetRow = safeRow;
+        } else if (
+          ra.targetCol == null &&
+          ra.targetRow == null &&
+          safeCol != null &&
+          safeRow != null
+        ) {
+          ra.targetCol = safeCol;
+          ra.targetRow = safeRow;
+        }
+        if (typeof ra.tempBoost !== 'number') {
+          ra.tempBoost = 1.0;
+        }
+        if (ra.tempBoost < TEMP_ALERT_SPEED_MULT) {
+          ra.tempBoost = TEMP_ALERT_SPEED_MULT;
+        }
+      }
+    } else {
+      const sectorName = getSector(guard.col, guard.row);
+      const sa = sectorAlerts[sectorName];
+      if (sa) {
+        if (sa.state !== 'tracking') {
+          sa.state = 'tracking';
+          sa.timer = ALERT_MEMORY_TICKS;
+          sa.source = source;
+          sa.sourceBaitId = null;
+          sa.targetCol = safeCol;
+          sa.targetRow = safeRow;
+        } else if (
+          sa.targetCol == null &&
+          sa.targetRow == null &&
+          safeCol != null &&
+          safeRow != null
+        ) {
+          sa.targetCol = safeCol;
+          sa.targetRow = safeRow;
+        }
+        if (typeof sa.tempBoost !== 'number') {
+          sa.tempBoost = 1.0;
+        }
+        if (sa.tempBoost < TEMP_ALERT_SPEED_MULT) {
+          sa.tempBoost = TEMP_ALERT_SPEED_MULT;
+        }
+      }
+    }
+
+    if (guard.state !== 'stunned') {
+      guard.state = 'alert_chaser';
+    }
+  }
+
+
   function applyGuardHit(guard, sourceBullet) {
     if (!guard || guard.state === 'dead') return;
+
+    // Turn toward the incoming shot direction
+    if (sourceBullet && typeof sourceBullet.dx === 'number' && typeof sourceBullet.dy === 'number') {
+      const dirX = -Math.sign(sourceBullet.dx);
+      const dirY = -Math.sign(sourceBullet.dy);
+      if (dirX !== 0 || dirY !== 0) {
+        guard.dirX = dirX;
+        guard.dirY = dirY;
+        updateGuardLookDirection(guard);
+      }
+    }
+
+    // Trigger alert + temporary speed boost for this area
+    triggerTemporaryAlertForGuard(guard, 'hit', guard.col, guard.row);
 
     guard.hp--;
     if (guard.hp <= 0) {
