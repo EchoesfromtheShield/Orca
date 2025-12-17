@@ -118,6 +118,11 @@
           <option selected>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
         </select>
       </label>
+      <label>grenade spawns:
+        <select id="grenade">
+          <option selected>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
       <label>walls:
         <select id="walls">
           <option>o</option>
@@ -236,6 +241,7 @@
           bait: parseInt(document.getElementById('bait').value, 10),
           rifle: parseInt(document.getElementById('rifle').value, 10),
           shield: parseInt(document.getElementById('shield').value, 10),
+          grenade: parseInt(document.getElementById('grenade').value, 10),
           walls: document.getElementById('walls').value
         }
       };

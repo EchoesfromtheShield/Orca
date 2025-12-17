@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups]
+//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -66,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups]');
   process.exit(1);
 }
 
@@ -95,12 +95,14 @@ const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
 //   argv[10] -> BAIT_PICKUPS
 //   argv[15] -> RIFLE_PICKUPS (optional, can also use env.RIFLE_PICKUPS)
 //   argv[16] -> SHIELD_PICKUPS (optional, can also use env.SHIELD_PICKUPS)
+//   argv[17] -> GRENADE_PICKUPS (optional, can also use env.GRENADE_PICKUPS)
 //   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
 const baitArg = process.argv[10] || process.env.BAIT_PICKUPS;
 const rifleArg = process.argv[15] || process.env.RIFLE_PICKUPS;
 const shieldArg = process.argv[16] || process.env.SHIELD_PICKUPS;
+const grenadeArg = process.argv[17] || process.env.GRENADE_PICKUPS;
 
 // Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
@@ -121,6 +123,9 @@ const RIFLE_PICKUP_COUNT = rifleArg != null
 
 const SHIELD_PICKUP_COUNT = shieldArg != null
   ? Math.max(0, parseInt(shieldArg, 10) || 0)
+  : 0;
+const GRENADE_PICKUP_COUNT = grenadeArg != null
+  ? Math.max(0, parseInt(grenadeArg, 10) || 0)
   : 0;
 
 // Ritual: optional identifier for this level/ritual
@@ -1474,6 +1479,15 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
         usedKeys.add(`${c.col},${c.row}`);
       });
 
+      // 6) Grenade (on cells not used by others)
+      const remainingForGrenade = allWalkable.filter(
+        (c) => !usedKeys.has(`${c.col},${c.row}`)
+      );
+      const grenadeCells = pickRandomCells(remainingForGrenade, GRENADE_PICKUP_COUNT);
+      grenadeCells.forEach((c) => {
+        usedKeys.add(`${c.col},${c.row}`);
+      });
+
       // Push into pickups array
       ammoCells.forEach((pos) => {
         pickups.push({
@@ -1510,6 +1524,14 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       shieldCells.forEach((pos) => {
         pickups.push({
           type: 'shield',
+          col: pos.col,
+          row: pos.row
+        });
+      });
+
+      grenadeCells.forEach((pos) => {
+        pickups.push({
+          type: 'grenade',
           col: pos.col,
           row: pos.row
         });
@@ -2234,13 +2256,17 @@ try {
   const shieldCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'shield').length
     : 0;
+  const grenadeCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'grenade').length
+    : 0;
 
   console.log(
     '  Pickups requested: ammo =', AMMO_PICKUP_COUNT,
     ', medikit =', MEDIKIT_PICKUP_COUNT,
     ', bait =', BAIT_PICKUP_COUNT,
     ', rifle =', RIFLE_PICKUP_COUNT,
-    ', shield =', SHIELD_PICKUP_COUNT
+    ', shield =', SHIELD_PICKUP_COUNT,
+    ', grenade =', GRENADE_PICKUP_COUNT
   );
   console.log(
     '  Pickups generated:',
@@ -2249,7 +2275,8 @@ try {
     ', medikit =', medCount,
     ', bait =', baitCount,
     ', rifle =', rifleCount,
-    ', shield =', shieldCount, ')'
+    ', shield =', shieldCount,
+    ', grenade =', grenadeCount, ')'
   );
   console.log('  Ritual unlock type:', RITUAL_TYPE);
   if (RITUAL_TYPE === 'getKey') {

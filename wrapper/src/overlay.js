@@ -63,6 +63,12 @@
   // Bullets
   const BULLET_STEPS_PER_TICK       = 4;  // cells per tick
   const GUARD_FIRE_COOLDOWN_TICKS   = 2;  // ticks between shots (~1s at 250ms)
+  // Grenades
+  const GRENADE_STEPS_PER_TICK      = 2;  // half speed of bullets
+  const GRENADE_RANGE_CELLS         = 5;  // explode after travelling this many cells
+  const GRENADE_COLOR               = '#ff5533';
+  const GRENADE_BLINK_TICKS         = 6;  // duration of explosion flash
+  const GRENADE_FUSE_TICKS          = Math.ceil((3000) / WORLD_TICK_MS); // 3s fuse when stopped
 
   // Pickup blink tuning (ammo & medikit)
   const PICKUP_BLINK_DURATION_SEC = 0.35; // faster blink; tune as you like
@@ -491,6 +497,7 @@
     selectedEquipmentIndex = 0;
     playerShields = 0;
     playerGrenades = 0;
+    playerLastExplosionDamageTick = -1000;
     shieldActive = false;
     shieldTicks = 0;
     shieldBlinkTicks = 0;
@@ -501,7 +508,9 @@
     rifleAimAnchorCol = null;
     rifleAimAnchorRow = null;
     rifleAimAnchorDir = null;
+    rifleAimCandidates = [];
     clearRifleBeams();
+    clearGrenadesAndFx();
     setPlayerColor('yellow');
     if (allPatchesUnlockedDiv) {
       allPatchesUnlockedDiv.style.display = 'none';
@@ -664,6 +673,7 @@
   let guardsContainer = null;
   let fovContainer = null;
   let bulletsContainer = null;
+  let grenadeFxContainer = null;
 
   // Big centered GAME OVER overlay
   let gameOverDiv = null;
@@ -684,6 +694,7 @@
   let playerInner = null;
   let playerCol = 0;
   let playerRow = 0;
+  let playerLastExplosionDamageTick = -1000;
   let prevPlayerCol = 0;
   let prevPlayerRow = 0;
   // 'up' | 'down' | 'left' | 'right'
@@ -730,6 +741,9 @@
 
   // Bullets
   let bullets = [];
+  // Grenades (player throwable)
+  let grenades = [];
+  let grenadeExplosions = [];
 
 
   // Pickups (ammo / medikit / bait pickups)
@@ -1212,6 +1226,17 @@
     bulletsContainer.style.height = '100%';
     bulletsContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(bulletsContainer);
+
+    // Grenade FX container (explosions)
+    grenadeFxContainer = document.createElement('div');
+    grenadeFxContainer.id = 'orca-stealth-grenades';
+    grenadeFxContainer.style.position = 'absolute';
+    grenadeFxContainer.style.left = '0';
+    grenadeFxContainer.style.top = '0';
+    grenadeFxContainer.style.width = '100%';
+    grenadeFxContainer.style.height = '100%';
+    grenadeFxContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(grenadeFxContainer);
 
     // Pickups container (above bullets, below patch markers/player)
     pickupsContainer = document.createElement('div');
@@ -2876,6 +2901,287 @@ function updateHudLayout() {
     bullets.forEach(updateBulletPosition);
   }
 
+  // --------------------------------------------------
+  // Grenade logic (player throwable)
+  // --------------------------------------------------
+
+  function updateGrenadePosition(grenade) {
+    if (!grenade.el) return;
+    const bw = cellW * 0.35;
+    const bh = cellH * 0.35;
+    const x = grenade.col * cellW + (cellW - bw) / 2;
+    const y = grenade.row * cellH + (cellH - bh) / 2;
+    grenade.el.style.width = bw + 'px';
+    grenade.el.style.height = bh + 'px';
+    grenade.el.style.background = GRENADE_COLOR;
+    grenade.el.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+  }
+
+  function launchGrenadeFromPlayer() {
+    if (!bulletsContainer) return;
+
+    let dx = 0;
+    let dy = 0;
+    if (playerDir === 'up') dy = -1;
+    else if (playerDir === 'down') dy = 1;
+    else if (playerDir === 'left') dx = -1;
+    else if (playerDir === 'right') dx = 1;
+
+    if (dx === 0 && dy === 0) return;
+
+    const startCol = playerCol + dx;
+    const startRow = playerRow + dy;
+    if (
+      startCol < 0 ||
+      startRow < 0 ||
+      startCol >= gridCols ||
+      startRow >= gridRows
+    ) {
+      return;
+    }
+
+    const grenadeEl = document.createElement('div');
+    grenadeEl.className = 'orca-stealth-grenade';
+    grenadeEl.style.position = 'absolute';
+    grenadeEl.style.borderRadius = '50%';
+    grenadeEl.style.pointerEvents = 'none';
+    bulletsContainer.appendChild(grenadeEl);
+
+    const grenade = {
+      col: startCol,
+      row: startRow,
+      dx,
+      dy,
+      el: grenadeEl,
+      alive: true,
+      rangeLeft: GRENADE_RANGE_CELLS,
+      state: 'moving',
+      fuseTicks: 0
+    };
+    grenades.push(grenade);
+    updateGrenadePosition(grenade);
+
+    playerGrenades--;
+    if (playerGrenades < 0) playerGrenades = 0;
+    updateModeVisual();
+  }
+
+  function applyGrenadeDamageAt(col, row) {
+    // Damage guards (1 HP) in this cell
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (!g || g.state === 'dead') continue;
+      if (g.col === col && g.row === row) {
+        // Avoid multiple hits in the same world tick from the same/overlapping blast
+        if (g.lastExplosionDamageTick === worldTick) continue;
+        g.lastExplosionDamageTick = worldTick;
+        triggerTemporaryAlertForGuard(g, 'hit', col, row);
+        g.hp = Math.max(0, (g.hp || g.maxHP) - 1);
+        if (g.hp <= 0) {
+          killGuard(g);
+        } else {
+          updateGuardSpriteAppearance(g);
+        }
+      }
+    }
+
+    // Damage player if on this cell
+    if (playerCol === col && playerRow === row) {
+      if (playerLastExplosionDamageTick !== worldTick) {
+        playerLastExplosionDamageTick = worldTick;
+        applyPlayerHit({ id: 'grenade' });
+      }
+    }
+  }
+
+  function createGrenadeExplosionFx(cells) {
+    if (!grenadeFxContainer) return;
+    const elements = [];
+    cells.forEach((cell) => {
+      const fx = document.createElement('div');
+      fx.style.position = 'absolute';
+      fx.style.pointerEvents = 'none';
+      const bw = cellW * 0.30;
+      const bh = cellH * 0.30;
+      const x = cell.col * cellW + (cellW - bw) / 2;
+      const y = cell.row * cellH + (cellH - bh) / 2;
+      fx.style.width = bw + 'px';
+      fx.style.height = bh + 'px';
+      fx.style.transform = 'translate(' + x + 'px, ' + y + 'px)';
+      fx.style.background = GRENADE_COLOR;
+      fx.style.borderRadius = '40%';
+      fx.style.opacity = Math.random() > 0.5 ? '1' : '0.2';
+      grenadeFxContainer.appendChild(fx);
+      elements.push({
+        el: fx,
+        col: cell.col,
+        row: cell.row
+      });
+    });
+    grenadeExplosions.push({
+      elements,
+      ttl: GRENADE_BLINK_TICKS
+    });
+  }
+
+  function triggerGrenadeExplosion(grenade, atCol, atRow) {
+    if (!grenade) return;
+    grenade.alive = false;
+    if (grenade.el && grenade.el.parentNode) {
+      grenade.el.parentNode.removeChild(grenade.el);
+    }
+
+    const damageCells = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const c = atCol + dx;
+        const r = atRow + dy;
+        if (c < 0 || r < 0 || c >= gridCols || r >= gridRows) continue;
+        if (!isWalkable(c, r)) continue;
+        damageCells.push({ col: c, row: r });
+      }
+    }
+
+    damageCells.forEach((cell) => applyGrenadeDamageAt(cell.col, cell.row));
+    createGrenadeExplosionFx(damageCells);
+  }
+
+  function stepGrenades() {
+    if (!grenades || grenades.length === 0) return;
+
+    const survivors = [];
+    for (let i = 0; i < grenades.length; i++) {
+      const g = grenades[i];
+      if (!g || !g.alive) continue;
+
+      // Waiting fuse (stopped)
+      if (g.state === 'fuse') {
+        g.fuseTicks--;
+        if (g.fuseTicks <= 0) {
+          triggerGrenadeExplosion(g, g.col, g.row);
+          continue;
+        }
+        updateGrenadePosition(g);
+        survivors.push(g);
+        continue;
+      }
+
+      let alive = true;
+      for (let step = 0; step < GRENADE_STEPS_PER_TICK && alive; step++) {
+        if (g.rangeLeft <= 0) {
+          g.state = 'fuse';
+          g.fuseTicks = GRENADE_FUSE_TICKS;
+          updateGrenadePosition(g);
+          survivors.push(g);
+          alive = false;
+          break;
+        }
+
+        const nextCol = g.col + g.dx;
+        const nextRow = g.row + g.dy;
+
+        // Out of bounds -> explode in current cell
+        if (nextCol < 0 || nextRow < 0 || nextCol >= gridCols || nextRow >= gridRows) {
+          triggerGrenadeExplosion(g, g.col, g.row);
+          alive = false;
+          break;
+        }
+
+        // If hitting a guard or wall -> explode at next cell
+        const hitGuard = findGuardAtCell(nextCol, nextRow);
+        if (hitGuard && hitGuard.state !== 'dead') {
+          g.col = nextCol;
+          g.row = nextRow;
+          triggerGrenadeExplosion(g, g.col, g.row);
+          alive = false;
+          break;
+        }
+        if (!isWalkable(nextCol, nextRow)) {
+          g.col = nextCol;
+          g.row = nextRow;
+          triggerGrenadeExplosion(g, g.col, g.row);
+          alive = false;
+          break;
+        }
+
+        // Move forward
+        g.col = nextCol;
+        g.row = nextRow;
+        g.rangeLeft--;
+
+        // If max distance reached after moving, stop and arm fuse
+        if (g.rangeLeft <= 0) {
+          g.state = 'fuse';
+          g.fuseTicks = GRENADE_FUSE_TICKS;
+          updateGrenadePosition(g);
+          survivors.push(g);
+          alive = false;
+          break;
+        }
+      }
+
+      if (alive && g.state !== 'fuse') {
+        updateGrenadePosition(g);
+        survivors.push(g);
+      }
+    }
+
+    grenades = survivors;
+  }
+
+  function updateGrenadeExplosions() {
+    if (!grenadeExplosions || grenadeExplosions.length === 0) return;
+    const survivors = [];
+    grenadeExplosions.forEach((fx) => {
+      fx.ttl--;
+      if (fx.ttl <= 0) {
+        fx.elements.forEach((el) => {
+          if (el && el.el && el.el.parentNode) el.el.parentNode.removeChild(el.el);
+        });
+        return;
+      }
+      fx.elements.forEach((item) => {
+        if (!item || !item.el) return;
+        const opacity = Math.random() > 0.5 ? '1' : '0.1';
+        item.el.style.opacity = opacity;
+        // Damage guards currently on this explosion cell (once per tick)
+        const hitGuard = findGuardAtCell(item.col, item.row);
+        if (hitGuard && hitGuard.state !== 'dead') {
+          applyGrenadeDamageAt(item.col, item.row);
+        }
+      });
+      survivors.push(fx);
+    });
+    grenadeExplosions = survivors;
+  }
+
+  function clearGrenadesAndFx() {
+    if (grenades && grenades.length) {
+      grenades.forEach((g) => {
+        if (g && g.el && g.el.parentNode) {
+          g.el.parentNode.removeChild(g.el);
+        }
+      });
+    }
+    grenades = [];
+    if (grenadeExplosions && grenadeExplosions.length) {
+      grenadeExplosions.forEach((fx) => {
+        if (fx && Array.isArray(fx.elements)) {
+          fx.elements.forEach((el) => {
+            if (el && el.parentNode) el.parentNode.removeChild(el);
+          });
+        }
+      });
+    }
+    grenadeExplosions = [];
+    if (grenadeFxContainer) {
+      while (grenadeFxContainer.firstChild) {
+        grenadeFxContainer.removeChild(grenadeFxContainer.firstChild);
+      }
+    }
+  }
+
+
   function updatePickupPosition(pickup) {
     if (!pickup.el) return;
     const x = pickup.col * cellW;
@@ -2969,24 +3275,13 @@ function updateHudLayout() {
       inner.style.background = '#ff00ff';
       inner.style.clipPath = 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)';
     } else if (type === 'grenade') {
-      // Orange "G" placeholder
+      // Small orange square
       inner.style.left = '50%';
       inner.style.top = '50%';
-      inner.style.width = '70%';
-      inner.style.height = '70%';
+      inner.style.width = '50%';
+      inner.style.height = '50%';
       inner.style.transform = 'translate(-50%, -50%)';
-      inner.style.background = 'transparent';
-      const label = document.createElement('div');
-      label.textContent = 'G';
-      label.style.position = 'absolute';
-      label.style.left = '50%';
-      label.style.top = '50%';
-      label.style.transform = 'translate(-50%, -50%)';
-      label.style.fontFamily = 'monospace';
-      label.style.fontSize = '80%';
-      label.style.fontWeight = 'bold';
-      label.style.color = '#ff5533';
-      inner.appendChild(label);
+      inner.style.background = '#ff5533';
     } else if (type === 'key') {
       // NEW: blinking white "K" (no background)
       inner.style.left = '50%';
@@ -7620,6 +7915,8 @@ function stepGuardAlert(guard) {
       updateRifleBeams();
       updatePlayerBlink();
       updateShieldState();
+      stepGrenades();
+      updateGrenadeExplosions();
       return;
     }
 
@@ -7670,12 +7967,14 @@ function stepGuardAlert(guard) {
 
     // 5) Movimento proiettili
     stepBullets();
+    stepGrenades();
 
     // 6) Collisioni corpo a corpo (stealth / danno)
     checkGuardPlayerCollisions();
 
     // 6.5) Rifle beams decay
     updateRifleBeams();
+    updateGrenadeExplosions();
 
     // 7) Blink pickups
     updatePickupsBlink();
@@ -7974,6 +8273,8 @@ function stepGuardAlert(guard) {
       handleRifleAction();
     } else if (selected.id === 'shield') {
       handleShieldAction();
+    } else if (selected.id === 'grenade') {
+      handleGrenadeAction();
     } else {
       // Placeholder for future equipment mechanics (shield / grenade / rifle)
     }
@@ -8015,6 +8316,14 @@ function stepGuardAlert(guard) {
     shieldBlinkTicks = 0;
     setPlayerColor('#ff00ff'); // bright fuchsia
     updateModeVisual();
+  }
+
+  function handleGrenadeAction() {
+    if (playerGrenades <= 0) {
+      console.log('[overlay] PLAYER tried to use GRENADE but inventory is empty.');
+      return;
+    }
+    launchGrenadeFromPlayer();
   }
 
   function placeBaitInFrontOfPlayer() {
