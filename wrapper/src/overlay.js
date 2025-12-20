@@ -873,6 +873,19 @@
     );
   }
 
+  // Try to infer the room key for a given cell by checking guard patrol rects
+  function getRoomKeyForCell(col, row) {
+    if (!isDungeonLayout()) return null;
+    for (let i = 0; i < guards.length; i++) {
+      const g = guards[i];
+      if (!g) continue;
+      if (col >= g.minCol && col <= g.maxCol && row >= g.minRow && row <= g.maxRow) {
+        return getGuardRoomKey(g);
+      }
+    }
+    return null;
+  }
+
   // Ensure a roomAlerts entry exists with default fields
   function ensureRoomAlertEntry(key) {
     if (!key) return null;
@@ -4711,9 +4724,10 @@ function createPlacedBait(col, row) {
   // Four-corners reset on alert
   // -----------------------------
   function maybeStartFourCornersResetOnAlert() {
-    // Alert active?
+    // Alert active? (sector/room based)
     const alertActive = anySectorTracking() || (globalAlertLevel > 0);
-    if (!alertActive) return;
+    const dungeon = isDungeonLayout();
+    if (!alertActive && !dungeon) return;
     if (!patchMarkers || !patchMarkers.length) return;
 
     liberationTriggers.forEach((trigger, idx) => {
@@ -4726,6 +4740,19 @@ function createPlacedBait(col, row) {
 
       const markers = getMarkersForTrigger(idx);
       if (!markers.length) return;
+
+      // In dungeon, only start/reset countdown if the room of these corners is in alert
+      if (dungeon) {
+        const key = getRoomKeyForCell(markers[0].col, markers[0].row);
+        const ra = key ? roomAlerts[key] : null;
+        const roomAlertActive = ra && ra.state === 'tracking';
+        if (!roomAlertActive) {
+          return;
+        }
+      } else if (!alertActive) {
+        return;
+      }
+
       const activeCount = markers.filter((m) => m.active).length;
       if (activeCount > 0 && activeCount < markers.length) {
         patchResetCountdowns[idx] = FOUR_CORNERS_RESET_TICKS;
