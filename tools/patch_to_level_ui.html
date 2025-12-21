@@ -69,6 +69,13 @@
 <body>
   <h2>Patch to Level UI</h2>
 
+  <div class="row" style="margin-bottom:16px;">
+    <label style="display:flex; align-items:center; gap:8px;">
+      <input type="checkbox" id="detectSystem" />
+      detect system patches
+    </label>
+  </div>
+
   <div class="row">
     <div>Select .orca file</div>
     <button id="btnFile">Browse</button>
@@ -149,15 +156,24 @@
 
     let serverFilePath = null;
     let patchCount = 0;
+    let patchInfo = [];
 
     const btnFile = document.getElementById('btnFile');
     const fileInput = document.getElementById('fileInput');
     const fileName = document.getElementById('fileName');
-    const patchInfo = document.getElementById('patchInfo');
+    const patchInfoEl = document.getElementById('patchInfo');
     const patchList = document.getElementById('patchList');
     const statusEl = document.getElementById('status');
+    const detectSystemEl = document.getElementById('detectSystem');
 
     btnFile.addEventListener('click', () => fileInput.click());
+
+    detectSystemEl.addEventListener('change', () => {
+      if (serverFilePath) {
+        setStatus('Detecting patches...');
+        detectPatches().catch((err) => setStatus('Error: ' + err.message, true));
+      }
+    });
 
     fileInput.addEventListener('change', async (ev) => {
       const file = ev.target.files && ev.target.files[0];
@@ -188,35 +204,44 @@
       const res = await fetch('/api/detect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filePath: serverFilePath })
+        body: JSON.stringify({
+          filePath: serverFilePath,
+          detectSystem: detectSystemEl.checked
+        })
       });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'detect failed');
       }
-      patchCount = data.patchCount || 0;
-      patchInfo.textContent = 'patch detected: ' + patchCount;
+      patchInfo = Array.isArray(data.patches) ? data.patches : [];
+      patchCount = data.patchCount || patchInfo.length || 0;
+      patchInfoEl.textContent = 'patch detected: ' + patchCount;
       renderPatchList();
       setStatus('Ready');
     }
 
     function renderPatchList() {
       patchList.innerHTML = '';
-      for (let i = 0; i < patchCount; i++) {
+      const infoList = patchInfo && patchInfo.length ? patchInfo : Array.from({ length: patchCount }, () => ({ isSystem: false }));
+      for (let i = 0; i < infoList.length; i++) {
+        const meta = infoList[i] || { isSystem: false };
         const row = document.createElement('div');
         row.className = 'patch-row';
         const label = document.createElement('div');
-        label.textContent = 'patch ' + (i + 1);
-        const sel = document.createElement('select');
-        sel.dataset.patchIndex = i;
-        rituals.forEach(r => {
-          const opt = document.createElement('option');
-          opt.value = r.value;
-          opt.textContent = r.label;
-          sel.appendChild(opt);
-        });
+        label.textContent = 'patch ' + (i + 1) + (meta.isSystem ? ' (SYS)' : '');
+        let sel = null;
+        if (!meta.isSystem) {
+          sel = document.createElement('select');
+          sel.dataset.patchIndex = i;
+          rituals.forEach(r => {
+            const opt = document.createElement('option');
+            opt.value = r.value;
+            opt.textContent = r.label;
+            sel.appendChild(opt);
+          });
+        }
         row.appendChild(label);
-        row.appendChild(sel);
+        if (sel) row.appendChild(sel);
         patchList.appendChild(row);
       }
     }
@@ -242,6 +267,7 @@
           rifle: parseInt(document.getElementById('rifle').value, 10),
           shield: parseInt(document.getElementById('shield').value, 10),
           grenade: parseInt(document.getElementById('grenade').value, 10),
+          detectSystem: document.getElementById('detectSystem').checked,
           walls: document.getElementById('walls').value
         }
       };

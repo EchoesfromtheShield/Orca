@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Simple CLI:
-//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups]
+//  node tools/patch_to_level.js input.orca levels/generated-level.orca generated-level.json [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups] [detectSystemPatches]
 //
 // input.orca:
 //   - can be a small exported selection from ORCA
@@ -33,12 +33,12 @@
 //    - Ogni patch diventa una stanza rettangolare, chiusa da muri (WALL_CHAR),
 //      con il codice patch dentro e margini di pavimento '.' attorno.
 //    - Le stanze sono disposte in linea orizzontale, collegate da un corridoio
-//      orizzontale in basso e da un “pozzo” verticale per stanza.
+//      orizzontale in basso e da un â€œpozzoâ€ verticale per stanza.
 //
 // 3) layout = "dungeon"
-//    - Layout “dungeon-like” basato su stanze rettangolari + corridoi a L:
+//    - Layout â€œdungeon-likeâ€ basato su stanze rettangolari + corridoi a L:
 //      * la griglia parte tutta piena di muri (WALL_CHAR);
-//      * per ogni patch viene “scavata” una stanza abbastanza grande per
+//      * per ogni patch viene â€œscavataâ€ una stanza abbastanza grande per
 //        contenere la patch + margini (pavimento '.');
 //      * le stanze sono collegate fra loro in catena con corridoi a L
 //        (prima orizzontali, poi verticali) fra i loro centri;
@@ -66,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups] [detectSystemPatches]');
   process.exit(1);
 }
 
@@ -96,6 +96,7 @@ const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
 //   argv[15] -> RIFLE_PICKUPS (optional, can also use env.RIFLE_PICKUPS)
 //   argv[16] -> SHIELD_PICKUPS (optional, can also use env.SHIELD_PICKUPS)
 //   argv[17] -> GRENADE_PICKUPS (optional, can also use env.GRENADE_PICKUPS)
+//   argv[18] -> DETECT_SYSTEM_PATCHES (optional, can also use env.DETECT_SYSTEM_PATCHES)
 //   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
@@ -103,6 +104,7 @@ const baitArg = process.argv[10] || process.env.BAIT_PICKUPS;
 const rifleArg = process.argv[15] || process.env.RIFLE_PICKUPS;
 const shieldArg = process.argv[16] || process.env.SHIELD_PICKUPS;
 const grenadeArg = process.argv[17] || process.env.GRENADE_PICKUPS;
+const detectSystemArg = process.argv[18] || process.env.DETECT_SYSTEM_PATCHES;
 
 // Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
@@ -127,6 +129,8 @@ const SHIELD_PICKUP_COUNT = shieldArg != null
 const GRENADE_PICKUP_COUNT = grenadeArg != null
   ? Math.max(0, parseInt(grenadeArg, 10) || 0)
   : 0;
+const DETECT_SYSTEM_PATCHES = (detectSystemArg || '').toString().toLowerCase() === 'true' ||
+  detectSystemArg === '1';
 
 // Ritual: optional identifier for this level/ritual
 // Can be provided via CLI (11th arg) or env.RITUAL_ID
@@ -183,7 +187,7 @@ const DESTROY_TARGET_HP = destroyHpArg != null
 // Room size can be overridden via environment variables, e.g.
 //   ROOM_W=100 ROOM_H=40 node ...
 const ROOM_W = parseInt(process.env.ROOM_W, 10) || 140;
-const ROOM_H = parseInt(process.env.ROOM_H, 10) || 40;
+const ROOM_H = parseInt(process.env.ROOM_H, 10) || 45;
 
 // Margins for layouts that build rooms from patches
 // rooms_line usa ROOM_MARGIN_X / ROOM_MARGIN_Y fissi.
@@ -195,9 +199,9 @@ const ROOM_GAP_COLS   = parseInt(process.env.ROOM_GAP_COLS, 10) || 4;
 // Dungeon: per lato, margini minimi e massimi intorno alla patch.
 // Default: 2..4 celle per lato, ma puoi alzare con
 //   ROOM_MARGIN_X_MAX / ROOM_MARGIN_Y_MAX
-const ROOM_MARGIN_X_MIN = parseInt(process.env.ROOM_MARGIN_X_MIN, 10) || ROOM_MARGIN_X;
+const ROOM_MARGIN_X_MIN = parseInt(process.env.ROOM_MARGIN_X_MIN, 10) || 1;
 const ROOM_MARGIN_X_MAX = parseInt(process.env.ROOM_MARGIN_X_MAX, 10) || (ROOM_MARGIN_X + 4);
-const ROOM_MARGIN_Y_MIN = parseInt(process.env.ROOM_MARGIN_Y_MIN, 10) || ROOM_MARGIN_Y;
+const ROOM_MARGIN_Y_MIN = parseInt(process.env.ROOM_MARGIN_Y_MIN, 10) || 1;
 const ROOM_MARGIN_Y_MAX = parseInt(process.env.ROOM_MARGIN_Y_MAX, 10) || (ROOM_MARGIN_Y + 4);
 
 // Dungeon: spessore corridoi (in celle), min/max.
@@ -426,24 +430,117 @@ function findCommentBlocks(clusterGrid) {
   return blocks;
 }
 
+function hasSystemMarker(clusterGrid, block) {
+  const sub = sliceGrid(
+    clusterGrid,
+    block.x,
+    block.y,
+    block.x + block.w - 1,
+    block.y + block.h - 1
+  );
+  for (let y = 0; y < sub.height; y++) {
+    for (let x = 0; x < sub.width; x++) {
+      if (sub.grid[y][x] === '$') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractInnerPatchGrid(clusterGrid, block) {
+  const sub = sliceGrid(
+    clusterGrid,
+    block.x,
+    block.y,
+    block.x + block.w - 1,
+    block.y + block.h - 1
+  );
+  const innerW = Math.max(0, sub.width - 2);
+  const innerH = Math.max(0, sub.height - 2);
+  const inner = [];
+  for (let y = 0; y < innerH; y++) {
+    const row = [];
+    for (let x = 0; x < innerW; x++) {
+      row.push(sub.grid[y + 1][x + 1]);
+    }
+    inner.push(row);
+  }
+  return { grid: inner, width: innerW, height: innerH };
+}
+
+function placeSystemPatchesAtTop(grid, systemPatches, maxRows) {
+  const cells = [];
+  if (!systemPatches || systemPatches.length === 0) return cells;
+  let cursorX = 0;
+  let cursorY = 0;
+  let rowHeight = 0;
+
+  systemPatches.forEach((p) => {
+    if (p.width > ROOM_W) {
+      console.warn('[patch_to_level] System patch too wide for map:', p.id);
+      return;
+    }
+
+    if (cursorX + p.width > ROOM_W) {
+      cursorX = 0;
+      cursorY += rowHeight + 1;
+      rowHeight = 0;
+    }
+
+    if (cursorY + p.height > maxRows) {
+      console.warn('[patch_to_level] Not enough top space to place system patch', p.id);
+      return;
+    }
+
+    for (let y = 0; y < p.height; y++) {
+      for (let x = 0; x < p.width; x++) {
+        const gx = cursorX + x;
+        const gy = cursorY + y;
+        if (gy < 0 || gy >= grid.length || gx < 0 || gx >= grid[0].length) continue;
+        grid[gy][gx] = p.grid[y][x];
+        cells.push({ col: gx, row: gy });
+      }
+    }
+
+    rowHeight = Math.max(rowHeight, p.height);
+    cursorX += p.width + 1;
+  });
+
+  return cells;
+}
+
 // Prepare the "cluster" and ensure it has at least one comment block.
 // If no blocks are found, auto-wrap the cluster in a single '#'-framed block.
+function applySystemFlags(blocks, clusterGrid) {
+  // Always annotate with isSystem so we can log/inspect even if the flag is off.
+  return blocks.map((b) => ({
+    ...b,
+    isSystem: hasSystemMarker(clusterGrid, b)
+  }));
+}
+
 function prepareCommentedCluster(fullGrid) {
   const { minX, minY, maxX, maxY } = findNonDotBoundingBox(fullGrid);
   const sliced = sliceGrid(fullGrid, minX, minY, maxX, maxY);
   let clusterGrid = sliced.grid;
 
   // Try to detect explicit comment blocks.
-  let blocks = findCommentBlocks(clusterGrid);
+  let blocks = applySystemFlags(findCommentBlocks(clusterGrid), clusterGrid);
 
   if (blocks.length === 0) {
     // No comment rails: auto-wrap whole cluster.
     console.warn('[patch_to_level] No comment blocks found, auto-wrapping entire patch.');
     clusterGrid = wrapGridWithCommentFrame(clusterGrid);
-    blocks = findCommentBlocks(clusterGrid);
+    blocks = applySystemFlags(findCommentBlocks(clusterGrid), clusterGrid);
     if (blocks.length === 0) {
       throw new Error('Failed to auto-wrap patch into a comment block.');
     }
+  }
+
+  if (DETECT_SYSTEM_PATCHES) {
+    const sysCount = blocks.filter((b) => b.isSystem).length;
+    console.log('[patch_to_level] System patch detection enabled. Found', sysCount, 'system patches out of', blocks.length);
   }
 
   return {
@@ -531,7 +628,8 @@ function connectSpawnRoomToDungeon(
   innerMinX,
   innerMinY,
   innerMaxX,
-  innerMaxY
+  innerMaxY,
+  forbiddenSet
 ) {
   const height = grid.length;
   const width = grid[0].length;
@@ -548,6 +646,8 @@ function connectSpawnRoomToDungeon(
   function idx(x, y) {
     return y * width + x;
   }
+
+  const forbidden = forbiddenSet || new Set();
 
   const visited = new Array(width * height).fill(false);
   const prev = new Array(width * height).fill(-1);
@@ -575,6 +675,7 @@ function connectSpawnRoomToDungeon(
       const ny = cy + dirs[i].dy;
 
       if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      if (forbidden.has(nx + ',' + ny)) continue;
 
       const ch = grid[ny][nx];
 
@@ -624,8 +725,23 @@ function connectSpawnRoomToDungeon(
 // Inject a small 3x3 spawn room (5x5 including walls) into a dungeon layout,
 // connect it with a 1-tile corridor to the nearest existing floor,
 // and return the modified ORCA grid string plus playerSpawn coordinates.
-function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
+function injectPlayerSpawnRoomIntoDungeon(orcaGridStr, opts = {}) {
   const { grid, width, height } = stringToGrid(orcaGridStr);
+  const {
+    systemCells = [],
+    reservedTopRows = 0
+  } = opts;
+
+  const forbidden = new Set(
+    systemCells.map((c) => `${c.col},${c.row}`)
+  );
+  if (reservedTopRows > 0) {
+    for (let y = 0; y < Math.min(reservedTopRows, height); y++) {
+      for (let x = 0; x < width; x++) {
+        forbidden.add(`${x},${y}`);
+      }
+    }
+  }
 
   // Detect which glyph is being used as "wall".
   const wallChar = detectWallChar(grid);
@@ -641,7 +757,7 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
 
   // Find a 5x5 area made entirely of walls, leaving a small border.
   outer:
-  for (let y = 1; y <= maxStartY; y++) {
+  for (let y = Math.max(1, reservedTopRows); y <= maxStartY; y++) {
     for (let x = 1; x <= maxStartX; x++) {
       let ok = true;
       for (let yy = 0; yy < roomH && ok; yy++) {
@@ -696,7 +812,8 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
     innerMinX,
     innerMinY,
     innerMaxX,
-    innerMaxY
+    innerMaxY,
+    forbidden
   );
 
   const newStr = gridToString(grid);
@@ -719,7 +836,8 @@ function injectPlayerSpawnRoomIntoDungeon(orcaGridStr) {
 // playerSpawn: optional { col, row } suggested spawn for the player.
 // levelGrid: 2D grid (array of rows) of the final ORCA level.
 // layout: string, "arena" | "rooms_line" | "dungeon".
-function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ritualId) {
+// systemCells: optional [{col,row}] to treat as non-walkable for spawns/pickups.
+function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ritualId, systemCells) {
   const fovProfiles = {
     A: {
       depth: 9,
@@ -737,6 +855,11 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
   const hasGrid = Array.isArray(levelGrid) && levelGrid.length > 0;
   const gridH = hasGrid ? levelGrid.length : 0;
   const gridW = hasGrid ? levelGrid[0].length : 0;
+  const systemSet = new Set(
+    Array.isArray(systemCells)
+      ? systemCells.map((c) => `${c.col},${c.row}`)
+      : []
+  );
 
   // Defaults:
   // - dungeon  -> guards per room (per patch) default 3
@@ -761,7 +884,8 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
 
 
   // Helper: collect all walkable ('.') cells inside a rectangle.
-  function collectWalkableCells(minCol, maxCol, minRow, maxRow) {
+  function collectWalkableCells(minCol, maxCol, minRow, maxRow, forbiddenSet) {
+    const forbidden = forbiddenSet || systemSet;
     const cells = [];
     if (!hasGrid) {
       return cells;
@@ -772,6 +896,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       for (let col = minCol; col <= maxCol; col++) {
         if (col < 0 || col >= gridW) continue;
         if (levelGrid[row][col] === '.') {
+          if (forbidden.size && forbidden.has(col + ',' + row)) continue;
           cells.push({ col, row });
         }
       }
@@ -786,7 +911,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       return result;
     }
 
-    // Fisher–Yates shuffle on a local copy
+    // Fisherâ€“Yates shuffle on a local copy
     const pool = candidates.slice();
     for (let i = pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -811,7 +936,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       return result;
     }
 
-    // Fisher–Yates shuffle to randomize candidates
+    // Fisherâ€“Yates shuffle to randomize candidates
     const cells = allCells.slice();
     for (let i = cells.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -930,7 +1055,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
           console.warn(
             '[patch_to_level] WARNING (dungeon): no walkable cells around patch',
             b.id || patchIndex,
-            '— guards will be skipped for this room.'
+            'â€” guards will be skipped for this room.'
           );
           return;
         }
@@ -979,7 +1104,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
           console.warn(
             '[patch_to_level] WARNING (dungeon): could not place guards for room',
             b.id || patchIndex,
-            '— no valid spawn cells.'
+            'â€” no valid spawn cells.'
           );
           return;
         }
@@ -1097,7 +1222,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
           console.warn(
             '[patch_to_level] WARNING (dungeon): no walkable cells around patch',
             b.id || patchIndex,
-            '— guards will be skipped for this room.'
+            'â€” guards will be skipped for this room.'
           );
           return;
         }
@@ -1143,7 +1268,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
           console.warn(
             '[patch_to_level] WARNING (dungeon): no valid walkable cells in room',
             b.id || patchIndex,
-            '— guards will be skipped for this room.'
+            'â€” guards will be skipped for this room.'
           );
           return;
         }
@@ -1202,7 +1327,7 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
           console.warn(
             '[patch_to_level] WARNING (dungeon): could not place guards for room',
             b.id || patchIndex,
-            '— no valid spawn cells.'
+            'â€” no valid spawn cells.'
           );
           return;
         }
@@ -1579,6 +1704,12 @@ function buildArenaLayout(fullGrid) {
     blocks
   } = prepareCommentedCluster(fullGrid);
 
+  const sysCount = blocks.filter((b) => b.isSystem).length;
+  const normCount = blocks.length - sysCount;
+  if (DETECT_SYSTEM_PATCHES) {
+    console.log('[patch_to_level][arena] System patches:', sysCount, 'Normal patches:', normCount);
+  }
+
   const originX = Math.max(0, Math.floor((ROOM_W - clusterWidth) / 2));
   const originY = Math.max(0, Math.floor((ROOM_H - clusterHeight) / 2));
 
@@ -1592,9 +1723,33 @@ function buildArenaLayout(fullGrid) {
     );
   }
 
-  const orcaGrid = buildLevelGrid(ROOM_W, ROOM_H, clusterGrid, originX, originY);
+  const systemBlocks = blocks.filter((b) => b.isSystem);
+  let normalBlocks = DETECT_SYSTEM_PATCHES ? blocks.filter((b) => !b.isSystem) : blocks;
+  if (normalBlocks.length === 0) {
+    normalBlocks = blocks; // fallback to avoid empty level
+  }
 
-  const commentBlocksGlobal = blocks.map((b, idx) => ({
+  // Un-comment system patches by removing their frames
+  let clusterWithSystems = clusterGrid.map((row) => row.slice());
+  systemBlocks.forEach((b) => {
+    for (let y = 0; y < b.h; y++) {
+      for (let x = 0; x < b.w; x++) {
+        const gx = b.x + x;
+        const gy = b.y + y;
+        if (gx < 0 || gy < 0 || gy >= clusterWithSystems.length || gx >= clusterWithSystems[0].length) continue;
+        const isBorder = (x === 0 || y === 0 || x === b.w - 1 || y === b.h - 1);
+        if (isBorder) {
+          clusterWithSystems[gy][gx] = '.';
+        } else {
+          clusterWithSystems[gy][gx] = clusterGrid[gy][gx];
+        }
+      }
+    }
+  });
+
+  const orcaGrid = buildLevelGrid(ROOM_W, ROOM_H, clusterWithSystems, originX, originY);
+
+  const commentBlocksGlobal = normalBlocks.map((b, idx) => ({
     id: `patch_${idx}`,
     x: originX + b.x,
     y: originY + b.y,
@@ -1722,7 +1877,7 @@ function buildRoomsLineLayout(fullGrid) {
   const corridorBottomWall = corridorY + 1;
 
   // Final global grid: start as all '.'
-  const finalGrid = [];
+  let finalGrid = [];
   for (let y = 0; y < ROOM_H; y++) {
     const row = new Array(ROOM_W).fill('.');
     finalGrid.push(row);
@@ -1779,7 +1934,7 @@ function buildRoomsLineLayout(fullGrid) {
     // corridorY row itself remains '.' as walkable floor
   }
 
-  const commentBlocksGlobal = [];
+    const commentBlocksGlobal = [];
 
   // Step 4: connect each room to the corridor with a vertical shaft
   roomPlacements.forEach((r) => {
@@ -1898,8 +2053,17 @@ function buildDungeonLayout(fullGrid) {
     throw new Error('buildDungeonLayout: no patches found.');
   }
 
+  const systemBlocks = blocks.filter((b) => b.isSystem);
+  let blocksForRooms = DETECT_SYSTEM_PATCHES ? blocks.filter((b) => !b.isSystem) : blocks;
+  if (blocksForRooms.length === 0) {
+    blocksForRooms = blocks; // fallback to avoid empty layout
+  }
+  if (DETECT_SYSTEM_PATCHES) {
+    console.log('[patch_to_level][dungeon] System patches:', systemBlocks.length, 'Normal patches:', blocksForRooms.length);
+  }
+
   // Extract patches as independent blocks
-  const patchDescs = blocks.map((b, idx) => {
+  const patchDescs = blocksForRooms.map((b, idx) => {
     const sub = sliceGrid(
       clusterGrid,
       b.x,
@@ -1912,6 +2076,16 @@ function buildDungeonLayout(fullGrid) {
       patchWidth: sub.width,
       patchHeight: sub.height,
       patchGrid: sub.grid
+    };
+  });
+
+  const systemPatchDescs = (DETECT_SYSTEM_PATCHES ? systemBlocks : []).map((b, idx) => {
+    const inner = extractInnerPatchGrid(clusterGrid, b);
+    return {
+      id: `system_${idx}`,
+      width: inner.width,
+      height: inner.height,
+      grid: inner.grid
     };
   });
 
@@ -1959,150 +2133,150 @@ function buildDungeonLayout(fullGrid) {
   const ADAPTIVE_CORRIDOR_WIDTH_MAX =
     CORRIDOR_WIDTH_MIN + Math.round(corridorWidthRange * areaScale);
 
+  const RESERVED_TOP_ROWS = DETECT_SYSTEM_PATCHES ? 6 : 0;
+  const USABLE_HEIGHT = Math.max(1, ROOM_H - RESERVED_TOP_ROWS);
+
   console.log(
-    '[patch_to_level] Dungeon adaptive scale:',
-    'patchCount =', patchDescs.length,
-    'idealArea =', idealArea,
-    'mapArea =', totalMapArea,
-    'areaScale =', areaScale.toFixed(3),
-    'marginXMaxUsed =', ADAPTIVE_MARGIN_X_MAX,
-    'marginYMaxUsed =', ADAPTIVE_MARGIN_Y_MAX,
-    'corridorWidthMaxUsed =', ADAPTIVE_CORRIDOR_WIDTH_MAX
+    "[patch_to_level] Dungeon adaptive scale:",
+    "patchCount =", patchDescs.length,
+    "idealArea =", idealArea,
+    "mapArea =", totalMapArea,
+    "areaScale =", areaScale.toFixed(3),
+    "marginXMaxUsed =", ADAPTIVE_MARGIN_X_MAX,
+    "marginYMaxUsed =", ADAPTIVE_MARGIN_Y_MAX,
+    "corridorWidthMaxUsed =", ADAPTIVE_CORRIDOR_WIDTH_MAX,
+    "reservedTopRows =", RESERVED_TOP_ROWS
   );
 
+  function tryShelfPlacement(strategy) {
+    const rooms = [];
+    const rows = [];
+    let cursorX = 0;
+    let cursorY = 0;
+    let rowHeight = 0;
+    let currentRow = { startY: 0, height: 0, rooms: [] };
+    rows.push(currentRow);
+    const ROW_GAP = 2;
+    const corridorMax = strategy === "tight"
+      ? Math.max(1, CORRIDOR_WIDTH_MIN)
+      : ADAPTIVE_CORRIDOR_WIDTH_MAX;
+
+    for (let idx = 0; idx < patchDescs.length; idx++) {
+      const p = patchDescs[idx];
+      const pw = p.patchWidth;
+      const ph = p.patchHeight;
+
+      const marginX = (strategy === "tight")
+        ? Math.max(1, ROOM_MARGIN_X_MIN)
+        : randInt(ROOM_MARGIN_X_MIN, ADAPTIVE_MARGIN_X_MAX);
+      const marginY = (strategy === "tight")
+        ? Math.max(1, ROOM_MARGIN_Y_MIN)
+        : randInt(ROOM_MARGIN_Y_MIN, ADAPTIVE_MARGIN_Y_MAX);
+
+      const innerW = pw + marginX * 2;
+      const innerH = ph + marginY * 2;
+      const fullW = innerW + 2;
+      const fullH = innerH + 2;
+
+      if (cursorX + fullW > ROOM_W) {
+        cursorX = 0;
+        cursorY += rowHeight + ROW_GAP;
+        rowHeight = 0;
+        currentRow = { startY: cursorY, height: 0, rooms: [] };
+        rows.push(currentRow);
+      }
+
+      if (cursorY + fullH > USABLE_HEIGHT) {
+        return null;
+      }
+
+      const rectX = cursorX;
+      const rectY = cursorY;
+      const floorX = rectX + 1;
+      const floorY = rectY + 1;
+      const centerX = floorX + Math.floor(innerW / 2);
+      const centerY = floorY + Math.floor(innerH / 2);
+      const patchOffsetX = floorX + marginX;
+      const patchOffsetY = floorY + marginY;
+
+      const room = {
+        ...p,
+        innerW,
+        innerH,
+        fullW,
+        fullH,
+        rectX,
+        rectY,
+        floorX,
+        floorY,
+        centerX,
+        centerY,
+        patchOffsetX,
+        patchOffsetY,
+        corridorMax,
+        rowIndex: rows.length - 1
+      };
+
+      rooms.push(room);
+      currentRow.rooms.push(room);
+
+      cursorX += fullW + ROOM_GAP_COLS;
+      if (fullH > rowHeight) rowHeight = fullH;
+      if (fullH > currentRow.height) currentRow.height = fullH;
+    }
+
+    // Jitter vertical positions within each row band to avoid flat alignment
+    rows.forEach((row) => {
+      const maxH = row.height || 0;
+      row.rooms.forEach((room) => {
+        const slack = Math.max(0, maxH - room.fullH);
+        const offset = slack > 0 ? randInt(0, slack) : 0;
+        room.rectY = row.startY + offset;
+        room.floorY = room.rectY + 1;
+        room.centerY = room.floorY + Math.floor(room.innerH / 2);
+        room.patchOffsetY = room.floorY + (room.innerH - room.patchHeight) / 2;
+        room.patchOffsetY = Math.floor(room.patchOffsetY);
+      });
+    });
+
+    return { rooms, corridorMax };
+  }
+
+  const placementStrategies = ["adaptive", "tight"];
+  let placement = null;
+  for (let i = 0; i < placementStrategies.length && !placement; i++) {
+    placement = tryShelfPlacement(placementStrategies[i]);
+  }
+
+  if (!placement) {
+    throw new Error(
+      "[patch_to_level] Dungeon: could not place rooms within map height. Increase ROOM_H or reduce number/size of patches."
+    );
+  }
+
+  const placedRooms = placement.rooms;
+  const corridorWidthMaxUsed = placement.corridorMax;
 
   // Final grid: initially full of walls
-  const finalGrid = [];
+  let finalGrid = [];
   for (let y = 0; y < ROOM_H; y++) {
     const row = new Array(ROOM_W).fill(WALL_CHAR);
     finalGrid.push(row);
   }
 
-  const placedRooms = [];
-  const roomRects = [];
+  // Dig rooms
+  placedRooms.forEach((r) => {
+    const floorX = r.rectX + 1;
+    const floorY = r.rectY + 1;
 
-  // Place rooms like a simple random-dungeon algorithm,
-  // but with variable margins per room and HARD no-overlap.
-  patchDescs.forEach((p) => {
-    const pw = p.patchWidth;
-    const ph = p.patchHeight;
-
-    // Random margins around patch (adaptive max)
-    const marginX = randInt(ROOM_MARGIN_X_MIN, ADAPTIVE_MARGIN_X_MAX);
-    const marginY = randInt(ROOM_MARGIN_Y_MIN, ADAPTIVE_MARGIN_Y_MAX);
-
-
-    const innerW = pw + marginX * 2;
-    const innerH = ph + marginY * 2;
-
-    const fullW = innerW + 2; // + walls
-    const fullH = innerH + 2;
-
-    let rectX = 0;
-    let rectY = 0;
-
-    const maxRectX = Math.max(0, ROOM_W - fullW);
-    const maxRectY = Math.max(0, ROOM_H - fullH);
-
-    let placed = false;
-
-    if (maxRectX < 0 || maxRectY < 0) {
-      // Room larger than map: we accept clipping, but still avoid crashing.
-      console.warn(
-        '[patch_to_level] Dungeon: room for',
-        p.id,
-        'bigger than map, clipping at (0,0).'
-      );
-      rectX = 0;
-      rectY = 0;
-      placed = true;
-    } else {
-      // 1) Random attempts for variety
-      let attempts = 0;
-      const MAX_RANDOM_ATTEMPTS = 100;
-
-      while (attempts < MAX_RANDOM_ATTEMPTS && !placed) {
-        const candidate = {
-          x: randInt(0, maxRectX),
-          y: randInt(0, maxRectY),
-          w: fullW,
-          h: fullH
-        };
-        const overlap = roomRects.some((rr) => rectsOverlap(rr, candidate));
-        if (!overlap) {
-          rectX = candidate.x;
-          rectY = candidate.y;
-          placed = true;
-          break;
-        }
-        attempts++;
-      }
-
-      // 2) Deterministic scan: guarantee non-overlap if it exists
-      if (!placed) {
-        outerScan:
-        for (let y = 0; y <= maxRectY; y++) {
-          for (let x = 0; x <= maxRectX; x++) {
-            const candidate = { x, y, w: fullW, h: fullH };
-            const overlap = roomRects.some((rr) => rectsOverlap(rr, candidate));
-            if (!overlap) {
-              rectX = x;
-              rectY = y;
-              placed = true;
-              break outerScan;
-            }
-          }
-        }
-      }
-
-      // 3) Se ancora non c'è spazio, falliamo con errore esplicito
-      if (!placed) {
-        throw new Error(
-          '[patch_to_level] Dungeon: could not place room for ' +
-          p.id +
-          ' without overlap. Increase ROOM_W/ROOM_H or reduce number/size of patches.'
-        );
-      }
-    }
-
-    const floorX = rectX + 1;
-    const floorY = rectY + 1;
-
-    // Dig interior floor
-    for (let y = floorY; y < floorY + innerH; y++) {
+    for (let y = floorY; y < floorY + r.innerH; y++) {
       if (y < 0 || y >= ROOM_H) continue;
-      for (let x = floorX; x < floorX + innerW; x++) {
+      for (let x = floorX; x < floorX + r.innerW; x++) {
         if (x < 0 || x >= ROOM_W) continue;
-        finalGrid[y][x] = '.';
+        finalGrid[y][x] = ".";
       }
     }
-
-    const centerX = floorX + Math.floor(innerW / 2);
-    const centerY = floorY + Math.floor(innerH / 2);
-
-    const patchOffsetX = floorX + marginX;
-    const patchOffsetY = floorY + marginY;
-
-    const roomInfo = {
-      ...p,
-      innerW,
-      innerH,
-      fullW,
-      fullH,
-      rectX,
-      rectY,
-      floorX,
-      floorY,
-      centerX,
-      centerY,
-      patchOffsetX,
-      patchOffsetY
-    };
-
-    placedRooms.push(roomInfo);
-    roomRects.push({ x: rectX, y: rectY, w: fullW, h: fullH });
   });
-
 
   // Connect rooms with L-shaped corridors of variable thickness
   for (let i = 0; i < placedRooms.length - 1; i++) {
@@ -2114,9 +2288,8 @@ function buildDungeonLayout(fullGrid) {
     const x2 = r2.centerX;
     const y2 = r2.centerY;
 
-    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, ADAPTIVE_CORRIDOR_WIDTH_MAX);
-    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, ADAPTIVE_CORRIDOR_WIDTH_MAX);
-
+    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, corridorWidthMaxUsed);
+    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, corridorWidthMaxUsed);
 
     // Horizontal segment
     carveHorizontalCorridor(finalGrid, y1, x1, x2, corridorWidthH);
@@ -2142,7 +2315,7 @@ function buildDungeonLayout(fullGrid) {
       }
     }
 
-    // Room interior rectangle (only '.' floor area).
+    // Room interior rectangle (only "." floor area).
     // We export it so that JSON generation can:
     // - spawn guards inside the actual room,
     // - use the room interior as patrol rect base.
@@ -2164,8 +2337,32 @@ function buildDungeonLayout(fullGrid) {
     });
   });
 
+  // Shift entire dungeon down by reserved rows to host system patches at the top
+  if (RESERVED_TOP_ROWS > 0) {
+    const shifted = [];
+    for (let y = 0; y < ROOM_H; y++) {
+      shifted.push(new Array(ROOM_W).fill(WALL_CHAR));
+    }
+    for (let y = 0; y < ROOM_H; y++) {
+      const srcY = y - RESERVED_TOP_ROWS;
+      if (srcY < 0) continue;
+      for (let x = 0; x < ROOM_W; x++) {
+        shifted[y][x] = finalGrid[srcY][x];
+      }
+    }
+    finalGrid = shifted;
+    commentBlocksGlobal.forEach((b) => {
+      b.y += RESERVED_TOP_ROWS;
+      b.roomMinRow += RESERVED_TOP_ROWS;
+      b.roomMaxRow += RESERVED_TOP_ROWS;
+    });
+  }
+
+  // Place system patches in the reserved top rows (un-commented)
+  const systemCells = placeSystemPatchesAtTop(finalGrid, systemPatchDescs, RESERVED_TOP_ROWS);
+
   const orcaGrid = finalGrid.map((row) => row.join('')).join('\n') + '\n';
-  return { orcaGrid, commentBlocksGlobal };
+  return { orcaGrid, commentBlocksGlobal, systemCells, reservedTopRows: RESERVED_TOP_ROWS };
 }
 
 
@@ -2193,11 +2390,16 @@ try {
   let orcaGrid = layoutResult.orcaGrid;
   const commentBlocksGlobal = layoutResult.commentBlocksGlobal || [];
   let playerSpawn = layoutResult.playerSpawn || null;
+  const systemCells = layoutResult.systemCells || [];
+  const reservedTopRows = layoutResult.reservedTopRows || 0;
 
   // Solo per il layout dungeon: aggiungi una piccola stanza di spawn
   // dedicata, collegata al dungeon con un corridoio 1-cella.
   if (layout === 'dungeon') {
-    const spawnResult = injectPlayerSpawnRoomIntoDungeon(orcaGrid);
+    const spawnResult = injectPlayerSpawnRoomIntoDungeon(orcaGrid, {
+      systemCells,
+      reservedTopRows
+    });
     orcaGrid = spawnResult.orcaGrid;
     playerSpawn = spawnResult.playerSpawn;
   }
@@ -2206,7 +2408,7 @@ try {
   const levelGridInfo = stringToGrid(orcaGrid);
   const levelGrid = levelGridInfo.grid;
 
-  const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, RITUAL_ID);
+  const jsonConfig = createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, RITUAL_ID, systemCells);
 
 
   // layoutType is already set inside createLevelJson, but we keep this

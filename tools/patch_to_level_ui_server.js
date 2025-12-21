@@ -159,7 +159,23 @@ function findCommentBlocks(clusterGrid) {
   return blocks;
 }
 
-function detectPatchCount(filePath) {
+function hasSystemMarker(clusterGrid, block) {
+  const sub = sliceGrid(
+    clusterGrid,
+    block.x,
+    block.y,
+    block.x + block.w - 1,
+    block.y + block.h - 1
+  );
+  for (let y = 0; y < sub.height; y++) {
+    for (let x = 0; x < sub.width; x++) {
+      if (sub.grid[y][x] === '$') return true;
+    }
+  }
+  return false;
+}
+
+function detectPatches(filePath, detectSystem) {
   const { grid } = normalizeGrid(loadRawLines(filePath));
   const { minX, minY, maxX, maxY } = findNonDotBoundingBox(grid);
   let clusterGrid = sliceGrid(grid, minX, minY, maxX, maxY).grid;
@@ -168,7 +184,11 @@ function detectPatchCount(filePath) {
     clusterGrid = wrapGridWithCommentFrame(clusterGrid);
     blocks = findCommentBlocks(clusterGrid);
   }
-  return blocks.length;
+  const patches = blocks.map((b, idx) => ({
+    index: idx,
+    isSystem: detectSystem ? hasSystemMarker(clusterGrid, b) : false
+  }));
+  return { patchCount: patches.length, patches };
 }
 
 function mapRitualLabel(val) {
@@ -204,6 +224,7 @@ function runPatchToLevel(options, cb) {
     rifle = 0,
     shield = 0,
     grenade = 0,
+    detectSystem = false,
     ritualType = 'fourCorners',
     patchRituals = [],
     wallChar = 'y'
@@ -231,7 +252,8 @@ function runPatchToLevel(options, cb) {
     '4',
     String(rifle),
     String(shield),
-    String(grenade)
+    String(grenade),
+    detectSystem ? '1' : '0'
   ];
 
   const child = spawn(process.execPath, args, {
@@ -315,8 +337,9 @@ const server = http.createServer(async (req, res) => {
       if (!body.filePath) {
         return sendJson(res, 400, { error: 'filePath required' });
       }
-      const count = detectPatchCount(body.filePath);
-      return sendJson(res, 200, { patchCount: count });
+      const detectSystem = !!body.detectSystem;
+      const { patchCount, patches } = detectPatches(body.filePath, detectSystem);
+      return sendJson(res, 200, { patchCount, patches });
     } catch (err) {
       return sendJson(res, 500, { error: err.message });
     }
@@ -356,6 +379,7 @@ const server = http.createServer(async (req, res) => {
         rifle: settings.rifle || 0,
         shield: settings.shield || 0,
         grenade: settings.grenade || 0,
+        detectSystem: !!settings.detectSystem,
         ritualType,
         patchRituals: ritualList,
         wallChar: settings.walls || 'y'
