@@ -130,6 +130,11 @@
           <option selected>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
         </select>
       </label>
+      <label>smoke spawns:
+        <select id="smoke">
+          <option selected>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
       <label>walls:
         <select id="walls">
           <option>o</option>
@@ -267,6 +272,7 @@
           rifle: parseInt(document.getElementById('rifle').value, 10),
           shield: parseInt(document.getElementById('shield').value, 10),
           grenade: parseInt(document.getElementById('grenade').value, 10),
+          smoke: parseInt(document.getElementById('smoke').value, 10),
           detectSystem: document.getElementById('detectSystem').checked,
           walls: document.getElementById('walls').value
         }

@@ -88,6 +88,7 @@
   const INITIAL_RIFLE_PICKUPS       = 0;  // rifle charges pickup (legacy default: none)
   const INITIAL_SHIELD_PICKUPS      = 0;  // shield charges pickup (legacy default: none)
   const INITIAL_GRENADE_PICKUPS     = 0;  // grenade pickups (placeholder mechanics)
+  const INITIAL_SMOKE_PICKUPS       = 0;  // smoke pickups (default 0)
 
   // Player shoot keys
   const PLAYER_SHOOT_KEYS           = ['s', 'S']; // keys that fire the player weapon
@@ -96,6 +97,7 @@
   const BAIT_MAX_HP                 = 4;  // bait hit points (tunable)
   const PLAYER_BAIT_MAX             = 3;  // max baits that player can carry (tunable)
   const PLAYER_RIFLE_MAX            = 3;  // max rifle charges player can carry
+  const PLAYER_SMOKE_MAX            = 3;  // max smoke charges the player can carry
   const RIFLE_FOV_WIDTHS            = [
     1, 1, // first 2 cells depth -> width 1
     3, 3, 3, 3, 3, 3, 3, 3, // next 8 cells depth -> width 3
@@ -113,12 +115,17 @@
     (SHIELD_DURATION_SECONDS * 1000) / WORLD_TICK_MS
   );
   const SHIELD_BLINK_TICKS           = 6; // quick flash when consumed/timeout
+  const SMOKE_MAX_CELLS              = 36;
+  const SMOKE_FORM_TICKS             = Math.ceil((4000) / WORLD_TICK_MS);
+  const SMOKE_HOLD_TICKS             = Math.ceil((4000) / WORLD_TICK_MS);
+  const SMOKE_FADE_TICKS             = Math.ceil((4000) / WORLD_TICK_MS);
   const BASIC_LOOT_CHANCE            = 0.5; // 50% drop chance for basic loot
   const SPECIAL_LOOT_CHANCE          = 0.3; // 30% drop chance for special loot
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
     { id: 'grenade', label: 'GRENADE' },
+    { id: 'smoke', label: 'SMOKE' },
     { id: 'rifle', label: 'RIFLE' }
   ];
 
@@ -604,6 +611,7 @@
     // Remove any pickups that were spawned before (random defaults, etc.)
     clearAllPickups();
     clearAllBaits();
+    clearAllSmokes();
 
 
     // Mark pickups as already handled for this level:
@@ -725,6 +733,7 @@
   let playerRifles = 0; // number of rifle charges currently carried
   let playerShields = 0; // number of shield charges currently carried
   let playerGrenades = 0; // number of grenades carried (placeholder)
+  let playerSmokes = 0; // number of smoke charges carried
   let selectedEquipmentIndex = 0; // 0 = BAIT, cycles with R
 
   // Guards
@@ -744,6 +753,10 @@
   // Grenades (player throwable)
   let grenades = [];
   let grenadeExplosions = [];
+  let smokeContainer = null;
+  // Smoke clouds
+  let smokes = [];
+  let smokeCells = new Set();
 
 
   // Pickups (ammo / medikit / bait pickups)
@@ -1251,6 +1264,17 @@
     grenadeFxContainer.style.pointerEvents = 'none';
     overlayDiv.appendChild(grenadeFxContainer);
 
+    // Smoke container (above grenades, below pickups)
+    smokeContainer = document.createElement('div');
+    smokeContainer.id = 'orca-stealth-smoke';
+    smokeContainer.style.position = 'absolute';
+    smokeContainer.style.left = '0';
+    smokeContainer.style.top = '0';
+    smokeContainer.style.width = '100%';
+    smokeContainer.style.height = '100%';
+    smokeContainer.style.pointerEvents = 'none';
+    overlayDiv.appendChild(smokeContainer);
+
     // Pickups container (above bullets, below patch markers/player)
     pickupsContainer = document.createElement('div');
     pickupsContainer.id = 'orca-stealth-pickups';
@@ -1449,6 +1473,8 @@
           styles.push('color: #00d8ff');
         } else if (item.id === 'grenade') {
           styles.push('color: #ff5533');
+        } else if (item.id === 'smoke') {
+          styles.push('color: #ffffff');
         }
       }
 
@@ -1472,6 +1498,11 @@
         styles.push('opacity: ' + (available ? '1' : '0.35'));
         const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
         return `<span${styleAttr}>${item.label} ${playerGrenades}/${PLAYER_GRENADE_MAX}</span>`;
+      } else if (item.id === 'smoke') {
+        const available = playerSmokes > 0;
+        styles.push('opacity: ' + (available ? '1' : '0.35'));
+        const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
+        return `<span${styleAttr}>${item.label} ${playerSmokes}/${PLAYER_SMOKE_MAX}</span>`;
       }
 
       const styleAttr = styles.length ? ` style="${styles.join(';')}"` : '';
@@ -2988,7 +3019,9 @@ function updateHudLayout() {
         // Avoid multiple hits in the same world tick from the same/overlapping blast
         if (g.lastExplosionDamageTick === worldTick) continue;
         g.lastExplosionDamageTick = worldTick;
-        triggerTemporaryAlertForGuard(g, 'hit', col, row);
+        if (!isSmokeCell(col, row)) {
+          triggerTemporaryAlertForGuard(g, 'hit', col, row);
+        }
         g.hp = Math.max(0, (g.hp || g.maxHP) - 1);
         if (g.hp <= 0) {
           killGuard(g);
@@ -3194,6 +3227,153 @@ function updateHudLayout() {
     }
   }
 
+  // ---------------- SMOKE ----------------
+  function isSmokeCell(col, row) {
+    return smokeCells.has(col + ',' + row);
+  }
+
+  function addSmokeCell(smoke, col, row) {
+    if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) return;
+    const key = col + ',' + row;
+    if (smokeCells.has(key)) return;
+    if (!isWalkable(col, row)) return;
+
+    const cellEl = document.createElement('div');
+    cellEl.style.position = 'absolute';
+    cellEl.style.left = col * cellW + 'px';
+    cellEl.style.top = row * cellH + 'px';
+    cellEl.style.width = cellW + 'px';
+    cellEl.style.height = cellH + 'px';
+    cellEl.style.pointerEvents = 'none';
+
+    const inner = document.createElement('div');
+    inner.style.position = 'absolute';
+    inner.style.left = '0';
+    inner.style.top = '0';
+    inner.style.width = '100%';
+    inner.style.height = '100%';
+    inner.style.overflow = 'hidden';
+
+    // Create tiny "pixel" specks
+    const dots = [];
+    const baseSize = Math.max(2, Math.round(Math.max(cellW, cellH) * 0.05) || 2);
+    const dotCount = 6 + Math.floor(Math.random() * 5); // 6-10 tiny pixels, more spaced
+    for (let i = 0; i < dotCount; i++) {
+      const d = document.createElement('div');
+      d.style.position = 'absolute';
+      d.style.width = baseSize + 'px';
+      d.style.height = baseSize + 'px';
+      d.style.left = Math.round(Math.random() * 90) + '%';
+      d.style.top = Math.round(Math.random() * 90) + '%';
+      d.style.transform = 'translate(-50%, -50%)';
+      d.style.background = '#ffffff';
+      d.style.opacity = Math.random() < 0.5 ? '0' : '1';
+      inner.appendChild(d);
+      dots.push(d);
+    }
+    cellEl.appendChild(inner);
+
+    if (smokeContainer) {
+      smokeContainer.appendChild(cellEl);
+    }
+
+    smokeCells.add(key);
+    smoke.cells.push({ col, row, el: cellEl, inner, dots });
+  }
+
+  function removeSmokeCell(smoke, cell) {
+    const key = cell.col + ',' + cell.row;
+    smokeCells.delete(key);
+    if (cell.el && cell.el.parentNode) {
+      cell.el.parentNode.removeChild(cell.el);
+    }
+    const idx = smoke.cells.indexOf(cell);
+    if (idx >= 0) smoke.cells.splice(idx, 1);
+  }
+
+  function spawnSmokeCloud(originCol, originRow) {
+    const smoke = {
+      cells: [],
+      phase: 'forming',
+      formTicks: 0,
+      holdTicks: 0,
+      fadeTicks: 0
+    };
+    addSmokeCell(smoke, originCol, originRow);
+    smokes.push(smoke);
+  }
+
+  function updateSmokes() {
+    if (!smokes.length) return;
+    const survivors = [];
+    smokes.forEach((smoke) => {
+      if (!smoke) return;
+
+      if (smoke.phase === 'forming') {
+        smoke.formTicks++;
+        const remaining = SMOKE_MAX_CELLS - smoke.cells.length;
+        const ticksLeft = Math.max(1, SMOKE_FORM_TICKS - smoke.formTicks + 1);
+        const addCount = Math.max(1, Math.ceil(remaining / ticksLeft));
+        const neighbors = [];
+        smoke.cells.forEach((c) => {
+          neighbors.push({ col: c.col + 1, row: c.row });
+          neighbors.push({ col: c.col - 1, row: c.row });
+          neighbors.push({ col: c.col, row: c.row + 1 });
+          neighbors.push({ col: c.col, row: c.row - 1 });
+        });
+        shuffleArray(neighbors);
+        let added = 0;
+        for (let i = 0; i < neighbors.length && added < addCount; i++) {
+          const n = neighbors[i];
+          const key = n.col + ',' + n.row;
+          if (smokeCells.has(key)) continue;
+          if (!isWalkable(n.col, n.row)) continue;
+          addSmokeCell(smoke, n.col, n.row);
+          added++;
+        }
+        if (smoke.formTicks >= SMOKE_FORM_TICKS || smoke.cells.length >= SMOKE_MAX_CELLS) {
+          smoke.phase = 'hold';
+        }
+      } else if (smoke.phase === 'hold') {
+        smoke.holdTicks++;
+        if (smoke.holdTicks >= SMOKE_HOLD_TICKS) {
+          smoke.phase = 'fading';
+        }
+      } else if (smoke.phase === 'fading') {
+        smoke.fadeTicks++;
+        const ticksLeft = Math.max(1, SMOKE_FADE_TICKS - smoke.fadeTicks + 1);
+        const removeCount = Math.max(1, Math.ceil(smoke.cells.length / ticksLeft));
+        shuffleArray(smoke.cells);
+        for (let i = 0; i < removeCount && smoke.cells.length > 0; i++) {
+          removeSmokeCell(smoke, smoke.cells[0]);
+        }
+        if (smoke.fadeTicks >= SMOKE_FADE_TICKS && smoke.cells.length > 0) {
+          // Hard clear any leftover cells at end of fade
+          while (smoke.cells.length > 0) {
+            removeSmokeCell(smoke, smoke.cells[0]);
+          }
+        }
+        if (smoke.cells.length === 0 || smoke.fadeTicks >= SMOKE_FADE_TICKS) {
+          // completed fading, drop from survivors
+        }
+      }
+
+      // Per-cell flicker of tiny pixels (all phases that still have cells)
+      smoke.cells.forEach((c) => {
+        if (!c.dots) return;
+        c.dots.forEach((d) => {
+          if (!d) return;
+          d.style.opacity = Math.random() < 0.55 ? '0' : '1';
+        });
+      });
+
+      if (smoke.cells.length > 0 && smoke.fadeTicks <= SMOKE_FADE_TICKS) {
+        survivors.push(smoke);
+      }
+    });
+    smokes = survivors;
+  }
+
 
   function updatePickupPosition(pickup) {
     if (!pickup.el) return;
@@ -3295,6 +3475,27 @@ function updateHudLayout() {
       inner.style.height = '50%';
       inner.style.transform = 'translate(-50%, -50%)';
       inner.style.background = '#ff5533';
+    } else if (type === 'smoke') {
+      // Three thin white horizontal lines stacked
+      inner.style.left = '50%';
+      inner.style.top = '50%';
+      inner.style.width = '70%';
+      inner.style.height = '70%';
+      inner.style.transform = 'translate(-50%, -50%)';
+      inner.style.position = 'relative';
+      const makeLine = (offset) => {
+        const line = document.createElement('div');
+        line.style.position = 'absolute';
+        line.style.left = '5%';
+        line.style.right = '5%';
+        line.style.top = offset;
+        line.style.height = '12%';
+        line.style.background = '#ffffff';
+        return line;
+      };
+      inner.appendChild(makeLine('10%'));
+      inner.appendChild(makeLine('44%'));
+      inner.appendChild(makeLine('78%'));
     } else if (type === 'key') {
       // NEW: blinking white "K" (no background)
       inner.style.left = '50%';
@@ -3385,13 +3586,33 @@ function updateHudLayout() {
     pickups = [];
   }
 
-    function clearAllBaits() {
+  function clearAllBaits() {
     if (baitsContainer) {
       while (baitsContainer.firstChild) {
         baitsContainer.removeChild(baitsContainer.firstChild);
       }
     }
     baits = [];
+  }
+
+  function clearAllSmokes() {
+    if (smokeContainer) {
+      while (smokeContainer.firstChild) {
+        smokeContainer.removeChild(smokeContainer.firstChild);
+      }
+    }
+    smokes = [];
+    smokeCells = new Set();
+  }
+
+  function clearAllSmokes() {
+    if (smokeContainer) {
+      while (smokeContainer.firstChild) {
+        smokeContainer.removeChild(smokeContainer.firstChild);
+      }
+    }
+    smokes = [];
+    smokeCells = new Set();
   }
 
   // Force pickups to spawn only on walkable cells; if needed, snap to nearest walkable.
@@ -3438,6 +3659,7 @@ function updateHudLayout() {
       else if (def.type === 'rifle') type = 'rifle';
       else if (def.type === 'shield') type = 'shield';
       else if (def.type === 'grenade') type = 'grenade';
+      else if (def.type === 'smoke') type = 'smoke';
 
       let col = typeof def.col === 'number' ? def.col : null;
       let row = typeof def.row === 'number' ? def.row : null;
@@ -3523,6 +3745,7 @@ function updateHudLayout() {
     placePickups('rifle', INITIAL_RIFLE_PICKUPS);
     placePickups('shield', INITIAL_SHIELD_PICKUPS);
     placePickups('grenade', INITIAL_GRENADE_PICKUPS);
+    placePickups('smoke', INITIAL_SMOKE_PICKUPS);
 
     console.log(
       '[overlay] Initial pickups spawned:',
@@ -3537,7 +3760,9 @@ function updateHudLayout() {
       INITIAL_SHIELD_PICKUPS,
       'shield,',
       INITIAL_GRENADE_PICKUPS,
-      'grenade.'
+      'grenade,',
+      INITIAL_SMOKE_PICKUPS,
+      'smoke.'
     );
 
   }
@@ -3562,6 +3787,10 @@ function updateHudLayout() {
   }
 
   function hasLineOfShot(guard, targetCol, targetRow) {
+    // Smoke blocks line-of-shot as if it were a wall
+    if (isSmokeCell(guard.col, guard.row)) {
+      return false;
+    }
     const dx = targetCol - guard.col;
     const dy = targetRow - guard.row;
 
@@ -3577,7 +3806,7 @@ function updateHudLayout() {
     let r = guard.row + stepY;
 
     while (c !== targetCol || r !== targetRow) {
-      if (!isWalkable(c, r)) {
+      if (!isWalkable(c, r) || isSmokeCell(c, r)) {
         return false;
       }
       c += stepX;
@@ -5020,6 +5249,8 @@ function createPlacedBait(col, row) {
   // We skip the starting cell (guard position) and require
   // every intermediate + target cell to be walkable.
   function hasLineOfSightForFov(fromCol, fromRow, toCol, toRow) {
+    // If the origin is inside smoke, vision is blocked immediately
+    if (isSmokeCell(fromCol, fromRow)) return false;
     let x0 = fromCol;
     let y0 = fromRow;
     const x1 = toCol;
@@ -5036,7 +5267,7 @@ function createPlacedBait(col, row) {
     while (true) {
       // Skip the starting cell (guard position), test everything else
       if (!firstStep) {
-        if (!isWalkable(x0, y0)) {
+        if (!isWalkable(x0, y0) || isSmokeCell(x0, y0)) {
           return false;
         }
       } else {
@@ -5239,6 +5470,11 @@ function createPlacedBait(col, row) {
 
       // Do not draw FOV on non-walkable cells (walls, Orca code)
       if (!isWalkable(c, r)) {
+        continue;
+      }
+
+      // Smoke blocks guard FOV like a wall
+      if (isSmokeCell(c, r)) {
         continue;
       }
 
@@ -7484,6 +7720,8 @@ function stepGuardAlert(guard) {
   function applyGuardHit(guard, sourceBullet) {
     if (!guard || guard.state === 'dead') return;
 
+    const guardInSmoke = isSmokeCell(guard.col, guard.row);
+
     // Turn toward the incoming shot direction
     if (sourceBullet && typeof sourceBullet.dx === 'number' && typeof sourceBullet.dy === 'number') {
       const dirX = -Math.sign(sourceBullet.dx);
@@ -7496,7 +7734,9 @@ function stepGuardAlert(guard) {
     }
 
     // Trigger alert + temporary speed boost for this area
-    triggerTemporaryAlertForGuard(guard, 'hit', guard.col, guard.row);
+    if (!guardInSmoke) {
+      triggerTemporaryAlertForGuard(guard, 'hit', guard.col, guard.row);
+    }
 
     guard.hp--;
     if (guard.hp <= 0) {
@@ -7548,7 +7788,7 @@ function stepGuardAlert(guard) {
     }
 
     if (Math.random() < SPECIAL_LOOT_CHANCE) {
-      const specials = ['rifle', 'shield', 'bait', 'grenade'];
+      const specials = ['rifle', 'shield', 'bait', 'grenade', 'smoke'];
       const pick = specials[Math.floor(Math.random() * specials.length)];
       trySpawn(pick);
     }
@@ -7756,6 +7996,24 @@ function stepGuardAlert(guard) {
         );
         return false;
       }
+    } else if (pickup.type === 'smoke') {
+      if (playerSmokes < PLAYER_SMOKE_MAX) {
+        playerSmokes++;
+        if (playerSmokes > PLAYER_SMOKE_MAX) playerSmokes = PLAYER_SMOKE_MAX;
+        console.log(
+          '[overlay] PLAYER picked SMOKE. SMOKE:',
+          playerSmokes,
+          '/',
+          PLAYER_SMOKE_MAX
+        );
+        updateModeVisual();
+        return true;
+      } else {
+        console.log(
+          '[overlay] PLAYER picked SMOKE but is already at max smokes.'
+        );
+        return false;
+      }
     }
 
     return false;
@@ -7944,6 +8202,7 @@ function stepGuardAlert(guard) {
       updateShieldState();
       stepGrenades();
       updateGrenadeExplosions();
+      updateSmokes();
       return;
     }
 
@@ -7970,6 +8229,9 @@ function stepGuardAlert(guard) {
 
     // Assegna slot cardinali per settore (N/E/S/W) una volta per tick
     assignSectorCardinals();
+
+    // Grow/decay smoke clouds before perception so they occlude FOV
+    updateSmokes();
 
     // 1) Tick di "percezione": aggiorna FOV + stati di alert + memoria 3s
     updateAllFovAndAlert(true);
@@ -8302,6 +8564,8 @@ function stepGuardAlert(guard) {
       handleShieldAction();
     } else if (selected.id === 'grenade') {
       handleGrenadeAction();
+    } else if (selected.id === 'smoke') {
+      handleSmokeAction();
     } else {
       // Placeholder for future equipment mechanics (shield / grenade / rifle)
     }
@@ -8351,6 +8615,49 @@ function stepGuardAlert(guard) {
       return;
     }
     launchGrenadeFromPlayer();
+  }
+
+  function handleSmokeAction() {
+    if (playerSmokes <= 0) {
+      console.log('[overlay] PLAYER tried to use SMOKE but inventory is empty.');
+      return;
+    }
+    if (isGameOver) return;
+
+    let dx = 0;
+    let dy = 0;
+    if (playerDir === 'up') dy = -1;
+    else if (playerDir === 'down') dy = 1;
+    else if (playerDir === 'left') dx = -1;
+    else if (playerDir === 'right') dx = 1;
+
+    let targetCol = playerCol + dx;
+    let targetRow = playerRow + dy;
+
+    if (
+      targetCol < 0 ||
+      targetRow < 0 ||
+      targetCol >= gridCols ||
+      targetRow >= gridRows
+    ) {
+      return;
+    }
+
+    // Allow smoke only on walkable cells; if not, snap to nearest walkable
+    if (!isWalkable(targetCol, targetRow)) {
+      const res = findNearestWalkableCell(targetCol, targetRow);
+      if (!res) {
+        console.log('[overlay] Cannot place SMOKE: no walkable cell found nearby.');
+        return;
+      }
+      targetCol = res.col;
+      targetRow = res.row;
+    }
+
+    spawnSmokeCloud(targetCol, targetRow);
+    playerSmokes--;
+    if (playerSmokes < 0) playerSmokes = 0;
+    updateModeVisual();
   }
 
   function placeBaitInFrontOfPlayer() {

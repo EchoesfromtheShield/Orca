@@ -89,22 +89,24 @@ const WALL_CHAR_RAW = (wallCharCli && wallCharCli.length > 0)
   : (wallCharEnv && wallCharEnv.length > 0 ? wallCharEnv : 'y');
 const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
 
-// Pickups: ammo / medikit / bait counts (can be overridden via CLI or env)
-//   argv[8]  -> AMMO_PICKUPS
-//   argv[9]  -> MEDIKIT_PICKUPS
-//   argv[10] -> BAIT_PICKUPS
-//   argv[15] -> RIFLE_PICKUPS (optional, can also use env.RIFLE_PICKUPS)
-//   argv[16] -> SHIELD_PICKUPS (optional, can also use env.SHIELD_PICKUPS)
-//   argv[17] -> GRENADE_PICKUPS (optional, can also use env.GRENADE_PICKUPS)
-//   argv[18] -> DETECT_SYSTEM_PATCHES (optional, can also use env.DETECT_SYSTEM_PATCHES)
-//   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
+  // Pickups: ammo / medikit / bait counts (can be overridden via CLI or env)
+  //   argv[8]  -> AMMO_PICKUPS
+  //   argv[9]  -> MEDIKIT_PICKUPS
+  //   argv[10] -> BAIT_PICKUPS
+  //   argv[15] -> RIFLE_PICKUPS (optional, can also use env.RIFLE_PICKUPS)
+  //   argv[16] -> SHIELD_PICKUPS (optional, can also use env.SHIELD_PICKUPS)
+  //   argv[17] -> GRENADE_PICKUPS (optional, can also use env.GRENADE_PICKUPS)
+  //   argv[18] -> SMOKE_PICKUPS   (optional, can also use env.SMOKE_PICKUPS)
+  //   argv[19] -> DETECT_SYSTEM_PATCHES (optional, can also use env.DETECT_SYSTEM_PATCHES)
+  //   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
 const baitArg = process.argv[10] || process.env.BAIT_PICKUPS;
 const rifleArg = process.argv[15] || process.env.RIFLE_PICKUPS;
 const shieldArg = process.argv[16] || process.env.SHIELD_PICKUPS;
 const grenadeArg = process.argv[17] || process.env.GRENADE_PICKUPS;
-const detectSystemArg = process.argv[18] || process.env.DETECT_SYSTEM_PATCHES;
+const smokeArg = process.argv[18] || process.env.SMOKE_PICKUPS;
+const detectSystemArg = process.argv[19] || process.env.DETECT_SYSTEM_PATCHES;
 
 // Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
@@ -128,6 +130,9 @@ const SHIELD_PICKUP_COUNT = shieldArg != null
   : 0;
 const GRENADE_PICKUP_COUNT = grenadeArg != null
   ? Math.max(0, parseInt(grenadeArg, 10) || 0)
+  : 0;
+const SMOKE_PICKUP_COUNT = smokeArg != null
+  ? Math.max(0, parseInt(smokeArg, 10) || 0)
   : 0;
 const DETECT_SYSTEM_PATCHES = (detectSystemArg || '').toString().toLowerCase() === 'true' ||
   detectSystemArg === '1';
@@ -1572,10 +1577,10 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       const remainingForMed = allWalkable.filter(
         (c) => !usedKeys.has(`${c.col},${c.row}`)
       );
-      const medCells = pickRandomCells(remainingForMed, MEDIKIT_PICKUP_COUNT);
-      medCells.forEach((c) => {
-        usedKeys.add(`${c.col},${c.row}`);
-      });
+  const medCells = pickRandomCells(remainingForMed, MEDIKIT_PICKUP_COUNT);
+  medCells.forEach((c) => {
+    usedKeys.add(`${c.col},${c.row}`);
+  });
 
       // 3) Bait (on cells not used by ammo+medikit)
       const remainingForBait = allWalkable.filter(
@@ -1608,8 +1613,16 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       const remainingForGrenade = allWalkable.filter(
         (c) => !usedKeys.has(`${c.col},${c.row}`)
       );
-      const grenadeCells = pickRandomCells(remainingForGrenade, GRENADE_PICKUP_COUNT);
-      grenadeCells.forEach((c) => {
+  const grenadeCells = pickRandomCells(remainingForGrenade, GRENADE_PICKUP_COUNT);
+  grenadeCells.forEach((c) => {
+    usedKeys.add(`${c.col},${c.row}`);
+  });
+      // 7) Smoke (on cells not used by others)
+      const remainingForSmoke = allWalkable.filter(
+        (c) => !usedKeys.has(`${c.col},${c.row}`)
+      );
+      const smokeCells = pickRandomCells(remainingForSmoke, SMOKE_PICKUP_COUNT);
+      smokeCells.forEach((c) => {
         usedKeys.add(`${c.col},${c.row}`);
       });
 
@@ -1654,9 +1667,16 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
         });
       });
 
-      grenadeCells.forEach((pos) => {
+  grenadeCells.forEach((pos) => {
+    pickups.push({
+      type: 'grenade',
+      col: pos.col,
+      row: pos.row
+    });
+  });
+      smokeCells.forEach((pos) => {
         pickups.push({
-          type: 'grenade',
+          type: 'smoke',
           col: pos.col,
           row: pos.row
         });
@@ -2461,6 +2481,9 @@ try {
   const grenadeCount = jsonConfig.pickups
     ? jsonConfig.pickups.filter((p) => p.type === 'grenade').length
     : 0;
+  const smokeCount = jsonConfig.pickups
+    ? jsonConfig.pickups.filter((p) => p.type === 'smoke').length
+    : 0;
 
   console.log(
     '  Pickups requested: ammo =', AMMO_PICKUP_COUNT,
@@ -2468,7 +2491,8 @@ try {
     ', bait =', BAIT_PICKUP_COUNT,
     ', rifle =', RIFLE_PICKUP_COUNT,
     ', shield =', SHIELD_PICKUP_COUNT,
-    ', grenade =', GRENADE_PICKUP_COUNT
+    ', grenade =', GRENADE_PICKUP_COUNT,
+    ', smoke =', SMOKE_PICKUP_COUNT
   );
   console.log(
     '  Pickups generated:',
@@ -2478,7 +2502,8 @@ try {
     ', bait =', baitCount,
     ', rifle =', rifleCount,
     ', shield =', shieldCount,
-    ', grenade =', grenadeCount, ')'
+    ', grenade =', grenadeCount,
+    ', smoke =', smokeCount, ')'
   );
   console.log('  Ritual unlock type:', RITUAL_TYPE);
   if (RITUAL_TYPE === 'getKey') {
