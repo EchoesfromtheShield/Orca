@@ -228,7 +228,8 @@ function runPatchToLevel(options, cb) {
     ritualType = 'fourCorners',
     patchRituals = [],
     wallChar = 'y',
-    smoke = 0
+    smoke = 0,
+    assassins = 0
   } = options;
 
   const baseName = path.basename(inputPath, path.extname(inputPath));
@@ -255,7 +256,8 @@ function runPatchToLevel(options, cb) {
     String(shield),
     String(grenade),
     String(smoke),
-    detectSystem ? '1' : '0'
+    detectSystem ? '1' : '0',
+    String(assassins)
   ];
 
   const child = spawn(process.execPath, args, {
@@ -382,6 +384,7 @@ const server = http.createServer(async (req, res) => {
         shield: settings.shield || 0,
         grenade: settings.grenade || 0,
         smoke: settings.smoke || 0,
+        assassins: settings.assassins || 0,
         detectSystem: !!settings.detectSystem,
         ritualType,
         patchRituals: ritualList,

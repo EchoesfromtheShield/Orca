@@ -100,6 +100,11 @@
           <option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option>
         </select>
       </label>
+      <label>assassins per map:
+        <select id="assassins">
+          <option selected>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        </select>
+      </label>
       <label>mediKit spawns:
         <select id="medikits">
           <option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option>
@@ -273,6 +278,7 @@
           shield: parseInt(document.getElementById('shield').value, 10),
           grenade: parseInt(document.getElementById('grenade').value, 10),
           smoke: parseInt(document.getElementById('smoke').value, 10),
+          assassins: parseInt(document.getElementById('assassins').value, 10),
           detectSystem: document.getElementById('detectSystem').checked,
           walls: document.getElementById('walls').value
         }

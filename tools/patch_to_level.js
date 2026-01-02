@@ -66,7 +66,7 @@ const path = require('path');
 // ----- CLI args -------------------------------------------------------
 
 if (process.argv.length < 5) {
-  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups] [detectSystemPatches]');
+  console.error('Usage: node patch_to_level.js <input.orca> <output.orca> <output.json> [layout] [guardsPerPatch] [wallChar] [ammoPickups] [medikitPickups] [baitPickups] [ritualId] [ritualType] [keyCornerIndex] [destroyTargetHp] [riflePickups] [shieldPickups] [grenadePickups] [smokePickups] [detectSystemPatches] [assassinsPerMap]');
   process.exit(1);
 }
 
@@ -98,6 +98,7 @@ const WALL_CHAR = WALL_CHAR_RAW[0]; // ensure single char
   //   argv[17] -> GRENADE_PICKUPS (optional, can also use env.GRENADE_PICKUPS)
   //   argv[18] -> SMOKE_PICKUPS   (optional, can also use env.SMOKE_PICKUPS)
   //   argv[19] -> DETECT_SYSTEM_PATCHES (optional, can also use env.DETECT_SYSTEM_PATCHES)
+  //   argv[20] -> ASSASSINS_PER_MAP (optional, can also use env.ASSASSINS_PER_MAP)
   //   or env.AMMO_PICKUPS / env.MEDIKIT_PICKUPS / env.BAIT_PICKUPS
 const ammoArg = process.argv[8] || process.env.AMMO_PICKUPS;
 const medArg  = process.argv[9] || process.env.MEDIKIT_PICKUPS;
@@ -107,6 +108,7 @@ const shieldArg = process.argv[16] || process.env.SHIELD_PICKUPS;
 const grenadeArg = process.argv[17] || process.env.GRENADE_PICKUPS;
 const smokeArg = process.argv[18] || process.env.SMOKE_PICKUPS;
 const detectSystemArg = process.argv[19] || process.env.DETECT_SYSTEM_PATCHES;
+const assassinsArg = process.argv[20] || process.env.ASSASSINS_PER_MAP;
 
 // Default: 3 ammo, 1 medikit, 3 bait if not specified
 const AMMO_PICKUP_COUNT = ammoArg != null
@@ -136,6 +138,9 @@ const SMOKE_PICKUP_COUNT = smokeArg != null
   : 0;
 const DETECT_SYSTEM_PATCHES = (detectSystemArg || '').toString().toLowerCase() === 'true' ||
   detectSystemArg === '1';
+const ASSASSINS_PER_MAP = assassinsArg != null
+  ? Math.max(0, parseInt(assassinsArg, 10) || 0)
+  : 0;
 
 // Ritual: optional identifier for this level/ritual
 // Can be provided via CLI (11th arg) or env.RITUAL_ID
@@ -932,6 +937,37 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
     return result;
   }
 
+  function collectAllWalkableCells(forbiddenSet) {
+    if (!hasGrid) return [];
+    return collectWalkableCells(0, gridW - 1, 0, gridH - 1, forbiddenSet);
+  }
+
+  function isCorridorLikeCell(col, row) {
+    let open = 0;
+    const dirs = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1]
+    ];
+    for (let i = 0; i < dirs.length; i++) {
+      const nc = col + dirs[i][0];
+      const nr = row + dirs[i][1];
+      if (nc < 0 || nr < 0 || nc >= gridW || nr >= gridH) continue;
+      if (levelGrid[nr][nc] === '.') open++;
+    }
+    return open <= 2; // corridors / chokepoints
+  }
+
+  function shuffleArray(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+  }
+
   // Helper: choose up to "count" cells with the constraint
   // that no two chosen cells share the same row or column.
   // If strict placement is impossible, we relax to "unique cell only".
@@ -1505,6 +1541,38 @@ function createLevelJson(commentBlocksGlobal, playerSpawn, levelGrid, layout, ri
       '[patch_to_level] Using legacy static guards as fallback:',
       guards.length
     );
+  }
+
+  // Assassins: global roaming guards (default 0)
+  if (ASSASSINS_PER_MAP > 0 && hasGrid) {
+    const occupied = new Set(
+      guards.map((g) => `${g.startCol},${g.startRow}`)
+    );
+    const allWalkable = collectAllWalkableCells(systemSet);
+    const corridors = allWalkable.filter((c) => isCorridorLikeCell(c.col, c.row));
+    const pool = (layoutType === 'dungeon' && corridors.length) ? corridors.slice() : allWalkable.slice();
+    shuffleArray(pool);
+
+    let spawned = 0;
+    for (let i = 0; i < pool.length && spawned < ASSASSINS_PER_MAP; i++) {
+      const c = pool[i];
+      const key = `${c.col},${c.row}`;
+      if (occupied.has(key)) continue;
+      occupied.add(key);
+      guards.push({
+        id: `assassin_${spawned + 1}`,
+        patrolType: 'rect',
+        startCol: c.col,
+        startRow: c.row,
+        rect: { minCol: 0, maxCol: gridW - 1, minRow: 0, maxRow: gridH - 1 },
+        fovProfile: 'A',
+        behavior: 'assassin',
+        type: 'assassin'
+      });
+      spawned++;
+    }
+
+    console.log('[patch_to_level] Assassins generated:', spawned);
   }
 
   // Liberation triggers: one per commented patch (frame)

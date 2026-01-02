@@ -121,6 +121,8 @@
   const SMOKE_FADE_TICKS             = Math.ceil((4000) / WORLD_TICK_MS);
   const BASIC_LOOT_CHANCE            = 0.5; // 50% drop chance for basic loot
   const SPECIAL_LOOT_CHANCE          = 0.3; // 30% drop chance for special loot
+  const ASSASSIN_PAUSE_CHANCE        = 0.18; // probability to pause after a move
+  const ASSASSIN_PAUSE_TICKS         = 2;    // pause duration in ticks
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
@@ -131,6 +133,7 @@
 
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
+  const ASSASSIN_MAX_HP             = 4;  // assassin max hit points
 
   // Four-corners reset on alert (seconds)
   const FOUR_CORNERS_RESET_SECONDS  = 5;
@@ -612,6 +615,7 @@
     clearAllPickups();
     clearAllBaits();
     clearAllSmokes();
+    clearAssassinTargets();
 
 
     // Mark pickups as already handled for this level:
@@ -757,6 +761,8 @@
   // Smoke clouds
   let smokes = [];
   let smokeCells = new Set();
+  // Assassin targeting queue
+  let assassinTargets = [];
 
 
   // Pickups (ammo / medikit / bait pickups)
@@ -1874,9 +1880,15 @@ function updateHudLayout() {
         shootCooldown: 0,
 
         // HP
-        maxHP: GUARD_MAX_HP,
-        hp: GUARD_MAX_HP,
-        dead: false
+        maxHP: (cfg && cfg.type === 'assassin') ? ASSASSIN_MAX_HP : GUARD_MAX_HP,
+        hp: (cfg && cfg.type === 'assassin') ? ASSASSIN_MAX_HP : GUARD_MAX_HP,
+        dead: false,
+
+        // Type / flags
+        type: (cfg && cfg.type) ? cfg.type : 'guard',
+        isAssassin: cfg && cfg.type === 'assassin',
+        assassinTarget: null,
+        assassinPauseTicks: 0
 
       };
 
@@ -5206,6 +5218,12 @@ function createPlacedBait(col, row) {
         bullets = survivors;
       }
     }
+
+    // Assassins treat unlocked patch as a lure
+    const center = getTriggerCenter(trigger);
+    if (center) {
+      addAssassinTarget(center.col, center.row, 'unlock');
+    }
   }
 
 
@@ -5852,6 +5870,7 @@ function createPlacedBait(col, row) {
       playerCol,
       playerRow
     );
+    addAssassinTarget(playerCol, playerRow, 'alert');
   }
 
   function updateAllFovAndAlert(manageMemory) {
@@ -5905,7 +5924,7 @@ function createPlacedBait(col, row) {
       );
 
       // If no player, check for any alive bait in FOV
-      if (!nextSeenPlayer) {
+      if (!nextSeenPlayer && !guard.isAssassin) {
         for (let i = 0; i < guard.fovCells.length; i++) {
           const cell = guard.fovCells[i];
           const bait = findPlacedBaitAtCell(cell.col, cell.row);
@@ -5943,8 +5962,8 @@ function createPlacedBait(col, row) {
       guard.wasSeeingPlayer = prevSeenPlayer;
       guard.wasSeeingBait = prevSeenBait;
       guard.seenPlayer = nextSeenPlayer;
-      guard.seenBait = !!seenBaitObj;
-      guard.seenBaitId = seenBaitObj ? seenBaitObj.id : null;
+      guard.seenBait = guard.isAssassin ? false : !!seenBaitObj;
+      guard.seenBaitId = guard.isAssassin ? null : (seenBaitObj ? seenBaitObj.id : null);
 
       if (nextSeenPlayer || guard.seenBait || !!seenCorpseCell || !!seenStunnedCell) {
         anySeen = true;
@@ -6474,6 +6493,161 @@ function createPlacedBait(col, row) {
       guard.dirX = 0;
       guard.dirY = dy > 0 ? 1 : -1;
     }
+  }
+
+  // ---------------- ASSASSIN HELPERS ----------------
+  function addAssassinTarget(col, row, reason) {
+    if (col == null || row == null) return;
+    if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) return;
+    const key = col + ',' + row;
+    if (assassinTargets.find((t) => t && (t.col + ',' + t.row) === key)) return;
+    assassinTargets.push({ col, row, reason });
+  }
+
+  function clearAssassinTargets() {
+    assassinTargets = [];
+    guards.forEach((g) => {
+      if (g && g.isAssassin) {
+        g.assassinTarget = null;
+      }
+    });
+  }
+
+  function getTriggerCenter(trigger) {
+    if (!trigger) return null;
+    const block = trigger.targetBlock || PATCH_RECT;
+    if (!block) return null;
+    const w = block.w || PATCH_RECT.w;
+    const h = block.h || PATCH_RECT.h;
+    return {
+      col: block.x + Math.floor(w / 2),
+      row: block.y + Math.floor(h / 2)
+    };
+  }
+
+  function pickLockedPatchTarget() {
+    if (!liberationTriggers || !liberationTriggers.length) return null;
+    const options = [];
+    liberationTriggers.forEach((t, idx) => {
+      const st = triggerRuntimeState[idx];
+      if (st && st.completed) return;
+      const c = getTriggerCenter(t);
+      if (c) options.push(c);
+    });
+    if (!options.length) return null;
+    return options[Math.floor(Math.random() * options.length)];
+  }
+
+  function pickAssassinTarget(guard) {
+    if (guard.assassinTarget && guard.col === guard.assassinTarget.col && guard.row === guard.assassinTarget.row) {
+      guard.assassinTarget = null;
+    }
+    if (!guard.assassinTarget && assassinTargets.length) {
+      guard.assassinTarget = assassinTargets.shift();
+    }
+    if (!guard.assassinTarget) {
+      const locked = pickLockedPatchTarget();
+      if (locked) {
+        guard.assassinTarget = locked;
+      }
+    }
+    return guard.assassinTarget;
+  }
+
+  function stepAssassin(guard) {
+    // Pauses to reduce jittery movement
+    if (guard.assassinPauseTicks && guard.assassinPauseTicks > 0) {
+      guard.assassinPauseTicks--;
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      registerGuardMovementHistory(guard);
+      return;
+    }
+
+    // If player is in sight, hunt like an alert guard (ignore baits)
+    if (guard.seenPlayer) {
+      guard.state = 'alert_chaser';
+      const tx = playerCol;
+      const ty = playerRow;
+      aimGuardAtTarget(guard, tx, ty);
+
+      if (hasLineOfShot(guard, tx, ty)) {
+        updateGuardLookDirection(guard);
+        updateGuardPosition(guard);
+        registerGuardMovementHistory(guard);
+        // shootingTickForGuard will handle firing
+        return;
+      }
+
+      ensureGuardPath(guard, tx, ty);
+      const steps = ALERT_STEPS_PER_TICK;
+      for (let i = 0; i < steps; i++) {
+        const moved = stepGuardAlongPath(guard);
+        if (!moved) break;
+        if (hasLineOfShot(guard, tx, ty)) break;
+      }
+      guard.assassinPauseTicks = Math.random() < ASSASSIN_PAUSE_CHANCE ? ASSASSIN_PAUSE_TICKS : 0;
+      clampGuard(guard);
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      registerGuardMovementHistory(guard);
+      return;
+    }
+
+    const target = pickAssassinTarget(guard);
+
+    if (!target) {
+      // Wander: try a small random step
+      const dirs = [
+        { dx: 1, dy: 0 },
+        { dx: -1, dy: 0 },
+        { dx: 0, dy: 1 },
+        { dx: 0, dy: -1 }
+      ];
+      shuffleArray(dirs);
+      for (let i = 0; i < dirs.length; i++) {
+        const nc = guard.col + dirs[i].dx;
+        const nr = guard.row + dirs[i].dy;
+        if (nc < 0 || nr < 0 || nc >= gridCols || nr >= gridRows) continue;
+        if (!isWalkable(nc, nr)) continue;
+        if (isCellOccupiedByOtherGuard(nc, nr, guard)) continue;
+        guard.col = nc;
+        guard.row = nr;
+        updateGuardPosition(guard);
+        updateGuardLookDirection(guard);
+        registerGuardMovementHistory(guard);
+        return;
+      }
+      registerGuardMovementHistory(guard);
+      return;
+    }
+
+    guard.state = 'alert_chaser';
+    aimGuardAtTarget(guard, target.col, target.row);
+    ensureGuardPath(guard, target.col, target.row);
+
+    if (!guard.path) {
+      updateGuardLookDirection(guard);
+      updateGuardPosition(guard);
+      registerGuardMovementHistory(guard);
+      return;
+    }
+
+    const steps = ALERT_STEPS_PER_TICK;
+    for (let i = 0; i < steps; i++) {
+      const moved = stepGuardAlongPath(guard);
+      if (!moved) break;
+      if (guard.col === target.col && guard.row === target.row) {
+        guard.assassinTarget = null;
+        break;
+      }
+    }
+
+    guard.assassinPauseTicks = Math.random() < ASSASSIN_PAUSE_CHANCE ? ASSASSIN_PAUSE_TICKS : 0;
+    clampGuard(guard);
+    updateGuardLookDirection(guard);
+    updateGuardPosition(guard);
+    registerGuardMovementHistory(guard);
   }
 
   // --------------------------------------------------
@@ -7513,6 +7687,12 @@ function stepGuardAlert(guard) {
       return;
     }
 
+    // Assassin custom behaviour (stun-immune, global roaming)
+    if (guard.isAssassin) {
+      stepAssassin(guard);
+      return;
+    }
+
     // STUNNED state
     if (guard.state === 'stunned') {
       // Cancel patrol extra behaviours while stunned
@@ -7583,7 +7763,7 @@ function stepGuardAlert(guard) {
     const sprite = guard.sprite;
 
     // Base style (size & border are fixed)
-    sprite.style.borderRadius = '50%';
+    sprite.style.borderRadius = guard.isAssassin ? '0%' : '50%';
     sprite.style.boxSizing = 'border-box';
     sprite.style.overflow = 'hidden';
 
@@ -7594,16 +7774,28 @@ function stepGuardAlert(guard) {
       return;
     }
 
-    // Alive: decide full vs half fill based on HP
-    if (guard.hp >= guard.maxHP) {
-      // Full HP: solid bright red circle
-      sprite.style.background = '#df0a0aff';
+    if (guard.isAssassin) {
+      const ratio = Math.max(0, Math.min(1, guard.hp / guard.maxHP));
+      const emptyPct = (1 - ratio) * 100;
       sprite.style.border = '2px solid #df0a0aff';
-    } else {
-      // Wounded: half filled (top half red, bottom empty)
       sprite.style.background =
-        'linear-gradient(to bottom, #df0a0aff 50%, rgba(0,0,0,0) 50%)';
-      sprite.style.border = '2px solid #df0a0aff';
+        'linear-gradient(to top, #df0a0aff ' +
+        (100 - emptyPct).toFixed(1) +
+        '%, rgba(0,0,0,0) ' +
+        (100 - emptyPct).toFixed(1) +
+        '%)';
+    } else {
+      // Alive normal guard: full vs half fill based on HP
+      if (guard.hp >= guard.maxHP) {
+        // Full HP: solid bright red circle
+        sprite.style.background = '#df0a0aff';
+        sprite.style.border = '2px solid #df0a0aff';
+      } else {
+        // Wounded: half filled (top half red, bottom empty)
+        sprite.style.background =
+          'linear-gradient(to bottom, #df0a0aff 50%, rgba(0,0,0,0) 50%)';
+        sprite.style.border = '2px solid #df0a0aff';
+      }
     }
   }
 
@@ -7654,6 +7846,12 @@ function stepGuardAlert(guard) {
     const layoutType = getLayoutType();
     const safeCol = (typeof targetCol === 'number') ? targetCol : null;
     const safeRow = (typeof targetRow === 'number') ? targetRow : null;
+
+    if (safeCol != null && safeRow != null) {
+      addAssassinTarget(safeCol, safeRow, 'alert');
+    } else {
+      addAssassinTarget(guard.col, guard.row, 'alert');
+    }
 
     if (layoutType === 'dungeon') {
       const roomKey = getGuardRoomKey(guard);
@@ -8037,6 +8235,11 @@ function stepGuardAlert(guard) {
   }
 
   function neutralizeGuard(guard) {
+    if (!guard) return;
+    if (guard.isAssassin) {
+      applyGuardHit(guard, null);
+      return;
+    }
     if (guard.state === 'stunned') return;
     guard.state = 'stunned';
     guard.neutralized = true;
