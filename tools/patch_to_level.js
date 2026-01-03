@@ -223,7 +223,7 @@ const CORRIDOR_WIDTH_MAX = parseInt(process.env.CORRIDOR_WIDTH_MAX, 10) || 6;
 // (used for adaptive margins / corridor widths).
 // 0.65 means "try to keep total room area around 65% of map area".
 // Can be overridden with env.DUNGEON_TARGET_FILL.
-const DUNGEON_TARGET_FILL = parseFloat(process.env.DUNGEON_TARGET_FILL || '0.65');
+const DUNGEON_TARGET_FILL = parseFloat(process.env.DUNGEON_TARGET_FILL || '0.50');
 
 
 // Sanitize layout
@@ -2085,6 +2085,15 @@ function randInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+}
+
 // Carve a horizontal corridor centered on centerY, from x1 to x2,
 // with a given vertical thickness "width".
 function carveHorizontalCorridor(grid, centerY, x1, x2, width) {
@@ -2178,6 +2187,212 @@ function buildDungeonLayout(fullGrid) {
   });
 
   // --------------------------------------------------------------
+  // New approach: compact placement, then scale up until just before overflow
+  // --------------------------------------------------------------
+  const RESERVED_TOP_ROWS = DETECT_SYSTEM_PATCHES ? 6 : 0;
+  const USABLE_HEIGHT = Math.max(1, ROOM_H - RESERVED_TOP_ROWS);
+
+  function clamp(v, min, max) {
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+  }
+
+  function tryLayoutWithScale(scale, attempts = 6) {
+    const rooms = [];
+    const rowGap = clamp(Math.round(scale * 2), 1, 6);
+    const colGap = clamp(Math.round(ROOM_GAP_COLS * scale), ROOM_GAP_COLS, 8);
+
+    const corridorMin = clamp(Math.round(CORRIDOR_WIDTH_MIN * scale), 1, 4);
+    const corridorMax = clamp(Math.round(CORRIDOR_WIDTH_MAX * scale), corridorMin, 4);
+
+    const marginMinX = clamp(Math.round(ROOM_MARGIN_X_MIN * scale), 2, 6);
+    const marginMinY = clamp(Math.round(ROOM_MARGIN_Y_MIN * scale), 2, 6);
+    const marginMaxX = clamp(Math.round(ROOM_MARGIN_X_MAX * scale), marginMinX, 6);
+    const marginMaxY = clamp(Math.round(ROOM_MARGIN_Y_MAX * scale), marginMinY, 6);
+
+    const patches = patchDescs.slice();
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) shuffleArray(patches);
+
+      rooms.length = 0;
+      let cursorX = 0;
+      let cursorY = 0;
+      let rowHeight = 0;
+      let roomsInRow = 0;
+      const maxPerRow = Math.max(3, Math.floor(ROOM_W / 20));
+      let rowStartJitter = randInt(0, Math.floor(ROOM_W * 0.15));
+      cursorX = rowStartJitter;
+
+      let failed = false;
+
+      // For very few patches, pre-assign anchors to spread across quadrants
+      let anchors = null;
+      if (patches.length <= 4) {
+        anchors = [
+          { x: Math.floor(ROOM_W * 0.05), y: Math.floor(USABLE_HEIGHT * 0.05) },
+          { x: Math.floor(ROOM_W * 0.55), y: Math.floor(USABLE_HEIGHT * 0.05) },
+          { x: Math.floor(ROOM_W * 0.05), y: Math.floor(USABLE_HEIGHT * 0.55) },
+          { x: Math.floor(ROOM_W * 0.55), y: Math.floor(USABLE_HEIGHT * 0.55) }
+        ];
+        shuffleArray(anchors);
+      } else if (patches.length <= 6) {
+        anchors = [
+          { x: Math.floor(ROOM_W * 0.05), y: Math.floor(USABLE_HEIGHT * 0.05) },
+          { x: Math.floor(ROOM_W * 0.35), y: Math.floor(USABLE_HEIGHT * 0.05) },
+          { x: Math.floor(ROOM_W * 0.65), y: Math.floor(USABLE_HEIGHT * 0.05) },
+          { x: Math.floor(ROOM_W * 0.05), y: Math.floor(USABLE_HEIGHT * 0.55) },
+          { x: Math.floor(ROOM_W * 0.35), y: Math.floor(USABLE_HEIGHT * 0.55) },
+          { x: Math.floor(ROOM_W * 0.65), y: Math.floor(USABLE_HEIGHT * 0.55) }
+        ];
+        shuffleArray(anchors);
+      }
+
+      for (let i = 0; i < patches.length; i++) {
+        const p = patches[i];
+        const pw = p.patchWidth;
+        const ph = p.patchHeight;
+
+        const marginX = randInt(marginMinX, marginMaxX);
+        const marginY = randInt(marginMinY, marginMaxY);
+        const innerW = pw + marginX * 2;
+        const innerH = ph + marginY * 2;
+        const fullW = innerW + 2;
+        const fullH = innerH + 2;
+
+        const forceWrap = (roomsInRow >= maxPerRow);
+        if (anchors && anchors[i]) {
+          cursorX = anchors[i].x;
+          cursorY = anchors[i].y;
+          rowHeight = 0;
+          roomsInRow = 0;
+        } else if (cursorX + fullW > ROOM_W || forceWrap) {
+          cursorX = randInt(0, Math.floor(ROOM_W * 0.2));
+          cursorY += rowHeight + rowGap;
+          rowHeight = 0;
+          roomsInRow = 0;
+        }
+
+        if (cursorY + fullH > USABLE_HEIGHT) {
+          failed = true;
+          break;
+        }
+
+        const rectX = cursorX;
+        const rectY = cursorY;
+        const floorX = rectX + 1;
+        const floorY = rectY + 1;
+
+        rooms.push({
+          ...p,
+          innerW,
+          innerH,
+          fullW,
+          fullH,
+          rectX,
+          rectY,
+          floorX,
+          floorY,
+          centerX: floorX + Math.floor(innerW / 2),
+          centerY: floorY + Math.floor(innerH / 2),
+          patchOffsetX: floorX + marginX,
+          patchOffsetY: floorY + marginY,
+          marginX,
+          marginY
+        });
+
+        cursorX += fullW + colGap;
+        roomsInRow++;
+        if (fullH > rowHeight) rowHeight = fullH;
+      }
+
+      if (failed) continue;
+
+      // Horizontal jitter per row to use slack
+      const rowsByY = {};
+      rooms.forEach((r) => {
+        if (!rowsByY[r.rectY]) rowsByY[r.rectY] = [];
+        rowsByY[r.rectY].push(r);
+      });
+      Object.values(rowsByY).forEach((list) => {
+        let maxRight = 0;
+        list.forEach((r) => {
+          const right = r.rectX + r.fullW;
+          if (right > maxRight) maxRight = right;
+        });
+        const slack = Math.max(0, ROOM_W - maxRight);
+        const shift = slack > 0 ? randInt(0, slack) : 0;
+        if (shift === 0) return;
+        list.forEach((r) => {
+          r.rectX += shift;
+          r.floorX = r.rectX + 1;
+          r.centerX = r.floorX + Math.floor(r.innerW / 2);
+          r.patchOffsetX = r.floorX + r.marginX;
+        });
+      });
+
+      // Ensure at least 1-cell gap between rooms
+      const occupied = [];
+      let overlap = false;
+      rooms.forEach((r, idx) => {
+        const rect = {
+          x: r.rectX,
+          y: r.rectY,
+          w: r.fullW,
+          h: r.fullH
+        };
+        for (let j = 0; j < occupied.length; j++) {
+          const o = occupied[j];
+          const separated =
+            rect.x + rect.w + 1 <= o.x ||
+            o.x + o.w + 1 <= rect.x ||
+            rect.y + rect.h + 1 <= o.y ||
+            o.y + o.h + 1 <= rect.y;
+          if (!separated) {
+            overlap = true;
+            break;
+          }
+        }
+        if (!overlap) occupied.push(rect);
+      });
+      if (overlap) continue;
+
+      return { rooms: rooms.slice(), corridorMin, corridorMax };
+    }
+
+    return null;
+  }
+
+  const scaleSteps = [1, 1.1, 1.25, 1.4];
+  const MAX_ATTEMPTS_PER_SCALE = 50;
+  const RETRY_TIMEOUT_MS = 10000;
+  const startTime = Date.now();
+  let bestLayout = null;
+
+  while (!bestLayout && (Date.now() - startTime) < RETRY_TIMEOUT_MS) {
+    for (let i = 0; i < scaleSteps.length; i++) {
+      const res = tryLayoutWithScale(scaleSteps[i], MAX_ATTEMPTS_PER_SCALE);
+      if (res) {
+        bestLayout = res;
+        break;
+      }
+    }
+  }
+
+  if (!bestLayout) {
+    throw new Error(
+      "[patch_to_level] Dungeon: could not place rooms within map height. Increase ROOM_H or reduce number/size of patches."
+    );
+  }
+
+  const placedRooms = bestLayout.rooms;
+  const corridorWidthMinUsed = bestLayout.corridorMin;
+  const corridorWidthMaxUsed = bestLayout.corridorMax;
+
+  // Skip old adaptive placement logic
+  if (false) {
+  // --------------------------------------------------------------
   // Adaptive tuning of room margins and corridor thickness
   // --------------------------------------------------------------
   const totalMapArea = ROOM_W * ROOM_H;
@@ -2200,150 +2415,7 @@ function buildDungeonLayout(fullGrid) {
   let areaScale = 1.0;
 
   // If ideal area exceeds the target fraction of the map,
-  // shrink margins / corridor widths proportionally.
-  if (idealArea > 0 && idealArea > totalMapArea * targetFillFraction) {
-    areaScale = (totalMapArea * targetFillFraction) / idealArea;
-    // Do not shrink below 10% of the configured margin range
-    if (areaScale < 0.1) {
-      areaScale = 0.1;
-    }
   }
-
-  const marginXRange = Math.max(0, ROOM_MARGIN_X_MAX - ROOM_MARGIN_X_MIN);
-  const marginYRange = Math.max(0, ROOM_MARGIN_Y_MAX - ROOM_MARGIN_Y_MIN);
-
-  const ADAPTIVE_MARGIN_X_MAX =
-    ROOM_MARGIN_X_MIN + Math.round(marginXRange * areaScale);
-  const ADAPTIVE_MARGIN_Y_MAX =
-    ROOM_MARGIN_Y_MIN + Math.round(marginYRange * areaScale);
-
-  const corridorWidthRange = Math.max(0, CORRIDOR_WIDTH_MAX - CORRIDOR_WIDTH_MIN);
-  const ADAPTIVE_CORRIDOR_WIDTH_MAX =
-    CORRIDOR_WIDTH_MIN + Math.round(corridorWidthRange * areaScale);
-
-  const RESERVED_TOP_ROWS = DETECT_SYSTEM_PATCHES ? 6 : 0;
-  const USABLE_HEIGHT = Math.max(1, ROOM_H - RESERVED_TOP_ROWS);
-
-  console.log(
-    "[patch_to_level] Dungeon adaptive scale:",
-    "patchCount =", patchDescs.length,
-    "idealArea =", idealArea,
-    "mapArea =", totalMapArea,
-    "areaScale =", areaScale.toFixed(3),
-    "marginXMaxUsed =", ADAPTIVE_MARGIN_X_MAX,
-    "marginYMaxUsed =", ADAPTIVE_MARGIN_Y_MAX,
-    "corridorWidthMaxUsed =", ADAPTIVE_CORRIDOR_WIDTH_MAX,
-    "reservedTopRows =", RESERVED_TOP_ROWS
-  );
-
-  function tryShelfPlacement(strategy) {
-    const rooms = [];
-    const rows = [];
-    let cursorX = 0;
-    let cursorY = 0;
-    let rowHeight = 0;
-    let currentRow = { startY: 0, height: 0, rooms: [] };
-    rows.push(currentRow);
-    const ROW_GAP = 2;
-    const corridorMax = strategy === "tight"
-      ? Math.max(1, CORRIDOR_WIDTH_MIN)
-      : ADAPTIVE_CORRIDOR_WIDTH_MAX;
-
-    for (let idx = 0; idx < patchDescs.length; idx++) {
-      const p = patchDescs[idx];
-      const pw = p.patchWidth;
-      const ph = p.patchHeight;
-
-      const marginX = (strategy === "tight")
-        ? Math.max(1, ROOM_MARGIN_X_MIN)
-        : randInt(ROOM_MARGIN_X_MIN, ADAPTIVE_MARGIN_X_MAX);
-      const marginY = (strategy === "tight")
-        ? Math.max(1, ROOM_MARGIN_Y_MIN)
-        : randInt(ROOM_MARGIN_Y_MIN, ADAPTIVE_MARGIN_Y_MAX);
-
-      const innerW = pw + marginX * 2;
-      const innerH = ph + marginY * 2;
-      const fullW = innerW + 2;
-      const fullH = innerH + 2;
-
-      if (cursorX + fullW > ROOM_W) {
-        cursorX = 0;
-        cursorY += rowHeight + ROW_GAP;
-        rowHeight = 0;
-        currentRow = { startY: cursorY, height: 0, rooms: [] };
-        rows.push(currentRow);
-      }
-
-      if (cursorY + fullH > USABLE_HEIGHT) {
-        return null;
-      }
-
-      const rectX = cursorX;
-      const rectY = cursorY;
-      const floorX = rectX + 1;
-      const floorY = rectY + 1;
-      const centerX = floorX + Math.floor(innerW / 2);
-      const centerY = floorY + Math.floor(innerH / 2);
-      const patchOffsetX = floorX + marginX;
-      const patchOffsetY = floorY + marginY;
-
-      const room = {
-        ...p,
-        innerW,
-        innerH,
-        fullW,
-        fullH,
-        rectX,
-        rectY,
-        floorX,
-        floorY,
-        centerX,
-        centerY,
-        patchOffsetX,
-        patchOffsetY,
-        corridorMax,
-        rowIndex: rows.length - 1
-      };
-
-      rooms.push(room);
-      currentRow.rooms.push(room);
-
-      cursorX += fullW + ROOM_GAP_COLS;
-      if (fullH > rowHeight) rowHeight = fullH;
-      if (fullH > currentRow.height) currentRow.height = fullH;
-    }
-
-    // Jitter vertical positions within each row band to avoid flat alignment
-    rows.forEach((row) => {
-      const maxH = row.height || 0;
-      row.rooms.forEach((room) => {
-        const slack = Math.max(0, maxH - room.fullH);
-        const offset = slack > 0 ? randInt(0, slack) : 0;
-        room.rectY = row.startY + offset;
-        room.floorY = room.rectY + 1;
-        room.centerY = room.floorY + Math.floor(room.innerH / 2);
-        room.patchOffsetY = room.floorY + (room.innerH - room.patchHeight) / 2;
-        room.patchOffsetY = Math.floor(room.patchOffsetY);
-      });
-    });
-
-    return { rooms, corridorMax };
-  }
-
-  const placementStrategies = ["adaptive", "tight"];
-  let placement = null;
-  for (let i = 0; i < placementStrategies.length && !placement; i++) {
-    placement = tryShelfPlacement(placementStrategies[i]);
-  }
-
-  if (!placement) {
-    throw new Error(
-      "[patch_to_level] Dungeon: could not place rooms within map height. Increase ROOM_H or reduce number/size of patches."
-    );
-  }
-
-  const placedRooms = placement.rooms;
-  const corridorWidthMaxUsed = placement.corridorMax;
 
   // Final grid: initially full of walls
   let finalGrid = [];
@@ -2366,24 +2438,92 @@ function buildDungeonLayout(fullGrid) {
     }
   });
 
-  // Connect rooms with L-shaped corridors of variable thickness
-  for (let i = 0; i < placedRooms.length - 1; i++) {
-    const r1 = placedRooms[i];
-    const r2 = placedRooms[i + 1];
+  function connectRoomsRandomized(rooms, grid, corridorMinUse, corridorWidthMaxUsed) {
+    if (!rooms || rooms.length === 0) return;
+    const connected = new Set();
+    const remaining = new Set(rooms.map((_, i) => i));
+    const pick = () => remaining.values().next().value;
+    let current = pick();
+    connected.add(current);
+    remaining.delete(current);
 
-    const x1 = r1.centerX;
-    const y1 = r1.centerY;
-    const x2 = r2.centerX;
-    const y2 = r2.centerY;
+    function dist(a, b) {
+      return Math.abs(a.centerX - b.centerX) + Math.abs(a.centerY - b.centerY);
+    }
 
-    const corridorWidthH = randInt(CORRIDOR_WIDTH_MIN, corridorWidthMaxUsed);
-    const corridorWidthV = randInt(CORRIDOR_WIDTH_MIN, corridorWidthMaxUsed);
+    while (remaining.size) {
+      let bestFrom = null;
+      let bestTo = null;
+      let bestScore = Infinity;
+      connected.forEach((ci) => {
+        remaining.forEach((ri) => {
+          const a = rooms[ci];
+          const b = rooms[ri];
+          const base = dist(a, b);
+          const noise = 0.7 + Math.random() * 0.6; // inject randomness
+          const score = base * noise;
+          if (score < bestScore) {
+            bestScore = score;
+            bestFrom = ci;
+            bestTo = ri;
+          }
+        });
+      });
+      if (bestFrom == null || bestTo == null) break;
 
-    // Horizontal segment
-    carveHorizontalCorridor(finalGrid, y1, x1, x2, corridorWidthH);
-    // Vertical segment
-    carveVerticalCorridor(finalGrid, x2, y1, y2, corridorWidthV);
+      const r1 = rooms[bestFrom];
+      const r2 = rooms[bestTo];
+      const x1 = r1.centerX;
+      const y1 = r1.centerY;
+      const x2 = r2.centerX;
+      const y2 = r2.centerY;
+      const corridorWidthH = randInt(corridorMinUse, corridorWidthMaxUsed);
+      const corridorWidthV = randInt(corridorMinUse, corridorWidthMaxUsed);
+
+      if (Math.random() < 0.5) {
+        carveHorizontalCorridor(grid, y1, x1, x2, corridorWidthH);
+        carveVerticalCorridor(grid, x2, y1, y2, corridorWidthV);
+      } else {
+        carveVerticalCorridor(grid, x1, y1, y2, corridorWidthV);
+        carveHorizontalCorridor(grid, y2, x1, x2, corridorWidthH);
+      }
+
+      connected.add(bestTo);
+      remaining.delete(bestTo);
+    }
+
+    // Optional extra long corridors to “stretch” layout
+    const extraLinks = Math.min(2, Math.max(0, Math.floor(rooms.length / 3)));
+    for (let i = 0; i < extraLinks; i++) {
+      const aIdx = randInt(0, rooms.length - 1);
+      let bIdx = randInt(0, rooms.length - 1);
+      if (rooms.length > 1) {
+        let tries = 0;
+        while (bIdx === aIdx && tries < 5) {
+          bIdx = randInt(0, rooms.length - 1);
+          tries++;
+        }
+      }
+      const r1 = rooms[aIdx];
+      const r2 = rooms[bIdx];
+      const x1 = r1.centerX;
+      const y1 = r1.centerY;
+      const x2 = r2.centerX;
+      const y2 = r2.centerY;
+      const corridorWidthH = randInt(corridorMinUse, corridorWidthMaxUsed);
+      const corridorWidthV = randInt(corridorMinUse, corridorWidthMaxUsed);
+      if (Math.random() < 0.5) {
+        carveHorizontalCorridor(grid, y1, x1, x2, corridorWidthH);
+        carveVerticalCorridor(grid, x2, y1, y2, corridorWidthV);
+      } else {
+        carveVerticalCorridor(grid, x1, y1, y2, corridorWidthV);
+        carveHorizontalCorridor(grid, y2, x1, x2, corridorWidthH);
+      }
+    }
   }
+
+  // Connect rooms with randomized L-shaped corridors
+  connectRoomsRandomized(placedRooms, finalGrid, corridorWidthMinUsed, corridorWidthMaxUsed);
 
     // Insert patch grids into their rooms
   const commentBlocksGlobal = [];
