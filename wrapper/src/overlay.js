@@ -121,8 +121,8 @@
   const SMOKE_FADE_TICKS             = Math.ceil((4000) / WORLD_TICK_MS);
   const BASIC_LOOT_CHANCE            = 0.5; // 50% drop chance for basic loot
   const SPECIAL_LOOT_CHANCE          = 0.3; // 30% drop chance for special loot
-  const ASSASSIN_PAUSE_CHANCE        = 0.18; // probability to pause after a move
-  const ASSASSIN_PAUSE_TICKS         = 2;    // pause duration in ticks
+  const ASSASSIN_PAUSE_CHANCE        = 0.35; // probability to pause after a move
+  const ASSASSIN_PAUSE_TICKS         = 4;    // pause duration in ticks
   const EQUIPMENT_ITEMS             = [
     { id: 'bait', label: 'BAIT' },
     { id: 'shield', label: 'SHIELD' },
@@ -134,6 +134,7 @@
   // Guard HP
   const GUARD_MAX_HP                = 2;  // guard max hit points
   const ASSASSIN_MAX_HP             = 4;  // assassin max hit points
+  const ASSASSIN_COLOR              = '#ff5577'; // distinct red tone
 
   // Four-corners reset on alert (seconds)
   const FOUR_CORNERS_RESET_SECONDS  = 5;
@@ -763,6 +764,8 @@
   let smokeCells = new Set();
   // Assassin targeting queue
   let assassinTargets = [];
+  // Latest "beacon" that should attract all assassins
+  let assassinBeacon = null;
 
 
   // Pickups (ammo / medikit / bait pickups)
@@ -1798,18 +1801,28 @@ function updateHudLayout() {
       guardsContainer.appendChild(gEl);
 
       const rect = cfg.rect || {};
-            const guard = {
+      // Clamp spawn inside grid to avoid out-of-bounds positions
+      const startCol = Math.min(
+        Math.max(cfg.startCol || 0, 0),
+        Math.max(0, gridCols - 1)
+      );
+      const startRow = Math.min(
+        Math.max(cfg.startRow || 0, 0),
+        Math.max(0, gridRows - 1)
+      );
+
+      const guard = {
         id: cfg.id || ('guard_' + index),
         patrolType: cfg.patrolType || 'rect',
         behavior: cfg.behavior || 'chaser',
 
         // Current position
-        col: cfg.startCol || 0,
-        row: cfg.startRow || 0,
+        col: startCol,
+        row: startRow,
 
         // "Home" position used when returning to patrol after alert
-        homeCol: cfg.startCol || 0,
-        homeRow: cfg.startRow || 0,
+        homeCol: startCol,
+        homeRow: startRow,
 
         // Patrol rectangle
         dirX: 1,
@@ -1891,6 +1904,16 @@ function updateHudLayout() {
         assassinPauseTicks: 0
 
       };
+
+      // Snap spawn to nearest walkable cell (especially important for assassins)
+      const nearest = findNearestWalkableCell(guard.col, guard.row) ||
+        findNearestWalkableCell(Math.floor(gridCols / 2), Math.floor(gridRows / 2));
+      if (nearest) {
+        guard.col = nearest.col;
+        guard.row = nearest.row;
+        guard.homeCol = nearest.col;
+        guard.homeRow = nearest.row;
+      }
 
       guards.push(guard);
       updateGuardSpriteAppearance(guard);
@@ -4372,6 +4395,7 @@ function createPlacedBait(col, row) {
     if (!target || !target.alive) return;
 
     target.hp--;
+    addAssassinTarget(target.col, target.row, 'destroy_target_hit');
 
     // Small visual feedback on hit
     if (target.outer) {
@@ -4630,6 +4654,7 @@ function createPlacedBait(col, row) {
           if (!tile.applied) {
             tile.applied = true;
           }
+          addAssassinTarget(tile.col, tile.row, 'pressure_tile');
         }
       } else {
         tile.holdTicks = 0;
@@ -4956,8 +4981,29 @@ function createPlacedBait(col, row) {
       markersForTrigger.length > 0 &&
       markersForTrigger.every((m) => m.active);
 
+    // Attract assassins when a corner is unlocked
+    if (
+      liberationTriggers[triggerIndex] &&
+      liberationTriggers[triggerIndex].corners &&
+      typeof candidate.cornerIndex === 'number'
+    ) {
+      const c = liberationTriggers[triggerIndex].corners[candidate.cornerIndex];
+      if (c && typeof c.col === 'number' && typeof c.row === 'number') {
+        addAssassinTarget(c.col, c.row, 'corner_unlock');
+      }
+    }
+
     if (allActiveForTrigger) {
       completeLiberationTrigger(triggerIndex);
+      // Safety: if runtime state was missing, force mark as completed and liberate once
+      const st = triggerRuntimeState[triggerIndex];
+      if (!st || !st.completed) {
+        if (st) st.completed = true;
+        const trigger = liberationTriggers[triggerIndex];
+        if (trigger) {
+          liberatePatchInOrca(trigger);
+        }
+      }
     }
   }
 
@@ -5523,9 +5569,14 @@ function createPlacedBait(col, row) {
       if (guard.state === 'stunned' || guard.state === 'dead') return;
 
       const isTrackingTarget = guard.seenPlayer || guard.seenBait;
-      const color = isTrackingTarget
-        ? 'rgba(255, 64, 64, ' + baseAlpha + ')'
-        : 'rgba(255, 0, 0, ' + baseAlpha + ')';
+      const assassinFov = guard.isAssassin;
+      const color = assassinFov
+        ? (isTrackingTarget
+          ? 'rgba(255, 100, 140, ' + baseAlpha + ')'
+          : 'rgba(255, 80, 120, ' + baseAlpha + ')')
+        : (isTrackingTarget
+          ? 'rgba(255, 64, 64, ' + baseAlpha + ')'
+          : 'rgba(255, 0, 0, ' + baseAlpha + ')');
 
       guard.fovCells.forEach((cell) => {
         const cellDiv = document.createElement('div');
@@ -5847,6 +5898,11 @@ function createPlacedBait(col, row) {
 
     addRifleBeamEffect(playerCol, playerRow, target.col, target.row);
 
+    if (target.isAssassin) {
+      triggerTemporaryAlertForGuard(target, 'rifle', playerCol, playerRow);
+      addAssassinTarget(playerCol, playerRow, 'rifle');
+    }
+
     target.hp = Math.max(0, (target.hp || GUARD_MAX_HP) - RIFLE_SHOT_DAMAGE);
     if (target.hp <= 0) {
       killGuard(target);
@@ -6030,6 +6086,7 @@ function createPlacedBait(col, row) {
       ['NW', 'NE', 'SW', 'SE'].forEach((name) => {
         const sa = sectorAlerts[name];
         if (!sa) return;
+        const wasTracking = sa.state === 'tracking';
         if (typeof sa.tempBoost !== 'number') {
           sa.tempBoost = 1.0;
         }
@@ -6132,6 +6189,12 @@ function createPlacedBait(col, row) {
             sa.sourceBaitId = null;
             sa.tempBoost = 1.0;
           }
+        }
+
+        if (!wasTracking && sa.state === 'tracking') {
+          const tx = (sa.targetCol != null) ? sa.targetCol : midCol;
+          const ty = (sa.targetRow != null) ? sa.targetRow : midRow;
+          addAssassinTarget(tx, ty, 'sector_alert');
         }
       });
 
@@ -6320,6 +6383,7 @@ function createPlacedBait(col, row) {
       for (const key in roomAlerts) {
         const ra = roomAlerts[key];
         if (!ra) continue;
+        const wasTracking = ra.state === 'tracking';
         if (typeof ra.tempBoost !== 'number') {
           ra.tempBoost = 1.0;
         }
@@ -6415,6 +6479,15 @@ function createPlacedBait(col, row) {
             ra.tempBoost = 1.0;
           }
         }
+
+        if (!wasTracking && ra.state === 'tracking') {
+          const target = (ra.targetCol != null && ra.targetRow != null)
+            ? { col: ra.targetCol, row: ra.targetRow }
+            : getRoomCenterFromKey(key);
+          if (target) {
+            addAssassinTarget(target.col, target.row, 'room_alert');
+          }
+        }
       }
 
       // Global alert: on if any room is tracking or any guard sees player/bait
@@ -6500,12 +6573,16 @@ function createPlacedBait(col, row) {
     if (col == null || row == null) return;
     if (col < 0 || row < 0 || col >= gridCols || row >= gridRows) return;
     const key = col + ',' + row;
-    if (assassinTargets.find((t) => t && (t.col + ',' + t.row) === key)) return;
-    assassinTargets.push({ col, row, reason });
+    if (!assassinTargets.find((t) => t && (t.col + ',' + t.row) === key)) {
+      assassinTargets.push({ col, row, reason });
+    }
+    // Beacon is the latest point of interest: all assassins will converge here
+    assassinBeacon = { col, row, reason, ts: Date.now() };
   }
 
   function clearAssassinTargets() {
     assassinTargets = [];
+    assassinBeacon = null;
     guards.forEach((g) => {
       if (g && g.isAssassin) {
         g.assassinTarget = null;
@@ -6538,20 +6615,53 @@ function createPlacedBait(col, row) {
     return options[Math.floor(Math.random() * options.length)];
   }
 
+  function getRoomCenterFromKey(key) {
+    if (!key) return null;
+    const parts = key.split(',').map((n) => parseInt(n, 10));
+    if (parts.length !== 4 || parts.some((n) => isNaN(n))) return null;
+    const [minC, maxC, minR, maxR] = parts;
+    return {
+      col: Math.floor((minC + maxC) / 2),
+      row: Math.floor((minR + maxR) / 2)
+    };
+  }
+
   function pickAssassinTarget(guard) {
-    if (guard.assassinTarget && guard.col === guard.assassinTarget.col && guard.row === guard.assassinTarget.row) {
-      guard.assassinTarget = null;
-    }
-    if (!guard.assassinTarget && assassinTargets.length) {
-      guard.assassinTarget = assassinTargets.shift();
-    }
-    if (!guard.assassinTarget) {
-      const locked = pickLockedPatchTarget();
-      if (locked) {
-        guard.assassinTarget = locked;
+    // If we already have a target and not yet arrived, keep it
+    if (guard.assassinTarget) {
+      if (guard.col === guard.assassinTarget.col && guard.row === guard.assassinTarget.row) {
+        guard.assassinTarget = null;
+      } else {
+        return guard.assassinTarget;
       }
     }
-    return guard.assassinTarget;
+
+    // Prefer the latest global beacon (e.g., alerts, player actions)
+    if (assassinBeacon) {
+      guard.assassinTarget = {
+        col: assassinBeacon.col,
+        row: assassinBeacon.row,
+        reason: assassinBeacon.reason
+      };
+      return guard.assassinTarget;
+    }
+
+    // Fallback: pending queued targets
+    if (assassinTargets.length) {
+      // Peek without removing so multiple assassins can respond
+      const t = assassinTargets[assassinTargets.length - 1];
+      guard.assassinTarget = { col: t.col, row: t.row, reason: t.reason };
+      return guard.assassinTarget;
+    }
+
+    // Last fallback: any locked patch center
+    const locked = pickLockedPatchTarget();
+    if (locked) {
+      guard.assassinTarget = locked;
+      return guard.assassinTarget;
+    }
+
+    return null;
   }
 
   function stepAssassin(guard) {
@@ -7777,9 +7887,9 @@ function stepGuardAlert(guard) {
     if (guard.isAssassin) {
       const ratio = Math.max(0, Math.min(1, guard.hp / guard.maxHP));
       const emptyPct = (1 - ratio) * 100;
-      sprite.style.border = '2px solid #df0a0aff';
+      sprite.style.border = '2px solid ' + ASSASSIN_COLOR;
       sprite.style.background =
-        'linear-gradient(to top, #df0a0aff ' +
+        'linear-gradient(to top, ' + ASSASSIN_COLOR + ' ' +
         (100 - emptyPct).toFixed(1) +
         '%, rgba(0,0,0,0) ' +
         (100 - emptyPct).toFixed(1) +
@@ -8367,12 +8477,12 @@ function stepGuardAlert(guard) {
     guards.forEach((guard) => {
       if (guard.state === 'stunned' || guard.state === 'dead') return;
       if (guard.col === playerCol && guard.row === playerRow) {
-        if (isPlayerBehindGuard(guard)) {
-          // Stealth takedown from behind
+        if (guard.isAssassin) {
+          applyPlayerHit(guard);
+        } else if (isPlayerBehindGuard(guard)) {
           neutralizeGuard(guard);
           updateAllFovAndAlert();
         } else {
-          // All other collisions: player takes damage
           applyPlayerHit(guard);
         }
       }
